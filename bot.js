@@ -239,7 +239,7 @@ client.on('messageCreate', async (message) => {
         }
 
         // ===== BAN =====
-        if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك') {
+        if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك' | commandName === 'بزبي' ) {
             if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية الحظر.');
             if (!target)
