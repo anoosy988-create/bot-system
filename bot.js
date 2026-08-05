@@ -21,9 +21,7 @@ const client = new Client({
 // ==================== DATABASE ====================
 
 const DB_FILE = './jailDatabase.json';
-const WARN_FILE = './warnings.json';
 const LOG_FILE = './logChannels.json';
-const WARN_ID_FILE = './warnId.json';
 
 function loadJSON(file) {
     if (!fs.existsSync(file)) return new Map();
@@ -40,21 +38,10 @@ function saveJSON(file, data) {
 }
 
 const jailDatabase = loadJSON(DB_FILE);
-let warnings = loadJSON(WARN_FILE);
 let logChannels = loadJSON(LOG_FILE);
 
-// رقم التحذير العالمي
-let warnIdCounter = 1;
-if (fs.existsSync(WARN_ID_FILE)) {
-    try {
-        warnIdCounter = parseInt(fs.readFileSync(WARN_ID_FILE, 'utf8')) || 1;
-    } catch { warnIdCounter = 1; }
-}
-
 function saveJailDB() { saveJSON(DB_FILE, jailDatabase); }
-function saveWarnings() { saveJSON(WARN_FILE, warnings); }
 function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
-function saveWarnId() { fs.writeFileSync(WARN_ID_FILE, warnIdCounter.toString(), 'utf8'); }
 
 // ==================== LOG SYSTEM ====================
 
@@ -111,10 +98,10 @@ const PREFIX_COMMANDS = [
     'سجن', 'افراج',
     'تف', 'تميم.يسلم.عليك', 'بزبي',
     'طرد', 'kick',
-    'تح', 'تحذيرات', 'شيل',
     'تكلم',
     'r',
     'سد حلقك', 'تايم',
+    'فك'
 ];
 
 // ==================== SLASH COMMANDS ====================
@@ -186,10 +173,9 @@ client.on('messageCreate', async (message) => {
                 .setColor(0xFFD700)
                 .setDescription('الأوامر المتاحة:')
                 .addFields(
-                    { name: 'العقوبات', value: '`سجن @عضو`\n`افراج @عضو`\n`تف @عضو` - بان\n`طرد @عضو`', inline: true },
+                    { name: 'العقوبات', value: '`سجن @عضو`\n`افراج @عضو`\n`تف @عضو` - بان\n`طرد @عضو`\n`فك آيدي/يوزر` - فك بان', inline: true },
                     { name: 'الإسكات', value: '`تايم @عضو 10m`\n`تكلم @عضو`', inline: true },
                     { name: 'الرتب', value: '`r @عضو اسم_الرتبة`', inline: true },
-                    { name: 'التحذيرات', value: '`تح @عضو السبب`\n`تحذيرات @عضو`\n`شيل @عضو #رقم`', inline: true },
                     { name: 'الإعدادات', value: '`/setlog` - تحديد روم اللوقات', inline: true }
                 )
                 .setFooter({ text: 'البوت يعمل بكفاءة' })
@@ -239,7 +225,7 @@ client.on('messageCreate', async (message) => {
         }
 
         // ===== BAN =====
-        if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك' | commandName === 'بزبي' ) {
+        if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك' || commandName === 'بزبي') {
             if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية الحظر.');
             if (!target)
@@ -249,7 +235,47 @@ client.on('messageCreate', async (message) => {
 
             await target.ban();
             await sendLog(message.guild, '🔨 حظر', target, `بواسطة: ${message.author.username}`);
-            return message.reply(`✅ راح لندن  ${target.user.username}.`);
+            return message.reply(`✅ راح لندن ${target.user.username}.`);
+        }
+
+        // ===== UNBAN =====
+        if (commandName === 'فك') {
+            if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+                return message.reply('❌ ما عندك صلاحية فك الحظر.');
+            if (!args[0])
+                return message.reply('❌ حدد آيدي أو يوزر. مثال: `فك 123456789` أو `فك username`');
+
+            const input = args[0];
+            let userId = input;
+            let username = input;
+
+            // التحقق إذا كان منشن
+            const mentionMatch = input.match(/^<@!?(\d{17,19})>$/);
+            if (mentionMatch) {
+                userId = mentionMatch[1];
+            } else if (!/^\d{17,19}$/.test(input)) {
+                // إذا كان الإدخال ليس آيدي، نبحث في قائمة المحظورين
+                const bans = await message.guild.bans.fetch();
+                const banned = bans.find(b => b.user.username.toLowerCase() === input.toLowerCase());
+                if (!banned)
+                    return message.reply(`❌ ما لقيت محظور باسم "${input}".`);
+                userId = banned.user.id;
+                username = banned.user.username;
+            }
+
+            // جلب اسم اليوزر إذا كان عندنا آيدي فقط
+            if (!username || username === userId) {
+                try {
+                    const user = await client.users.fetch(userId);
+                    username = user.username;
+                } catch {
+                    username = userId;
+                }
+            }
+
+            await message.guild.members.unban(userId);
+            await sendLog(message.guild, '🔓 فك حظر', {id: userId, username: username}, `بواسطة: ${message.author.username}`, 0x00FF00);
+            return message.reply(`✅ تم فك الحظر عن **${username}**.`);
         }
 
         // ===== KICK =====
@@ -272,16 +298,19 @@ client.on('messageCreate', async (message) => {
                 return message.reply('❌ ما عندك صلاحية الإسكات.');
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `تايم @عضو 10m`');
-            if (!args[0])
+
+            // نجمع args بعد المنشن، أو نبحث عن أي arg يمكن تحويله لوقت
+            const timeStr = args.slice(1).join(' ').trim() || args.find(arg => ms(arg));
+            if (!timeStr)
                 return message.reply('❌ حدد المدة. مثال: `تايم @عضو 10m`');
 
-            const duration = ms(args[0]);
+            const duration = ms(timeStr);
             if (!duration)
                 return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
 
             await target.timeout(duration);
-            await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${args[0]} | بواسطة: ${message.author.username}`);
-            return message.reply(`✅ تم صكه ${target.user.username} لمدة ${args[0]}.`);
+            await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
+            return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
         }
 
         // ===== UNTIMEOUT =====
