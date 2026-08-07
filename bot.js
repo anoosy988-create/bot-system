@@ -104,6 +104,9 @@ const PREFIX_COMMANDS = [
     'فك'
 ];
 
+// ==================== OWNER ID ====================
+const OWNER_ID = '1364275261398581279';
+
 // ==================== SLASH COMMANDS ====================
 
 client.on('ready', async () => {
@@ -189,9 +192,11 @@ client.on('messageCreate', async (message) => {
                 return message.reply('❌ ما عندك صلاحية إدارة الرتب.');
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
-            if (target.roles.highest.position >= message.member.roles.highest.position)
+            
+            const isOwner = message.author.id === OWNER_ID;
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تسجن عضو رتبته أعلى منك.');
-            if (target.permissions.has(PermissionsBitField.Flags.Administrator))
+            if (!isOwner && target.permissions.has(PermissionsBitField.Flags.Administrator))
                 return message.reply('❌ ما تقدر تسجن أدمن.');
 
             await message.guild.roles.fetch();
@@ -230,7 +235,9 @@ client.on('messageCreate', async (message) => {
                 return message.reply('❌ ما عندك صلاحية الحظر.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
-            if (target.roles.highest.position >= message.member.roles.highest.position)
+            
+            const isOwner = message.author.id === OWNER_ID;
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تحظر عضو رتبته أعلى منك.');
 
             await target.ban();
@@ -240,7 +247,8 @@ client.on('messageCreate', async (message) => {
 
         // ===== UNBAN =====
         if (commandName === 'فك') {
-            if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+            const isOwner = message.author.id === OWNER_ID;
+            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية فك الحظر.');
             if (!args[0])
                 return message.reply('❌ حدد آيدي أو يوزر. مثال: `فك 123456789` أو `فك username`');
@@ -284,7 +292,9 @@ client.on('messageCreate', async (message) => {
                 return message.reply('❌ ما عندك صلاحية الطرد.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
-            if (target.roles.highest.position >= message.member.roles.highest.position)
+            
+            const isOwner = message.author.id === OWNER_ID;
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تطير عضو رتبته أعلى منك.');
 
             await target.kick();
@@ -299,6 +309,8 @@ client.on('messageCreate', async (message) => {
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `تايم @عضو 10m`');
 
+            const isOwner = message.author.id === OWNER_ID;
+            
             // نجمع args بعد المنشن، أو نبحث عن أي arg يمكن تحويله لوقت
             const timeStr = args.slice(1).join(' ').trim() || args.find(arg => ms(arg));
             if (!timeStr)
@@ -308,7 +320,12 @@ client.on('messageCreate', async (message) => {
             if (!duration)
                 return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
 
-            await target.timeout(duration);
+            // للأونر نحاول نتجاوز التحقق من الرتبة، للباقي Discord يتحقق تلقائياً
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position) {
+                return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك.');
+            }
+
+            await target.timeout(duration, `بواسطة: ${message.author.username}`);
             await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
             return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
         }
