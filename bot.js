@@ -194,7 +194,8 @@ client.on('messageCreate', async (message) => {
                 return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
             
             const isOwner = message.author.id === OWNER_ID;
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+            // تغيير >= إلى > : يسمح بالسجن حتى لنفس الرتبة
+            if (!isOwner && target.roles.highest.position > message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تسجن عضو رتبته أعلى منك.');
             if (!isOwner && target.permissions.has(PermissionsBitField.Flags.Administrator))
                 return message.reply('❌ ما تقدر تسجن أدمن.');
@@ -237,7 +238,8 @@ client.on('messageCreate', async (message) => {
                 return message.reply('❌ حدد عضو.');
             
             const isOwner = message.author.id === OWNER_ID;
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+            // تغيير >= إلى > : يسمح بالبان حتى لنفس الرتبة
+            if (!isOwner && target.roles.highest.position > message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تحظر عضو رتبته أعلى منك.');
 
             await target.ban();
@@ -294,7 +296,8 @@ client.on('messageCreate', async (message) => {
                 return message.reply('❌ حدد عضو.');
             
             const isOwner = message.author.id === OWNER_ID;
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+            // تغيير >= إلى > : يسمح بالطرد حتى لنفس الرتبة
+            if (!isOwner && target.roles.highest.position > message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تطير عضو رتبته أعلى منك.');
 
             await target.kick();
@@ -320,8 +323,8 @@ client.on('messageCreate', async (message) => {
             if (!duration)
                 return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
 
-            // للأونر نحاول نتجاوز التحقق من الرتبة، للباقي Discord يتحقق تلقائياً
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position) {
+            // تغيير >= إلى > : يسمح بالتايم حتى لنفس الرتبة
+            if (!isOwner && target.roles.highest.position > message.member.roles.highest.position) {
                 return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك.');
             }
 
