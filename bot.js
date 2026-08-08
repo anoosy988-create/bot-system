@@ -22,7 +22,6 @@ const client = new Client({
 
 const DB_FILE = './jailDatabase.json';
 const LOG_FILE = './logChannels.json';
-const MANUAL_TIMEOUT_FILE = './manualTimeouts.json';
 
 function loadJSON(file) {
     if (!fs.existsSync(file)) return new Map();
@@ -43,97 +42,6 @@ let logChannels = loadJSON(LOG_FILE);
 
 function saveJailDB() { saveJSON(DB_FILE, jailDatabase); }
 function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
-
-// ==================== MANUAL TIMEOUT SYSTEM ====================
-
-const manualTimeouts = new Map(); // key: guildId_memberId -> { timeoutId, endTime }
-
-function saveManualTimeouts() {
-    const data = {};
-    for (const [key, val] of manualTimeouts.entries()) {
-        data[key] = { endTime: val.endTime };
-    }
-    fs.writeFileSync(MANUAL_TIMEOUT_FILE, JSON.stringify(data, null, 2), 'utf8');
-}
-
-function loadManualTimeouts() {
-    if (!fs.existsSync(MANUAL_TIMEOUT_FILE)) return;
-    try {
-        const data = JSON.parse(fs.readFileSync(MANUAL_TIMEOUT_FILE, 'utf8'));
-        const now = Date.now();
-        for (const [key, val] of Object.entries(data)) {
-            const remaining = val.endTime - now;
-            if (remaining > 0) {
-                const [guildId, memberId] = key.split('_');
-                const guild = client.guilds.cache.get(guildId);
-                if (guild) {
-                    guild.members.fetch(memberId).then(member => {
-                        applyManualTimeout(guild, member, remaining, 'استعادة بعد إعادة تشغيل البوت', false);
-                    }).catch(() => {});
-                }
-            }
-        }
-    } catch(e) {}
-}
-
-async function applyManualTimeout(guild, member, durationMs, reason, save = true) {
-    const channels = guild.channels.cache.filter(c => 
-        c.isTextBased() || c.type === 2
-    );
-    
-    let appliedCount = 0;
-    
-    for (const channel of channels.values()) {
-        try {
-            await channel.permissionOverwrites.edit(member.id, {
-                SendMessages: false,
-                AddReactions: false,
-                Speak: false,
-                SendMessagesInThreads: false,
-                CreatePublicThreads: false,
-                CreatePrivateThreads: false
-            });
-            appliedCount++;
-        } catch (e) {}
-    }
-    
-    if (appliedCount === 0) return false;
-    
-    const key = `${guild.id}_${member.id}`;
-    const endTime = Date.now() + durationMs;
-    
-    if (manualTimeouts.has(key)) {
-        clearTimeout(manualTimeouts.get(key).timeoutId);
-    }
-    
-    const timeoutId = setTimeout(async () => {
-        await removeManualTimeout(guild, member);
-    }, durationMs);
-    
-    manualTimeouts.set(key, { timeoutId, endTime });
-    if (save) saveManualTimeouts();
-    return true;
-}
-
-async function removeManualTimeout(guild, member) {
-    const key = `${guild.id}_${member.id}`;
-    
-    if (manualTimeouts.has(key)) {
-        clearTimeout(manualTimeouts.get(key).timeoutId);
-        manualTimeouts.delete(key);
-        saveManualTimeouts();
-    }
-    
-    const channels = guild.channels.cache.filter(c => 
-        c.isTextBased() || c.type === 2
-    );
-    
-    for (const channel of channels.values()) {
-        try {
-            await channel.permissionOverwrites.delete(member.id);
-        } catch (e) {}
-    }
-}
 
 // ==================== LOG SYSTEM ====================
 
@@ -203,7 +111,6 @@ const OWNER_ID = '1364275261398581279';
 
 client.on('ready', async () => {
     console.log(`✅ Bot online: ${client.user.tag}`);
-    loadManualTimeouts(); // استعادة التوايم اليدوية بعد إعادة التشغيل
 
     const setLogCommand = new SlashCommandBuilder()
         .setName('setlog')
@@ -408,24 +315,9 @@ client.on('messageCreate', async (message) => {
                 return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك أو نفسك.');
             }
 
-            try {
-                // نحاول التايم العادي أولاً
-                await target.timeout(duration, `بواسطة: ${message.author.username}`);
-                await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
-                return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
-            } catch (err) {
-                // للأونر: لو فشل التايم العادي (أدمن/نفس الرتبة) نستخدم اليدوي مباشرة
-                if (isOwner) {
-                    const success = await applyManualTimeout(message.guild, target, duration, `بواسطة: ${message.author.username}`);
-                    if (success) {
-                        await sendLog(message.guild, '🔇 تايم أوت (يدوي)', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
-                        return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr} (تايم أوت يدوي).`);
-                    } else {
-                        return message.reply('❌ ما قدرت أسوي تايم أوت. تأكد أن البوت عنده صلاحية `Manage Permissions` في القنوات.');
-                    }
-                }
-                throw err;
-            }
+            await target.timeout(duration, `بواسطة: ${message.author.username}`);
+            await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
+            return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
         }
 
         // ===== UNTIMEOUT =====
@@ -435,12 +327,7 @@ client.on('messageCreate', async (message) => {
             if (!target)
                 return message.reply('❌ حدد عضو.');
 
-            try {
-                await target.timeout(null);
-            } catch (e) {}
-
-            await removeManualTimeout(message.guild, target);
-
+            await target.timeout(null);
             await sendLog(message.guild, '🔊 فك التايم', target, `بواسطة: ${message.author.username}`);
             return message.reply(`✅ تم فك التايم عن ${target.user.username}.`);
         }
