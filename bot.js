@@ -43,6 +43,36 @@ let logChannels = loadJSON(LOG_FILE);
 function saveJailDB() { saveJSON(DB_FILE, jailDatabase); }
 function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
 
+// ==================== MUTE ROLE SYSTEM ====================
+
+async function getOrCreateMuteRole(guild) {
+    let muteRole = guild.roles.cache.find(r => r.name === 'Muted' || r.name === 'ميوت');
+    if (muteRole) return muteRole;
+
+    muteRole = await guild.roles.create({
+        name: 'Muted',
+        color: '#808080',
+        reason: 'Mute role for timeout fallback'
+    });
+
+    // نجهز صلاحيات الرتبة في كل القنوات (مرة وحدة بس)
+    const channels = guild.channels.cache.filter(c => c.isTextBased() || c.type === 2);
+    for (const channel of channels.values()) {
+        try {
+            await channel.permissionOverwrites.edit(muteRole.id, {
+                SendMessages: false,
+                AddReactions: false,
+                Speak: false,
+                SendMessagesInThreads: false,
+                CreatePublicThreads: false,
+                CreatePrivateThreads: false
+            });
+        } catch (e) {}
+    }
+
+    return muteRole;
+}
+
 // ==================== LOG SYSTEM ====================
 
 async function sendLog(guild, title, target, description, color = 0xFF0000) {
@@ -167,6 +197,7 @@ client.on('messageCreate', async (message) => {
     console.log(`[CMD] ${commandName} | target: ${target?.user?.username || 'none'} | by: ${message.author.username}`);
 
     const isOwner = message.author.id === OWNER_ID;
+    const isAdmin = isOwner || message.member.permissions.has(PermissionsBitField.Flags.Administrator);
 
     try {
 
@@ -189,15 +220,13 @@ client.on('messageCreate', async (message) => {
 
         // ===== JAIL =====
         if (commandName === 'سجن') {
-            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما عندك صلاحية إدارة الرتب.');
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
             
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+            if (!isAdmin && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تسجن عضو رتبته أعلى منك أو نفسك.');
-            if (!isOwner && target.permissions.has(PermissionsBitField.Flags.Administrator))
-                return message.reply('❌ ما تقدر تسجن أدمن.');
 
             await message.guild.roles.fetch();
             let jailRole = message.guild.roles.cache.find(r => r.name === 'سجين')
@@ -215,7 +244,7 @@ client.on('messageCreate', async (message) => {
 
         // ===== UNJAIL =====
         if (commandName === 'افراج') {
-            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما عندك صلاحية.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
@@ -231,12 +260,12 @@ client.on('messageCreate', async (message) => {
 
         // ===== BAN =====
         if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك' || commandName === 'بزبي') {
-            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية الحظر.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
             
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+            if (!isAdmin && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تحظر عضو رتبته أعلى منك أو نفسك.');
 
             await target.ban();
@@ -246,7 +275,7 @@ client.on('messageCreate', async (message) => {
 
         // ===== UNBAN =====
         if (commandName === 'فك') {
-            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية فك الحظر.');
             if (!args[0])
                 return message.reply('❌ حدد آيدي أو يوزر. مثال: `فك 123456789` أو `فك username`');
@@ -283,12 +312,12 @@ client.on('messageCreate', async (message) => {
 
         // ===== KICK =====
         if (commandName === 'طرد' || commandName === 'kick') {
-            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.KickMembers))
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.KickMembers))
                 return message.reply('❌ ما عندك صلاحية الطرد.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
             
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+            if (!isAdmin && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تطير عضو رتبته أعلى منك أو نفسك.');
 
             await target.kick();
@@ -298,7 +327,7 @@ client.on('messageCreate', async (message) => {
 
         // ===== TIMEOUT =====
         if (commandName === 'تايم' || commandName === 'سد حلقك') {
-            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
                 return message.reply('❌ ما عندك صلاحية الإسكات.');
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `تايم @عضو 10m`');
@@ -311,30 +340,63 @@ client.on('messageCreate', async (message) => {
             if (!duration)
                 return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
 
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position) {
+            if (!isAdmin && target.roles.highest.position >= message.member.roles.highest.position) {
                 return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك أو نفسك.');
             }
 
-            await target.timeout(duration, `بواسطة: ${message.author.username}`);
-            await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
-            return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
+            try {
+                // نحاول التايم العادي أولاً
+                await target.timeout(duration, `بواسطة: ${message.author.username}`);
+                await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
+                return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
+            } catch (err) {
+                // لو فشل (أدمن/نفس الرتبة) نستخدم رتبة الميوت
+                if (err.code === 50013) {
+                    const muteRole = await getOrCreateMuteRole(message.guild);
+                    await target.roles.add(muteRole);
+                    
+                    // نفكها تلقائياً بعد المدة
+                    setTimeout(async () => {
+                        try {
+                            const freshMember = await message.guild.members.fetch(target.id);
+                            if (freshMember.roles.cache.has(muteRole.id)) {
+                                await freshMember.roles.remove(muteRole);
+                            }
+                        } catch (e) {}
+                    }, duration);
+
+                    await sendLog(message.guild, '🔇 تايم أوت (رتبة)', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
+                    return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr} (باستخدام رتبة الميوت).`);
+                }
+                throw err;
+            }
         }
 
         // ===== UNTIMEOUT =====
         if (commandName === 'تكلم') {
-            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
                 return message.reply('❌ ما عندك صلاحية.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
 
-            await target.timeout(null);
+            // نفك التايم العادي
+            try {
+                await target.timeout(null);
+            } catch (e) {}
+
+            // نفك رتبة الميوت
+            const muteRole = message.guild.roles.cache.find(r => r.name === 'Muted' || r.name === 'ميوت');
+            if (muteRole && target.roles.cache.has(muteRole.id)) {
+                await target.roles.remove(muteRole);
+            }
+
             await sendLog(message.guild, '🔊 فك التايم', target, `بواسطة: ${message.author.username}`);
             return message.reply(`✅ تم فك التايم عن ${target.user.username}.`);
         }
 
         // ===== ROLE =====
         if (commandName === 'r') {
-            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما معك صلاحية.');
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `r @عضو اسم_الرتبة`');
