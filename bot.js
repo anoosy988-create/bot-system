@@ -22,6 +22,7 @@ const client = new Client({
 
 const DB_FILE = './jailDatabase.json';
 const LOG_FILE = './logChannels.json';
+const MANUAL_TIMEOUT_FILE = './manualTimeouts.json';
 
 function loadJSON(file) {
     if (!fs.existsSync(file)) return new Map();
@@ -42,6 +43,97 @@ let logChannels = loadJSON(LOG_FILE);
 
 function saveJailDB() { saveJSON(DB_FILE, jailDatabase); }
 function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
+
+// ==================== MANUAL TIMEOUT SYSTEM ====================
+
+const manualTimeouts = new Map(); // key: guildId_memberId -> { timeoutId, endTime }
+
+function saveManualTimeouts() {
+    const data = {};
+    for (const [key, val] of manualTimeouts.entries()) {
+        data[key] = { endTime: val.endTime };
+    }
+    fs.writeFileSync(MANUAL_TIMEOUT_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function loadManualTimeouts() {
+    if (!fs.existsSync(MANUAL_TIMEOUT_FILE)) return;
+    try {
+        const data = JSON.parse(fs.readFileSync(MANUAL_TIMEOUT_FILE, 'utf8'));
+        const now = Date.now();
+        for (const [key, val] of Object.entries(data)) {
+            const remaining = val.endTime - now;
+            if (remaining > 0) {
+                const [guildId, memberId] = key.split('_');
+                const guild = client.guilds.cache.get(guildId);
+                if (guild) {
+                    guild.members.fetch(memberId).then(member => {
+                        applyManualTimeout(guild, member, remaining, 'استعادة بعد إعادة تشغيل البوت', false);
+                    }).catch(() => {});
+                }
+            }
+        }
+    } catch(e) {}
+}
+
+async function applyManualTimeout(guild, member, durationMs, reason, save = true) {
+    const channels = guild.channels.cache.filter(c => 
+        c.isTextBased() || c.type === 2
+    );
+    
+    let appliedCount = 0;
+    
+    for (const channel of channels.values()) {
+        try {
+            await channel.permissionOverwrites.edit(member.id, {
+                SendMessages: false,
+                AddReactions: false,
+                Speak: false,
+                SendMessagesInThreads: false,
+                CreatePublicThreads: false,
+                CreatePrivateThreads: false
+            });
+            appliedCount++;
+        } catch (e) {}
+    }
+    
+    if (appliedCount === 0) return false;
+    
+    const key = `${guild.id}_${member.id}`;
+    const endTime = Date.now() + durationMs;
+    
+    if (manualTimeouts.has(key)) {
+        clearTimeout(manualTimeouts.get(key).timeoutId);
+    }
+    
+    const timeoutId = setTimeout(async () => {
+        await removeManualTimeout(guild, member);
+    }, durationMs);
+    
+    manualTimeouts.set(key, { timeoutId, endTime });
+    if (save) saveManualTimeouts();
+    return true;
+}
+
+async function removeManualTimeout(guild, member) {
+    const key = `${guild.id}_${member.id}`;
+    
+    if (manualTimeouts.has(key)) {
+        clearTimeout(manualTimeouts.get(key).timeoutId);
+        manualTimeouts.delete(key);
+        saveManualTimeouts();
+    }
+    
+    const channels = guild.channels.cache.filter(c => 
+        c.isTextBased() || c.type === 2
+    );
+    
+    for (const channel of channels.values()) {
+        try {
+            await channel.permissionOverwrites.delete(member.id);
+        } catch (e) {}
+    }
+}
 
 // ==================== LOG SYSTEM ====================
 
@@ -111,6 +203,7 @@ const OWNER_ID = '1364275261398581279';
 
 client.on('ready', async () => {
     console.log(`✅ Bot online: ${client.user.tag}`);
+    loadManualTimeouts(); // استعادة التوايم اليدوية بعد إعادة التشغيل
 
     const setLogCommand = new SlashCommandBuilder()
         .setName('setlog')
@@ -146,7 +239,6 @@ client.on('interactionCreate', async (interaction) => {
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
-    // منع التكرار
     if (processedMessages.has(message.id)) return;
     processedMessages.add(message.id);
     setTimeout(() => processedMessages.delete(message.id), 10000);
@@ -166,6 +258,8 @@ client.on('messageCreate', async (message) => {
     if (!PREFIX_COMMANDS.includes(commandName)) return;
 
     console.log(`[CMD] ${commandName} | target: ${target?.user?.username || 'none'} | by: ${message.author.username}`);
+
+    const isOwner = message.author.id === OWNER_ID;
 
     try {
 
@@ -188,15 +282,13 @@ client.on('messageCreate', async (message) => {
 
         // ===== JAIL =====
         if (commandName === 'سجن') {
-            if (!message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما عندك صلاحية إدارة الرتب.');
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
             
-            const isOwner = message.author.id === OWNER_ID;
-            // تغيير >= إلى > : يسمح بالسجن حتى لنفس الرتبة
-            if (!isOwner && target.roles.highest.position > message.member.roles.highest.position)
-                return message.reply('❌ ما تقدر تسجن عضو رتبته أعلى منك.');
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تسجن عضو رتبته أعلى منك أو نفسك.');
             if (!isOwner && target.permissions.has(PermissionsBitField.Flags.Administrator))
                 return message.reply('❌ ما تقدر تسجن أدمن.');
 
@@ -216,7 +308,7 @@ client.on('messageCreate', async (message) => {
 
         // ===== UNJAIL =====
         if (commandName === 'افراج') {
-            if (!message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما عندك صلاحية.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
@@ -232,15 +324,13 @@ client.on('messageCreate', async (message) => {
 
         // ===== BAN =====
         if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك' || commandName === 'بزبي') {
-            if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية الحظر.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
             
-            const isOwner = message.author.id === OWNER_ID;
-            // تغيير >= إلى > : يسمح بالبان حتى لنفس الرتبة
-            if (!isOwner && target.roles.highest.position > message.member.roles.highest.position)
-                return message.reply('❌ ما تقدر تحظر عضو رتبته أعلى منك.');
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تحظر عضو رتبته أعلى منك أو نفسك.');
 
             await target.ban();
             await sendLog(message.guild, '🔨 حظر', target, `بواسطة: ${message.author.username}`);
@@ -249,7 +339,6 @@ client.on('messageCreate', async (message) => {
 
         // ===== UNBAN =====
         if (commandName === 'فك') {
-            const isOwner = message.author.id === OWNER_ID;
             if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية فك الحظر.');
             if (!args[0])
@@ -259,12 +348,10 @@ client.on('messageCreate', async (message) => {
             let userId = input;
             let username = input;
 
-            // التحقق إذا كان منشن
             const mentionMatch = input.match(/^<@!?(\d{17,19})>$/);
             if (mentionMatch) {
                 userId = mentionMatch[1];
             } else if (!/^\d{17,19}$/.test(input)) {
-                // إذا كان الإدخال ليس آيدي، نبحث في قائمة المحظورين
                 const bans = await message.guild.bans.fetch();
                 const banned = bans.find(b => b.user.username.toLowerCase() === input.toLowerCase());
                 if (!banned)
@@ -273,7 +360,6 @@ client.on('messageCreate', async (message) => {
                 username = banned.user.username;
             }
 
-            // جلب اسم اليوزر إذا كان عندنا آيدي فقط
             if (!username || username === userId) {
                 try {
                     const user = await client.users.fetch(userId);
@@ -290,15 +376,13 @@ client.on('messageCreate', async (message) => {
 
         // ===== KICK =====
         if (commandName === 'طرد' || commandName === 'kick') {
-            if (!message.member.permissions.has(PermissionsBitField.Flags.KickMembers))
+            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.KickMembers))
                 return message.reply('❌ ما عندك صلاحية الطرد.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
             
-            const isOwner = message.author.id === OWNER_ID;
-            // تغيير >= إلى > : يسمح بالطرد حتى لنفس الرتبة
-            if (!isOwner && target.roles.highest.position > message.member.roles.highest.position)
-                return message.reply('❌ ما تقدر تطير عضو رتبته أعلى منك.');
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تطير عضو رتبته أعلى منك أو نفسك.');
 
             await target.kick();
             await sendLog(message.guild, '👢 طرد', target, `بواسطة: ${message.author.username}`);
@@ -307,14 +391,11 @@ client.on('messageCreate', async (message) => {
 
         // ===== TIMEOUT =====
         if (commandName === 'تايم' || commandName === 'سد حلقك') {
-            if (!message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
+            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
                 return message.reply('❌ ما عندك صلاحية الإسكات.');
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `تايم @عضو 10m`');
 
-            const isOwner = message.author.id === OWNER_ID;
-            
-            // نجمع args بعد المنشن، أو نبحث عن أي arg يمكن تحويله لوقت
             const timeStr = args.slice(1).join(' ').trim() || args.find(arg => ms(arg));
             if (!timeStr)
                 return message.reply('❌ حدد المدة. مثال: `تايم @عضو 10m`');
@@ -323,31 +404,50 @@ client.on('messageCreate', async (message) => {
             if (!duration)
                 return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
 
-            // تغيير >= إلى > : يسمح بالتايم حتى لنفس الرتبة
-            if (!isOwner && target.roles.highest.position > message.member.roles.highest.position) {
-                return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك.');
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position) {
+                return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك أو نفسك.');
             }
 
-            await target.timeout(duration, `بواسطة: ${message.author.username}`);
-            await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
-            return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
+            try {
+                // نحاول التايم العادي أولاً
+                await target.timeout(duration, `بواسطة: ${message.author.username}`);
+                await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
+                return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
+            } catch (err) {
+                // للأونر: لو فشل التايم العادي (أدمن/نفس الرتبة) نستخدم اليدوي مباشرة
+                if (isOwner) {
+                    const success = await applyManualTimeout(message.guild, target, duration, `بواسطة: ${message.author.username}`);
+                    if (success) {
+                        await sendLog(message.guild, '🔇 تايم أوت (يدوي)', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
+                        return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr} (تايم أوت يدوي).`);
+                    } else {
+                        return message.reply('❌ ما قدرت أسوي تايم أوت. تأكد أن البوت عنده صلاحية `Manage Permissions` في القنوات.');
+                    }
+                }
+                throw err;
+            }
         }
 
         // ===== UNTIMEOUT =====
         if (commandName === 'تكلم') {
-            if (!message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
+            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
                 return message.reply('❌ ما عندك صلاحية.');
             if (!target)
                 return message.reply('❌ حدد عضو.');
 
-            await target.timeout(null);
+            try {
+                await target.timeout(null);
+            } catch (e) {}
+
+            await removeManualTimeout(message.guild, target);
+
             await sendLog(message.guild, '🔊 فك التايم', target, `بواسطة: ${message.author.username}`);
             return message.reply(`✅ تم فك التايم عن ${target.user.username}.`);
         }
 
         // ===== ROLE =====
         if (commandName === 'r') {
-            if (!message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+            if (!isOwner && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما معك صلاحية.');
             if (!target)
                 return message.reply('❌ حدد عضو. مثال: `r @عضو اسم_الرتبة`');
