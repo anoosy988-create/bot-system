@@ -45,7 +45,6 @@ function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
 function saveWelcomeChannels() { saveJSON(WELCOME_FILE, welcomeChannels); }
 
 // ==================== WELCOME IMAGE SYSTEM ====================
-// استخدم رابط Discord CDN مباشرة - لو وقف، بس ارسل الصورة ثاني وخذ الرابط الجديد
 const WELCOME_BG_URL = 'https://cdn.discordapp.com/attachments/1538615701231632405/1538615802151047188/1786904133960.png?ex=6a835321&is=6a8201a1&hm=4a2c42a86367463168f6580ab898543f14f3acaf3feb2bef2ad45122e4e525be&';
 
 async function getCanvas() {
@@ -71,20 +70,16 @@ async function createWelcomeImage(member) {
     const canvas = createCanvas(1425, 736);
     const ctx = canvas.getContext('2d');
 
-    // Load background from URL
     const background = await loadImage(WELCOME_BG_URL);
     ctx.drawImage(background, 0, 0, canvas.width, canvas.height);
 
-    // Load member avatar
     const avatarURL = member.user.displayAvatarURL({ extension: 'png', size: 512 });
     const avatar = await loadImage(avatarURL);
 
-    // Avatar position
     const avatarX = 180;
     const avatarY = 200;
     const avatarSize = 280;
 
-    // Circular clip
     ctx.save();
     ctx.beginPath();
     ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
@@ -93,14 +88,12 @@ async function createWelcomeImage(member) {
     ctx.drawImage(avatar, avatarX, avatarY, avatarSize, avatarSize);
     ctx.restore();
 
-    // Gold border
     ctx.beginPath();
     ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2 + 8, 0, Math.PI * 2);
     ctx.lineWidth = 8;
     ctx.strokeStyle = '#d4af37';
     ctx.stroke();
 
-    // Username only
     ctx.font = 'bold 42px DejaVu Sans, Arial, sans-serif';
     ctx.fillStyle = '#d4af37';
     ctx.textAlign = 'left';
@@ -266,7 +259,7 @@ client.on('guildMemberAdd', async (member) => {
     try {
         const imageBuffer = await createWelcomeImage(member);
 
-        const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
+        const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
 
         if (imageBuffer) {
             await channel.send({
@@ -279,7 +272,7 @@ client.on('guildMemberAdd', async (member) => {
     } catch (error) {
         console.error('[WELCOME ERROR]', error);
         await channel.send({
-            content: `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`
+            content: `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`
         }).catch(() => {});
     }
 });
