@@ -2,12 +2,9 @@ const { Client, GatewayIntentBits, PermissionsBitField, EmbedBuilder, SlashComma
 const ms = require('ms');
 const fs = require('fs');
 const express = require('express');
-const { createCanvas, loadImage } = require('canvas');
-const path = require('path');
 
 const app = express();
 const port = process.env.PORT || 3000;
-
 app.get('/', (req, res) => res.send('Bot is active!'));
 app.listen(port, () => console.log(`Server listening on port ${port}`));
 
@@ -21,7 +18,6 @@ const client = new Client({
 });
 
 // ==================== DATABASE ====================
-
 const DB_FILE = './jailDatabase.json';
 const LOG_FILE = './logChannels.json';
 const WELCOME_FILE = './welcomeChannels.json';
@@ -49,45 +45,62 @@ function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
 function saveWelcomeChannels() { saveJSON(WELCOME_FILE, welcomeChannels); }
 
 // ==================== WELCOME IMAGE SYSTEM ====================
+// استخدم رابط Discord CDN مباشرة - لو وقف، بس ارسل الصورة ثاني وخذ الرابط الجديد
+const WELCOME_BG_URL = 'https://cdn.discordapp.com/attachments/1538615701231632405/1538615802151047188/1786904133960.png?ex=6a835321&is=6a8201a1&hm=4a2c42a86367463168f6580ab898543f14f3acaf3feb2bef2ad45122e4e525be&';
 
-const WELCOME_BG_PATH = './welcome_bg.png'; // ← حط هنا اسم ملف الصورة الخلفية
+async function getCanvas() {
+    try {
+        return require('@napi-rs/canvas');
+    } catch {
+        try {
+            return require('canvas');
+        } catch {
+            return null;
+        }
+    }
+}
 
 async function createWelcomeImage(member) {
+    const canvasLib = await getCanvas();
+    if (!canvasLib) {
+        console.log('[WARN] No canvas library found');
+        return null;
+    }
+
+    const { createCanvas, loadImage } = canvasLib;
     const canvas = createCanvas(1425, 736);
     const ctx = canvas.getContext('2d');
 
-    // Load background (your image - no modifications to it)
-    const background = await loadImage(WELCOME_BG_PATH);
+    // Load background from URL
+    const background = await loadImage(WELCOME_BG_URL);
     ctx.drawImage(background, 0, 0, canvas.width, canvas.height);
 
     // Load member avatar
     const avatarURL = member.user.displayAvatarURL({ extension: 'png', size: 512 });
     const avatar = await loadImage(avatarURL);
 
-    // Avatar position (where the shmagh figure was)
+    // Avatar position
     const avatarX = 180;
     const avatarY = 200;
     const avatarSize = 280;
 
-    // Circular clip for avatar
+    // Circular clip
     ctx.save();
     ctx.beginPath();
     ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
     ctx.closePath();
     ctx.clip();
-
-    // Draw avatar
     ctx.drawImage(avatar, avatarX, avatarY, avatarSize, avatarSize);
     ctx.restore();
 
-    // Gold border around avatar
+    // Gold border
     ctx.beginPath();
     ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2 + 8, 0, Math.PI * 2);
     ctx.lineWidth = 8;
     ctx.strokeStyle = '#d4af37';
     ctx.stroke();
 
-    // Username ONLY - no WELCOME text on image
+    // Username only
     ctx.font = 'bold 42px DejaVu Sans, Arial, sans-serif';
     ctx.fillStyle = '#d4af37';
     ctx.textAlign = 'left';
@@ -106,7 +119,6 @@ async function createWelcomeImage(member) {
 }
 
 // ==================== MUTE ROLE SYSTEM ====================
-
 async function getOrCreateMuteRole(guild) {
     let muteRole = guild.roles.cache.find(r => r.name === 'Muted' || r.name === 'ميوت');
     if (muteRole) return muteRole;
@@ -130,16 +142,13 @@ async function getOrCreateMuteRole(guild) {
             });
         } catch (e) {}
     }
-
     return muteRole;
 }
 
 // ==================== LOG SYSTEM ====================
-
 async function sendLog(guild, title, target, description, color = 0xFF0000) {
     const logChannelId = logChannels.get(guild.id);
     if (!logChannelId) return;
-
     const channel = guild.channels.cache.get(logChannelId);
     if (!channel) return;
 
@@ -156,7 +165,6 @@ async function sendLog(guild, title, target, description, color = 0xFF0000) {
 }
 
 // ==================== SINGLE INSTANCE LOCK ====================
-
 const fs_lock = require('fs');
 const LOCK_FILE = './.bot.lock';
 
@@ -179,11 +187,9 @@ process.on('SIGINT', () => { try{fs_lock.unlinkSync(LOCK_FILE)}catch(e){} proces
 process.on('SIGTERM', () => { try{fs_lock.unlinkSync(LOCK_FILE)}catch(e){} process.exit(0); });
 
 // ==================== ANTI-DUPLICATE ====================
-
 const processedMessages = new Set();
 
 // ==================== COMMANDS LIST ====================
-
 const PREFIX_COMMANDS = [
     'مساعده', 'help',
     'سجن', 'افراج',
@@ -199,7 +205,6 @@ const PREFIX_COMMANDS = [
 const OWNER_ID = '1364275261398581279';
 
 // ==================== SLASH COMMANDS ====================
-
 client.on('ready', async () => {
     console.log(`✅ Bot online: ${client.user.tag}`);
 
@@ -233,11 +238,9 @@ client.on('interactionCreate', async (interaction) => {
         if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
             return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
         }
-
         const channel = interaction.options.getChannel('channel');
         logChannels.set(interaction.guild.id, channel.id);
         saveLogChannels();
-
         return interaction.reply({ content: `✅ تم تحديد روم اللوقات: ${channel}`, ephemeral: true });
     }
 
@@ -245,17 +248,14 @@ client.on('interactionCreate', async (interaction) => {
         if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
             return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
         }
-
         const channel = interaction.options.getChannel('channel');
         welcomeChannels.set(interaction.guild.id, channel.id);
         saveWelcomeChannels();
-
         return interaction.reply({ content: `✅ تم تحديد روم الترحيب: ${channel}`, ephemeral: true });
     }
 });
 
 // ==================== WELCOME EVENT ====================
-
 client.on('guildMemberAdd', async (member) => {
     const welcomeChannelId = welcomeChannels.get(member.guild.id);
     if (!welcomeChannelId) return;
@@ -266,14 +266,18 @@ client.on('guildMemberAdd', async (member) => {
     try {
         const imageBuffer = await createWelcomeImage(member);
 
-        // ALL text goes in the message, NOT on the image
-        await channel.send({
-            content: `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`,
-            files: [{ attachment: imageBuffer, name: 'welcome.png' }]
-        });
+        const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
+
+        if (imageBuffer) {
+            await channel.send({
+                content: messageContent,
+                files: [{ attachment: imageBuffer, name: 'welcome.png' }]
+            });
+        } else {
+            await channel.send({ content: messageContent });
+        }
     } catch (error) {
         console.error('[WELCOME ERROR]', error);
-        // Fallback text only
         await channel.send({
             content: `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`
         }).catch(() => {});
@@ -281,15 +285,12 @@ client.on('guildMemberAdd', async (member) => {
 });
 
 // ==================== MESSAGE COMMANDS ====================
-
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
-
     if (processedMessages.has(message.id)) return;
     processedMessages.add(message.id);
     setTimeout(() => processedMessages.delete(message.id), 10000);
 
-    // --- الردود التلقائية ---
     if (message.content === "سلام عليكم") return message.reply("عليكم السلام ورحمة الله وبركاته، منور!");
     if (message.content === ".") return message.reply("العسل ينقط، يلبى بس!");
     if (message.content === "تفاعلو") {
@@ -309,8 +310,6 @@ client.on('messageCreate', async (message) => {
     const isAdmin = message.member.permissions.has(PermissionsBitField.Flags.Administrator);
 
     try {
-
-        // ===== HELP =====
         if (commandName === 'مساعده' || commandName === 'help') {
             const embed = new EmbedBuilder()
                 .setTitle('أوامر البوت')
@@ -327,13 +326,10 @@ client.on('messageCreate', async (message) => {
             return message.channel.send({ embeds: [embed] });
         }
 
-        // ===== JAIL =====
         if (commandName === 'سجن') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما عندك صلاحية إدارة الرتب.');
-            if (!target)
-                return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
-            
+            if (!target) return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
             if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تسجن عضو رتبته أعلى منك أو نفسك.');
 
@@ -351,14 +347,11 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ تم سجن ${target.user.username}.`);
         }
 
-        // ===== UNJAIL =====
         if (commandName === 'افراج') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما عندك صلاحية.');
-            if (!target)
-                return message.reply('❌ حدد عضو.');
-            if (!jailDatabase.has(target.id))
-                return message.reply('❌ هذا العضو مو مسجون.');
+            if (!target) return message.reply('❌ حدد عضو.');
+            if (!jailDatabase.has(target.id)) return message.reply('❌ هذا العضو مو مسجون.');
 
             await target.roles.set(jailDatabase.get(target.id));
             jailDatabase.delete(target.id);
@@ -367,13 +360,10 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ تم فك السجن عن ${target.user.username}.`);
         }
 
-        // ===== BAN =====
         if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك' || commandName === 'بزبي') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية الحظر.');
-            if (!target)
-                return message.reply('❌ حدد عضو.');
-            
+            if (!target) return message.reply('❌ حدد عضو.');
             if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تحظر عضو رتبته أعلى منك أو نفسك.');
 
@@ -382,12 +372,10 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ راح لندن ${target.user.username}.`);
         }
 
-        // ===== UNBAN =====
         if (commandName === 'فك') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية فك الحظر.');
-            if (!args[0])
-                return message.reply('❌ حدد آيدي أو يوزر. مثال: `فك 123456789` أو `فك username`');
+            if (!args[0]) return message.reply('❌ حدد آيدي أو يوزر. مثال: `فك 123456789` أو `فك username`');
 
             const input = args[0];
             let userId = input;
@@ -399,8 +387,7 @@ client.on('messageCreate', async (message) => {
             } else if (!/^\d{17,19}$/.test(input)) {
                 const bans = await message.guild.bans.fetch();
                 const banned = bans.find(b => b.user.username.toLowerCase() === input.toLowerCase());
-                if (!banned)
-                    return message.reply(`❌ ما لقيت محظور باسم "${input}".`);
+                if (!banned) return message.reply(`❌ ما لقيت محظور باسم "${input}".`);
                 userId = banned.user.id;
                 username = banned.user.username;
             }
@@ -419,13 +406,10 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ تم فك الحظر عن **${username}**.`);
         }
 
-        // ===== KICK =====
         if (commandName === 'طرد' || commandName === 'kick') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.KickMembers))
                 return message.reply('❌ ما عندك صلاحية الطرد.');
-            if (!target)
-                return message.reply('❌ حدد عضو.');
-            
+            if (!target) return message.reply('❌ حدد عضو.');
             if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تطير عضو رتبته أعلى منك أو نفسك.');
 
@@ -434,24 +418,19 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ تم تسفيره ${target.user.username}.`);
         }
 
-        // ===== TIMEOUT =====
         if (commandName === 'تايم' || commandName === 'سد حلقك') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
                 return message.reply('❌ ما عندك صلاحية الإسكات.');
-            if (!target)
-                return message.reply('❌ حدد عضو. مثال: `تايم @عضو 10m`');
+            if (!target) return message.reply('❌ حدد عضو. مثال: `تايم @عضو 10m`');
 
             const timeStr = args.slice(1).join(' ').trim() || args.find(arg => ms(arg));
-            if (!timeStr)
-                return message.reply('❌ حدد المدة. مثال: `تايم @عضو 10m`');
+            if (!timeStr) return message.reply('❌ حدد المدة. مثال: `تايم @عضو 10m`');
 
             const duration = ms(timeStr);
-            if (!duration)
-                return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
+            if (!duration) return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
 
-            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position) {
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك أو نفسك.');
-            }
 
             try {
                 await target.timeout(duration, `بواسطة: ${message.author.username}`);
@@ -461,7 +440,6 @@ client.on('messageCreate', async (message) => {
                 if (err.code === 50013) {
                     const muteRole = await getOrCreateMuteRole(message.guild);
                     await target.roles.add(muteRole);
-                    
                     setTimeout(async () => {
                         try {
                             const freshMember = await message.guild.members.fetch(target.id);
@@ -470,7 +448,6 @@ client.on('messageCreate', async (message) => {
                             }
                         } catch (e) {}
                     }, duration);
-
                     await sendLog(message.guild, '🔇 تايم أوت (رتبة)', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
                     return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr} (باستخدام رتبة الميوت).`);
                 }
@@ -478,84 +455,64 @@ client.on('messageCreate', async (message) => {
             }
         }
 
-        // ===== UNTIMEOUT =====
         if (commandName === 'تكلم') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
                 return message.reply('❌ ما عندك صلاحية.');
-            if (!target)
-                return message.reply('❌ حدد عضو.');
+            if (!target) return message.reply('❌ حدد عضو.');
 
-            try {
-                await target.timeout(null);
-            } catch (e) {}
+            try { await target.timeout(null); } catch (e) {}
 
             const muteRole = message.guild.roles.cache.find(r => r.name === 'Muted' || r.name === 'ميوت');
-            if (muteRole && target.roles.cache.has(muteRole.id)) {
-                await target.roles.remove(muteRole);
-            }
+            if (muteRole && target.roles.cache.has(muteRole.id)) await target.roles.remove(muteRole);
 
             await sendLog(message.guild, '🔊 فك التايم', target, `بواسطة: ${message.author.username}`);
             return message.reply(`✅ تم فك التايم عن ${target.user.username}.`);
         }
 
-        // ===== GIVE ROLE =====
         if (commandName === 'r') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما معك صلاحية.');
-            if (!target)
-                return message.reply('❌ حدد عضو. مثال: `r @عضو اسم_الرتبة`');
+            if (!target) return message.reply('❌ حدد عضو. مثال: `r @عضو اسم_الرتبة`');
 
-            const filteredArgs = args.filter(a => !a.match(/^<@!?\d+>$/) && !a.match(/^\d{17,19}$/));
+            const filteredArgs = args.filter(a => !a.match(/^<@!?\d+$/) && !a.match(/^\d{17,19}$/));
             const roleName = filteredArgs.join(' ').trim();
             const roleId = args.find(a => a.match(/^\d{17,19}$/));
 
-            if (!roleName && !roleId)
-                return message.reply('❌ حدد اسم الرتبة.');
+            if (!roleName && !roleId) return message.reply('❌ حدد اسم الرتبة.');
 
             await message.guild.roles.fetch();
             const role = message.guild.roles.cache.get(roleId) ||
                 message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
 
-            if (!role)
-                return message.reply(`❌ ما لقيت رتبة باسم "${roleName}".`);
-
-            if (!isOwner && role.position >= message.member.roles.highest.position) {
+            if (!role) return message.reply(`❌ ما لقيت رتبة باسم "${roleName}".`);
+            if (!isOwner && role.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تعطي رتبة أعلى منك أو نفس رتبتك.');
-            }
 
             await target.roles.add(role);
             await sendLog(message.guild, '🏷️ إعطاء رتبة', target, `الرتبة: ${role.name} | بواسطة: ${message.author.username}`, 0x00FF00);
             return message.reply(`✅ تم إعطاء ${target.user.username} رتبة ${role.name}.`);
         }
 
-        // ===== REMOVE ROLE =====
         if (commandName === 'شيل') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما معك صلاحية.');
-            if (!target)
-                return message.reply('❌ حدد عضو. مثال: `شيل @عضو اسم_الرتبة`');
+            if (!target) return message.reply('❌ حدد عضو. مثال: `شيل @عضو اسم_الرتبة`');
 
-            const filteredArgs = args.filter(a => !a.match(/^<@!?\d+>$/) && !a.match(/^\d{17,19}$/));
+            const filteredArgs = args.filter(a => !a.match(/^<@!?\d+$/) && !a.match(/^\d{17,19}$/));
             const roleName = filteredArgs.join(' ').trim();
             const roleId = args.find(a => a.match(/^\d{17,19}$/));
 
-            if (!roleName && !roleId)
-                return message.reply('❌ حدد اسم الرتبة.');
+            if (!roleName && !roleId) return message.reply('❌ حدد اسم الرتبة.');
 
             await message.guild.roles.fetch();
             const role = message.guild.roles.cache.get(roleId) ||
                 message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
 
-            if (!role)
-                return message.reply(`❌ ما لقيت رتبة باسم "${roleName}".`);
-
-            if (!isOwner && role.position >= message.member.roles.highest.position) {
+            if (!role) return message.reply(`❌ ما لقيت رتبة باسم "${roleName}".`);
+            if (!isOwner && role.position >= message.member.roles.highest.position)
                 return message.reply('❌ ما تقدر تشيل رتبة أعلى منك أو نفس رتبتك.');
-            }
-
-            if (!target.roles.cache.has(role.id)) {
+            if (!target.roles.cache.has(role.id))
                 return message.reply(`❌ ${target.user.username} ما معه رتبة **${role.name}**.`);
-            }
 
             await target.roles.remove(role);
             await sendLog(message.guild, '🗑️ تجريد من رتبة', target, `الرتبة: ${role.name} | بواسطة: ${message.author.username}`, 0xFFA500);
