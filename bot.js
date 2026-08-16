@@ -2,6 +2,8 @@ const { Client, GatewayIntentBits, PermissionsBitField, EmbedBuilder, SlashComma
 const ms = require('ms');
 const fs = require('fs');
 const express = require('express');
+const { createCanvas, loadImage } = require('canvas');
+const path = require('path');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -22,6 +24,7 @@ const client = new Client({
 
 const DB_FILE = './jailDatabase.json';
 const LOG_FILE = './logChannels.json';
+const WELCOME_FILE = './welcomeChannels.json';
 
 function loadJSON(file) {
     if (!fs.existsSync(file)) return new Map();
@@ -39,9 +42,68 @@ function saveJSON(file, data) {
 
 const jailDatabase = loadJSON(DB_FILE);
 let logChannels = loadJSON(LOG_FILE);
+let welcomeChannels = loadJSON(WELCOME_FILE);
 
 function saveJailDB() { saveJSON(DB_FILE, jailDatabase); }
 function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
+function saveWelcomeChannels() { saveJSON(WELCOME_FILE, welcomeChannels); }
+
+// ==================== WELCOME IMAGE SYSTEM ====================
+
+const WELCOME_BG_PATH = './welcome_bg.png'; // ← حط هنا اسم ملف الصورة الخلفية
+
+async function createWelcomeImage(member) {
+    const canvas = createCanvas(1425, 736);
+    const ctx = canvas.getContext('2d');
+
+    // Load background (your image - no modifications to it)
+    const background = await loadImage(WELCOME_BG_PATH);
+    ctx.drawImage(background, 0, 0, canvas.width, canvas.height);
+
+    // Load member avatar
+    const avatarURL = member.user.displayAvatarURL({ extension: 'png', size: 512 });
+    const avatar = await loadImage(avatarURL);
+
+    // Avatar position (where the shmagh figure was)
+    const avatarX = 180;
+    const avatarY = 200;
+    const avatarSize = 280;
+
+    // Circular clip for avatar
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.clip();
+
+    // Draw avatar
+    ctx.drawImage(avatar, avatarX, avatarY, avatarSize, avatarSize);
+    ctx.restore();
+
+    // Gold border around avatar
+    ctx.beginPath();
+    ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2 + 8, 0, Math.PI * 2);
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = '#d4af37';
+    ctx.stroke();
+
+    // Username ONLY - no WELCOME text on image
+    ctx.font = 'bold 42px DejaVu Sans, Arial, sans-serif';
+    ctx.fillStyle = '#d4af37';
+    ctx.textAlign = 'left';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetX = 2;
+    ctx.shadowOffsetY = 2;
+
+    const username = `@${member.user.username}`;
+    const textX = avatarX + avatarSize + 50;
+    const textY = avatarY + avatarSize / 2 + 10;
+
+    ctx.fillText(username, textX, textY);
+
+    return canvas.toBuffer('image/png');
+}
 
 // ==================== MUTE ROLE SYSTEM ====================
 
@@ -141,16 +203,26 @@ const OWNER_ID = '1364275261398581279';
 client.on('ready', async () => {
     console.log(`✅ Bot online: ${client.user.tag}`);
 
-    const setLogCommand = new SlashCommandBuilder()
-        .setName('setlog')
-        .setDescription('تحديد روم اللوقات')
-        .addChannelOption(option =>
-            option.setName('channel')
-                .setDescription('اختر الروم')
-                .setRequired(true)
-        );
+    const commands = [
+        new SlashCommandBuilder()
+            .setName('setlog')
+            .setDescription('تحديد روم اللوقات')
+            .addChannelOption(option =>
+                option.setName('channel')
+                    .setDescription('اختر الروم')
+                    .setRequired(true)
+            ),
+        new SlashCommandBuilder()
+            .setName('setwelcome')
+            .setDescription('تحديد روم الترحيب')
+            .addChannelOption(option =>
+                option.setName('channel')
+                    .setDescription('اختر روم الترحيب')
+                    .setRequired(true)
+            )
+    ];
 
-    await client.application.commands.create(setLogCommand);
+    await client.application.commands.set(commands);
     console.log('✅ Slash commands registered');
 });
 
@@ -167,6 +239,44 @@ client.on('interactionCreate', async (interaction) => {
         saveLogChannels();
 
         return interaction.reply({ content: `✅ تم تحديد روم اللوقات: ${channel}`, ephemeral: true });
+    }
+
+    if (interaction.commandName === 'setwelcome') {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
+        }
+
+        const channel = interaction.options.getChannel('channel');
+        welcomeChannels.set(interaction.guild.id, channel.id);
+        saveWelcomeChannels();
+
+        return interaction.reply({ content: `✅ تم تحديد روم الترحيب: ${channel}`, ephemeral: true });
+    }
+});
+
+// ==================== WELCOME EVENT ====================
+
+client.on('guildMemberAdd', async (member) => {
+    const welcomeChannelId = welcomeChannels.get(member.guild.id);
+    if (!welcomeChannelId) return;
+
+    const channel = member.guild.channels.cache.get(welcomeChannelId);
+    if (!channel) return;
+
+    try {
+        const imageBuffer = await createWelcomeImage(member);
+
+        // ALL text goes in the message, NOT on the image
+        await channel.send({
+            content: `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`,
+            files: [{ attachment: imageBuffer, name: 'welcome.png' }]
+        });
+    } catch (error) {
+        console.error('[WELCOME ERROR]', error);
+        // Fallback text only
+        await channel.send({
+            content: `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`
+        }).catch(() => {});
     }
 });
 
@@ -210,7 +320,7 @@ client.on('messageCreate', async (message) => {
                     { name: 'العقوبات', value: '`سجن @عضو`\n`افراج @عضو`\n`تف @عضو` - بان\n`طرد @عضو`\n`فك آيدي/يوزر` - فك بان', inline: true },
                     { name: 'الإسكات', value: '`تايم @عضو 10m`\n`تكلم @عضو`', inline: true },
                     { name: 'الرتب', value: '`r @عضو اسم_الرتبة`\n`شيل @عضو اسم_الرتبة`', inline: true },
-                    { name: 'الإعدادات', value: '`/setlog` - تحديد روم اللوقات', inline: true }
+                    { name: 'الإعدادات', value: '`/setlog` - تحديد روم اللوقات\n`/setwelcome` - تحديد روم الترحيب', inline: true }
                 )
                 .setFooter({ text: 'البوت يعمل بكفاءة' })
                 .setTimestamp();
@@ -339,7 +449,6 @@ client.on('messageCreate', async (message) => {
             if (!duration)
                 return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
 
-            // الأونر فقط يقدر يعطي تايم لنفس الرتبة أو أعلى
             if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position) {
                 return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك أو نفسك.');
             }
@@ -410,8 +519,6 @@ client.on('messageCreate', async (message) => {
             if (!role)
                 return message.reply(`❌ ما لقيت رتبة باسم "${roleName}".`);
 
-            // الأدمن العادي ما يقدر يعطي رتب أعلى من رتبته أو نفسها
-            // الأونر فقط يقدر يعطي أي رتبة
             if (!isOwner && role.position >= message.member.roles.highest.position) {
                 return message.reply('❌ ما تقدر تعطي رتبة أعلى منك أو نفس رتبتك.');
             }
@@ -442,12 +549,10 @@ client.on('messageCreate', async (message) => {
             if (!role)
                 return message.reply(`❌ ما لقيت رتبة باسم "${roleName}".`);
 
-            // الأدمن العادي ما يقدر يشيل رتب أعلى من رتبته أو نفسها
             if (!isOwner && role.position >= message.member.roles.highest.position) {
                 return message.reply('❌ ما تقدر تشيل رتبة أعلى منك أو نفس رتبتك.');
             }
 
-            // نتحقق إذا العضو معه الرتبة
             if (!target.roles.cache.has(role.id)) {
                 return message.reply(`❌ ${target.user.username} ما معه رتبة **${role.name}**.`);
             }
