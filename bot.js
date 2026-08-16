@@ -45,7 +45,7 @@ function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
 function saveWelcomeChannels() { saveJSON(WELCOME_FILE, welcomeChannels); }
 
 // ==================== WELCOME IMAGE SYSTEM ====================
-const WELCOME_BG_URL = 'https://cdn.discordapp.com/attachments/1538615701231632405/1538615802151047188/1786904133960.png?ex=6a835321&is=6a8201a1&hm=4a2c42a86367463168f6580ab898543f14f3acaf3feb2bef2ad45122e4e525be&';
+const WELCOME_BG_URL = 'https://cdn.discordapp.com/attachments/1451757101142642768/1538632664582725662/welcome2.png?ex=6a8362d5&is=6a821155&hm=8631d5bed72d0cc7cca1772a7ecbb1e57930a69ea06cd4a488695d270242076d';
 
 async function getCanvas() {
     try {
@@ -259,7 +259,6 @@ client.on('guildMemberAdd', async (member) => {
     try {
         const imageBuffer = await createWelcomeImage(member);
 
-        // عدد الأعضاء الحقيقي في السيرفر (يتضمن العضو الجديد)
         const memberCount = member.guild.memberCount;
 
         const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
@@ -500,7 +499,7 @@ client.on('messageCreate', async (message) => {
 
             if (!roleName && !roleId) return message.reply('❌ حدد اسم الرتبة.');
 
-            await message.guild.roles.cache.fetch();
+            await message.guild.roles.fetch();
             const role = message.guild.roles.cache.get(roleId) ||
                 message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
 
