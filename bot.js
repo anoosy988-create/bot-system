@@ -259,7 +259,10 @@ client.on('guildMemberAdd', async (member) => {
     try {
         const imageBuffer = await createWelcomeImage(member);
 
-        const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
+        // عدد الأعضاء الحقيقي في السيرفر (يتضمن العضو الجديد)
+        const memberCount = member.guild.memberCount;
+
+        const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
 
         if (imageBuffer) {
             await channel.send({
@@ -497,7 +500,7 @@ client.on('messageCreate', async (message) => {
 
             if (!roleName && !roleId) return message.reply('❌ حدد اسم الرتبة.');
 
-            await message.guild.roles.fetch();
+            await message.guild.roles.cache.fetch();
             const role = message.guild.roles.cache.get(roleId) ||
                 message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
 
