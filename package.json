@@ -1,15 +1,14 @@
 {
-  "name": "botsestyem",
+  "name": "discord-bot",
   "version": "1.0.0",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
-  "type": "commonjs",
   "dependencies": {
-    "@napi-rs/canvas": "^0.1.65",
-    "discord.js": "^14.27.0",
-    "express": "^5.2.1",
-    "ms": "^2.1.3"
+    "discord.js": "^14.14.1",
+    "ms": "^2.1.3",
+    "express": "^4.18.2",
+    "mongoose": "^8.0.0"
   }
 }
