@@ -219,7 +219,7 @@ const PREFIX_COMMANDS = [
     'تف', 'تميم.يسلم.عليك', 'بزبي',
     'طرد', 'kick',
     'تكلم', 'تميم.يقولك.تكلم',
-    'r', 'شيل',
+    'r', 'تجريد',
     'سد حلقك', 'تايم', 'تميم.يقولك.اسكت',
     'فك', 'تميم.يبيك.ترجع'
 ];
@@ -541,7 +541,7 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ تم إعطاء ${target.user.username} رتبة ${role.name}.`);
         }
 
-        if (commandName === 'شيل') {
+        if (commandName === 'تجريد') {
             if (!target) return message.reply('❌ حدد عضو. مثال: `شيل @عضو اسم_الرتبة`');
 
             const filteredArgs = args.filter(a => !a.match(/^<@!?\d+>$/) && !a.match(/^\d{17,19}$/));
