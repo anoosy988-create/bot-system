@@ -51,8 +51,9 @@ function canExecute(message, target = null, requiredPermission = null, roleTarge
 }
 
 // ==================== MONGODB DATABASE ====================
+// Schema compatible with both bots — uses guild_id to avoid index conflicts
 const guildSchema = new mongoose.Schema({
-    _id: { type: String, required: true },
+    guild_id: { type: String, required: true, unique: true },
     logChannelId: { type: String, default: null },
     welcomeChannelId: { type: String, default: null },
     jailRoles: { type: Map, of: [String], default: new Map() },
@@ -72,28 +73,50 @@ const warnSchema = new mongoose.Schema({
 const GuildSettings = mongoose.model('GuildSettings', guildSchema);
 const Warn = mongoose.model('Warn', warnSchema);
 
-// DB Helpers
+// DB Helpers — all use guild_id instead of _id
 const db = {
-    setLogChannel(guildId, channelId) {
-        return GuildSettings.findByIdAndUpdate(guildId, { logChannelId: channelId }, { upsert: true });
+    async getOrCreate(guildId) {
+        let doc = await GuildSettings.findOne({ guild_id: guildId }).lean();
+        if (!doc) {
+            doc = await GuildSettings.create({ guild_id: guildId });
+        }
+        return doc;
+    },
+    async setLogChannel(guildId, channelId) {
+        await db.getOrCreate(guildId);
+        return GuildSettings.findOneAndUpdate(
+            { guild_id: guildId },
+            { logChannelId: channelId },
+            { upsert: true, new: true }
+        );
     },
     async getLogChannel(guildId) {
-        const s = await GuildSettings.findById(guildId).lean();
+        const s = await GuildSettings.findOne({ guild_id: guildId }).lean();
         return s?.logChannelId || null;
     },
-    setVanityURL(guildId, url) {
-        return GuildSettings.findByIdAndUpdate(guildId, { vanityURL: url }, { upsert: true });
+    async setVanityURL(guildId, url) {
+        await db.getOrCreate(guildId);
+        return GuildSettings.findOneAndUpdate(
+            { guild_id: guildId },
+            { vanityURL: url },
+            { upsert: true, new: true }
+        );
     },
     async getVanityURL(guildId) {
-        const s = await GuildSettings.findById(guildId).lean();
+        const s = await GuildSettings.findOne({ guild_id: guildId }).lean();
         return s?.vanityURL || null;
     },
     async isVanityProtectionEnabled(guildId) {
-        const s = await GuildSettings.findById(guildId).lean();
+        const s = await GuildSettings.findOne({ guild_id: guildId }).lean();
         return s?.vanityProtection || false;
     },
-    toggleVanityProtection(guildId, on) {
-        return GuildSettings.findByIdAndUpdate(guildId, { vanityProtection: on }, { upsert: true });
+    async toggleVanityProtection(guildId, on) {
+        await db.getOrCreate(guildId);
+        return GuildSettings.findOneAndUpdate(
+            { guild_id: guildId },
+            { vanityProtection: on },
+            { upsert: true, new: true }
+        );
     }
 };
 
@@ -249,7 +272,7 @@ async function getOrCreateMuteRole(guild) {
 // ==================== LOG SYSTEM ====================
 async function sendLog(guild, title, target, description, color = 0xFF0000) {
     try {
-        const settings = await GuildSettings.findById(guild.id).lean();
+        const settings = await GuildSettings.findOne({ guild_id: guild.id }).lean();
         if (!settings || !settings.logChannelId) return;
 
         const channel = guild.channels.cache.get(settings.logChannelId);
@@ -371,7 +394,6 @@ client.on('ready', async () => {
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
-    // Defer reply immediately to prevent "application did not respond"
     try {
         await interaction.deferReply({ ephemeral: true });
     } catch (err) {
@@ -385,6 +407,7 @@ client.on('interactionCreate', async (interaction) => {
 
     const { commandName } = interaction;
     const member = interaction.member;
+    const guildId = interaction.guild.id;
 
     try {
         if (commandName === 'setlog') {
@@ -392,7 +415,7 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.editReply({ content: '❌ ما عندك صلاحية.' }).catch(() => {});
             }
             const channel = interaction.options.getChannel('channel');
-            await db.setLogChannel(interaction.guild.id, channel.id);
+            await db.setLogChannel(guildId, channel.id);
             return interaction.editReply({ content: `✅ تم تحديد روم اللوقات: ${channel}` }).catch(() => {});
         }
 
@@ -401,8 +424,9 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.editReply({ content: '❌ ما عندك صلاحية.' }).catch(() => {});
             }
             const channel = interaction.options.getChannel('channel');
-            await GuildSettings.findByIdAndUpdate(
-                interaction.guild.id,
+            await db.getOrCreate(guildId);
+            await GuildSettings.findOneAndUpdate(
+                { guild_id: guildId },
                 { welcomeChannelId: channel.id },
                 { upsert: true, new: true }
             );
@@ -414,7 +438,7 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
             }
             const url = interaction.options.getString('url')?.trim();
-            await db.setVanityURL(interaction.guild.id, url);
+            await db.setVanityURL(guildId, url);
             return interaction.editReply({ content: `✅ تم تحديد رابط السيرفر: discord.gg/${url}` }).catch(() => {});
         }
 
@@ -423,7 +447,7 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
             }
             const on = interaction.options.getBoolean('enabled');
-            await db.toggleVanityProtection(interaction.guild.id, on);
+            await db.toggleVanityProtection(guildId, on);
             return interaction.editReply({ content: on ? '✅ حماية الرابط مفعلة.' : '⚠️ معطلة.' }).catch(() => {});
         }
 
@@ -431,7 +455,6 @@ client.on('interactionCreate', async (interaction) => {
             if (!isAdmin(member)) {
                 return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
             }
-            const guildId = interaction.guild.id;
             const logChId = await db.getLogChannel(guildId);
             const logCh = logChId ? `<#${logChId}>` : 'غير محدد';
             const vanity = await db.isVanityProtectionEnabled(guildId) ? '✅ مفعلة' : '⚠️ معطلة';
@@ -461,7 +484,7 @@ client.on('interactionCreate', async (interaction) => {
 // ==================== WELCOME EVENT ====================
 client.on('guildMemberAdd', async (member) => {
     try {
-        const settings = await GuildSettings.findById(member.guild.id).lean();
+        const settings = await GuildSettings.findOne({ guild_id: member.guild.id }).lean();
         if (!settings || !settings.welcomeChannelId) return;
 
         const channel = member.guild.channels.cache.get(settings.welcomeChannelId);
@@ -543,8 +566,8 @@ client.on('messageCreate', async (message) => {
                 .filter(r => r.id !== message.guild.id)
                 .map(r => r.id);
 
-            await GuildSettings.findByIdAndUpdate(
-                message.guild.id,
+            await GuildSettings.findOneAndUpdate(
+                { guild_id: message.guild.id },
                 { $set: { [`jailRoles.${target.id}`]: savedRoles } },
                 { upsert: true }
             );
@@ -561,15 +584,15 @@ client.on('messageCreate', async (message) => {
             const check = canExecute(message, target);
             if (!check.allowed) return message.reply(check.reason);
 
-            const settings = await GuildSettings.findById(message.guild.id).lean();
+            const settings = await GuildSettings.findOne({ guild_id: message.guild.id }).lean();
             if (!settings || !settings.jailRoles || !settings.jailRoles.get(target.id))
                 return message.reply('❌ هذا العضو مو مسجون.');
 
             const roles = settings.jailRoles.get(target.id);
             await target.roles.set(roles);
 
-            await GuildSettings.findByIdAndUpdate(
-                message.guild.id,
+            await GuildSettings.findOneAndUpdate(
+                { guild_id: message.guild.id },
                 { $unset: { [`jailRoles.${target.id}`]: 1 } }
             );
 
