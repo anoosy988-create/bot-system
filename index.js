@@ -1,4 +1,3 @@
-require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const fs = require('fs');
@@ -119,8 +118,8 @@ async function removeWarning(guildId, userId, number) {
     return result.deletedCount > 0;
 }
 
-function getLogChannel(guild) {
-    const id = db.getLogChannel(guild.id);
+async function getLogChannel(guild) {
+    const id = await db.getLogChannel(guild.id);
     return id ? guild.channels.cache.get(id) : null;
 }
 
@@ -480,7 +479,6 @@ client.on('messageCreate', async (message) => {
     const commandName = args.shift().toLowerCase();
     const target = message.mentions.members.first();
 
-    // Prefix commands check
     if (!PREFIX_COMMANDS.includes(commandName)) return;
 
     console.log(`[CMD] ${commandName} | target: ${target?.user?.username || 'none'} | by: ${message.author.username}`);
