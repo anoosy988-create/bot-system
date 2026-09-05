@@ -123,13 +123,16 @@ async function getLogChannel(guild) {
     return id ? guild.channels.cache.get(id) : null;
 }
 
-function logEmbed(title, fields, color = Colors.Blue) {
-    return new EmbedBuilder()
+function logEmbed(title, fields, color = Colors.Blue, clientUser = null) {
+    const embed = new EmbedBuilder()
         .setTitle(title)
         .addFields(fields)
         .setColor(color)
-        .setTimestamp()
-        .setFooter({ text: 'Cypher Protection System', iconURL: client.user?.displayAvatarURL?.() || undefined });
+        .setTimestamp();
+    if (clientUser) {
+        embed.setFooter({ text: 'Cypher Protection System', iconURL: clientUser.displayAvatarURL?.() || undefined });
+    }
+    return embed;
 }
 
 // ==================== HTTP SERVER ====================
@@ -352,10 +355,14 @@ client.on('ready', async () => {
         new SlashCommandBuilder()
             .setName('settings')
             .setDescription('عرض إعدادات البوت الحالية')
-    ];
+    ].map(cmd => cmd.toJSON());
 
-    await client.application.commands.set(commands);
-    console.log('✅ Slash commands registered');
+    try {
+        await client.application.commands.set(commands);
+        console.log('✅ Slash commands registered globally');
+    } catch (err) {
+        console.error('❌ Failed to register slash commands:', err.message);
+    }
 
     client.user.setActivity('Cypher Protection', { type: 4 });
 });
@@ -363,73 +370,91 @@ client.on('ready', async () => {
 // ==================== INTERACTION CREATE ====================
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
+
+    // Defer reply immediately to prevent "application did not respond"
+    try {
+        await interaction.deferReply({ ephemeral: true });
+    } catch (err) {
+        console.error('[Interaction] Failed to defer:', err.message);
+        return;
+    }
+
     if (!interaction.guild) {
-        return interaction.reply({ content: 'هذا الأمر يعمل في السيرفرات فقط.', flags: MessageFlags.Ephemeral }).catch(() => {});
+        return interaction.editReply({ content: 'هذا الأمر يعمل في السيرفرات فقط.' }).catch(() => {});
     }
 
     const { commandName } = interaction;
     const member = interaction.member;
 
-    if (commandName === 'setlog') {
-        if (!isOwner(interaction.user.id) && !isAdmin(member)) {
-            return interaction.reply({ content: '❌ ما عندك صلاحية.', flags: MessageFlags.Ephemeral }).catch(() => {});
+    try {
+        if (commandName === 'setlog') {
+            if (!isOwner(interaction.user.id) && !isAdmin(member)) {
+                return interaction.editReply({ content: '❌ ما عندك صلاحية.' }).catch(() => {});
+            }
+            const channel = interaction.options.getChannel('channel');
+            await db.setLogChannel(interaction.guild.id, channel.id);
+            return interaction.editReply({ content: `✅ تم تحديد روم اللوقات: ${channel}` }).catch(() => {});
         }
-        const channel = interaction.options.getChannel('channel');
-        await db.setLogChannel(interaction.guild.id, channel.id);
-        return interaction.reply({ content: `✅ تم تحديد روم اللوقات: ${channel}`, flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
 
-    if (commandName === 'setwelcome') {
-        if (!isOwner(interaction.user.id) && !isAdmin(member)) {
-            return interaction.reply({ content: '❌ ما عندك صلاحية.', flags: MessageFlags.Ephemeral }).catch(() => {});
+        if (commandName === 'setwelcome') {
+            if (!isOwner(interaction.user.id) && !isAdmin(member)) {
+                return interaction.editReply({ content: '❌ ما عندك صلاحية.' }).catch(() => {});
+            }
+            const channel = interaction.options.getChannel('channel');
+            await GuildSettings.findByIdAndUpdate(
+                interaction.guild.id,
+                { welcomeChannelId: channel.id },
+                { upsert: true, new: true }
+            );
+            return interaction.editReply({ content: `✅ تم تحديد روم الترحيب: ${channel}` }).catch(() => {});
         }
-        const channel = interaction.options.getChannel('channel');
-        await GuildSettings.findByIdAndUpdate(
-            interaction.guild.id,
-            { welcomeChannelId: channel.id },
-            { upsert: true, new: true }
-        );
-        return interaction.reply({ content: `✅ تم تحديد روم الترحيب: ${channel}`, flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
 
-    if (commandName === 'setvanity') {
-        if (!isAdmin(member)) {
-            return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', flags: MessageFlags.Ephemeral }).catch(() => {});
+        if (commandName === 'setvanity') {
+            if (!isAdmin(member)) {
+                return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
+            }
+            const url = interaction.options.getString('url')?.trim();
+            await db.setVanityURL(interaction.guild.id, url);
+            return interaction.editReply({ content: `✅ تم تحديد رابط السيرفر: discord.gg/${url}` }).catch(() => {});
         }
-        const url = interaction.options.getString('url')?.trim();
-        await db.setVanityURL(interaction.guild.id, url);
-        return interaction.reply({ content: `✅ تم تحديد رابط السيرفر: discord.gg/${url}`, flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
 
-    if (commandName === 'vanity-protect') {
-        if (!isAdmin(member)) {
-            return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', flags: MessageFlags.Ephemeral }).catch(() => {});
+        if (commandName === 'vanity-protect') {
+            if (!isAdmin(member)) {
+                return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
+            }
+            const on = interaction.options.getBoolean('enabled');
+            await db.toggleVanityProtection(interaction.guild.id, on);
+            return interaction.editReply({ content: on ? '✅ حماية الرابط مفعلة.' : '⚠️ معطلة.' }).catch(() => {});
         }
-        const on = interaction.options.getBoolean('enabled');
-        await db.toggleVanityProtection(interaction.guild.id, on);
-        return interaction.reply({ content: on ? '✅ حماية الرابط مفعلة.' : '⚠️ معطلة.', flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
 
-    if (commandName === 'settings') {
-        if (!isAdmin(member)) {
-            return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', flags: MessageFlags.Ephemeral }).catch(() => {});
+        if (commandName === 'settings') {
+            if (!isAdmin(member)) {
+                return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
+            }
+            const guildId = interaction.guild.id;
+            const logChId = await db.getLogChannel(guildId);
+            const logCh = logChId ? `<#${logChId}>` : 'غير محدد';
+            const vanity = await db.isVanityProtectionEnabled(guildId) ? '✅ مفعلة' : '⚠️ معطلة';
+            const vanityURL = await db.getVanityURL(guildId) || 'غير محدد';
+
+            const embed = new EmbedBuilder()
+                .setTitle('⚙️ إعدادات البوت')
+                .addFields(
+                    { name: '📝 روم اللوق', value: logCh, inline: true },
+                    { name: '🔗 الرابط', value: `discord.gg/${vanityURL}`, inline: true },
+                    { name: '🛡️ الحماية', value: vanity, inline: true }
+                )
+                .setColor(Colors.Gold)
+                .setTimestamp();
+            return interaction.editReply({ embeds: [embed] }).catch(() => {});
         }
-        const guildId = interaction.guild.id;
-        const logChId = await db.getLogChannel(guildId);
-        const logCh = logChId ? `<#${logChId}>` : 'غير محدد';
-        const vanity = await db.isVanityProtectionEnabled(guildId) ? '✅ مفعلة' : '⚠️ معطلة';
-        const vanityURL = await db.getVanityURL(guildId) || 'غير محدد';
-
-        const embed = new EmbedBuilder()
-            .setTitle('⚙️ إعدادات البوت')
-            .addFields(
-                { name: '📝 روم اللوق', value: logCh, inline: true },
-                { name: '🔗 الرابط', value: `discord.gg/${vanityURL}`, inline: true },
-                { name: '🛡️ الحماية', value: vanity, inline: true }
-            )
-            .setColor(Colors.Gold)
-            .setTimestamp();
-        return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral }).catch(() => {});
+    } catch (err) {
+        console.error(`[Interaction Error] ${commandName}:`, err);
+        try {
+            await interaction.editReply({ content: `❌ حصل خطأ: ${err.message}` });
+        } catch {
+            // ignore
+        }
     }
 });
 
@@ -728,7 +753,7 @@ client.on('messageCreate', async (message) => {
                     await logCh.send({ embeds: [logEmbed('🔒 تم قفل الشات', [
                         { name: '👤 بواسطة', value: `<@${message.author.id}>`, inline: true },
                         { name: '📢 القناة', value: `<#${message.channel.id}>`, inline: true },
-                    ], Colors.Red)] }).catch(() => {});
+                    ], Colors.Red, client.user)] }).catch(() => {});
                 }
                 await message.reply('🔒 تم قفل الشات بنجاح.').catch(() => {});
             } catch (err) {
@@ -747,7 +772,7 @@ client.on('messageCreate', async (message) => {
                     await logCh.send({ embeds: [logEmbed('🔓 تم فتح الشات', [
                         { name: '👤 بواسطة', value: `<@${message.author.id}>`, inline: true },
                         { name: '📢 القناة', value: `<#${message.channel.id}>`, inline: true },
-                    ], Colors.Green)] }).catch(() => {});
+                    ], Colors.Green, client.user)] }).catch(() => {});
                 }
                 await message.reply('🔓 تم فتح الشات بنجاح.').catch(() => {});
             } catch (err) {
@@ -773,7 +798,7 @@ client.on('messageCreate', async (message) => {
                         { name: '⚡ بواسطة', value: `<@${message.author.id}>`, inline: true },
                         { name: '📋 السبب', value: reason, inline: false },
                         { name: '#️⃣ الرقم', value: `#${warnNumber}`, inline: true },
-                    ], Colors.Orange)] }).catch(() => {});
+                    ], Colors.Orange, client.user)] }).catch(() => {});
                 }
                 await message.reply(`⚠️ تم إعطاء التحذير #${warnNumber} لـ <@${warnTarget.id}>\n**السبب:** ${reason}`).catch(() => {});
             } catch (err) {
@@ -813,7 +838,7 @@ client.on('messageCreate', async (message) => {
                         { name: '👤 العضو', value: `<@${warnTarget.id}>`, inline: true },
                         { name: '⚡ بواسطة', value: `<@${message.author.id}>`, inline: true },
                         { name: '#️⃣ الرقم المحذوف', value: `#${number}`, inline: true },
-                    ], Colors.Purple)] }).catch(() => {});
+                    ], Colors.Purple, client.user)] }).catch(() => {});
                 }
 
                 await message.reply(`🗑️ تم إزالة التحذير **#${number}** من <@${warnTarget.id}>.`).catch(() => {});
