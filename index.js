@@ -34,7 +34,7 @@ function canExecute(message, target = null, requiredPermission = null, roleTarge
 
     // لو الهدف هو الأونر → ممنوع
     if (target && isOwner(target.id)) {
-        return { allowed: false, reason: 'معالي المطيري ماتقدر تسوي له شي' };
+        return { allowed: false, reason: 'فحلك المطيري ماتقدر تسوي له شي' };
     }
 
     // تحقق من الصلاحية المطلوبة
@@ -349,12 +349,12 @@ client.on('messageCreate', async (message) => {
                 .setColor(0xFFD700)
                 .setDescription('الأوامر المتاحة:')
                 .addFields(
-                    { name: 'العقوبات', value: '`سجن @عضو`\n`افراج @عضو`\n`تف @عضو` - بان\n`طرد @عضو`\n`فك آيدي/يوزر` - فك بان', inline: true },
-                    { name: 'الإسكات', value: '`تايم @عضو 10m`\n`تكلم @عضو`', inline: true },
+                    { name: 'الاوامر الادارية', value: '`سجن @عضو`\n`افراج @عضو`\n`تف @عضو` - بان\n`طرد @عضو`\n`فك آيدي/يوزر` - فك بان', inline: true },
+                    { name: 'التايم', value: '`تايم @عضو 10m`\n`تكلم @عضو`', inline: true },
                     { name: 'الرتب', value: '`r @عضو اسم_الرتبة`\n`شيل @عضو اسم_الرتبة`', inline: true },
                     { name: 'الإعدادات', value: '`/setlog` - تحديد روم اللوقات\n`/setwelcome` - تحديد روم الترحيب', inline: true }
                 )
-                .setFooter({ text: 'البوت يعمل بكفاءة' })
+                .setFooter({ text: 'البوت يعمل عشانك يلبى' })
                 .setTimestamp();
             return message.channel.send({ embeds: [embed] });
         }
