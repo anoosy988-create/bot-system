@@ -29,6 +29,22 @@ function isAdmin(member) {
     return member.permissions.has(PermissionsBitField.Flags.Administrator);
 }
 
+/**
+ * مين يقدر يتحكم بإعدادات الحماية (يفعل/يعطل/يغير عدد العمليات):
+ * المالك، أو أدمن رتبته أعلى من البوت، أو شخص بالوايت ليست.
+ * هذا يمنع أدمن "ضعيف" (رتبته تحت البوت) من إيقاف الحماية بسهولة لو تم اختراق حسابه.
+ */
+async function canManageProtection(interaction) {
+    if (isOwner(interaction.user.id)) return true;
+    const wl = await db.isWhitelisted(interaction.guild.id, interaction.user.id);
+    if (wl) return true;
+    const me = interaction.guild.members.me;
+    if (isAdmin(interaction.member) && me && interaction.member.roles.highest.position > me.roles.highest.position) {
+        return true;
+    }
+    return false;
+}
+
 /* ─── Helper: canExecute ─── */
 function canExecute(message, target = null, requiredPermission = null, roleTarget = null) {
     const authorIsOwner = isOwner(message.author.id);
@@ -66,19 +82,48 @@ const guildSchema = new mongoose.Schema({
     vanityProtection: { type: Boolean, default: false },
 
     // ─── Anti-Nuke settings ───
+    // كل نوع حماية له سلاش خاص فيه: تفعيل مستقل + عدد العمليات المسموحة + نوع العقوبة
     antiNuke: {
-        enabled: { type: Boolean, default: false },
-        channelDelete: { type: Boolean, default: true },
-        channelCreate: { type: Boolean, default: true },
-        roleDelete: { type: Boolean, default: true },
-        roleCreate: { type: Boolean, default: true },
-        webhookCreate: { type: Boolean, default: true },
-        memberBan: { type: Boolean, default: true },
-        memberKick: { type: Boolean, default: true },
-        botAdd: { type: Boolean, default: true },
-        maxActions: { type: Number, default: 3 },     // كم عملية مسموحة
-        timeWindowMs: { type: Number, default: 10000 }, // خلال كم مللي ثانية (10 ثواني افتراضياً)
-        punishment: { type: String, default: 'ban' }   // 'ban' or 'kick'
+        enabled: { type: Boolean, default: false }, // المفتاح الرئيسي لكل النظام
+        timeWindowMs: { type: Number, default: 10000 }, // خلال كم مللي ثانية تُحسب العمليات (نافذة زمنية عامة)
+        channelDelete: {
+            enabled: { type: Boolean, default: true },
+            threshold: { type: Number, default: 3 },
+            punishment: { type: String, default: 'ban' }
+        },
+        channelCreate: {
+            enabled: { type: Boolean, default: true },
+            threshold: { type: Number, default: 3 },
+            punishment: { type: String, default: 'ban' }
+        },
+        roleDelete: {
+            enabled: { type: Boolean, default: true },
+            threshold: { type: Number, default: 3 },
+            punishment: { type: String, default: 'ban' }
+        },
+        roleCreate: {
+            enabled: { type: Boolean, default: true },
+            threshold: { type: Number, default: 3 },
+            punishment: { type: String, default: 'ban' }
+        },
+        webhookCreate: {
+            enabled: { type: Boolean, default: true },
+            threshold: { type: Number, default: 3 },
+            punishment: { type: String, default: 'ban' }
+        },
+        memberBan: {
+            enabled: { type: Boolean, default: true },
+            threshold: { type: Number, default: 3 },
+            punishment: { type: String, default: 'ban' }
+        },
+        memberKick: {
+            enabled: { type: Boolean, default: true },
+            threshold: { type: Number, default: 3 },
+            punishment: { type: String, default: 'ban' }
+        },
+        botAdd: {
+            enabled: { type: Boolean, default: true } // بوتات: عقوبة فورية بدون عداد
+        }
     },
     whitelist: { type: [String], default: [] }, // user IDs معفيين من الحماية
 
@@ -429,7 +474,7 @@ function pruneOld(list, windowMs) {
 }
 
 /**
- * يتحقق من عدد العمليات المشبوهة لليوزر، ولو تعدى الحد المسموح يعاقبه.
+ * يتحقق من عدد العمليات المشبوهة لليوزر لهذا النوع بالذات، ولو تعدى الحد المسموح يعاقبه.
  * يرجع true لو تم العقاب (يعني تصرف كنيوك)، و false لو كل شي طبيعي.
  */
 async function checkAndPunish(guild, executorId, actionType) {
@@ -437,34 +482,36 @@ async function checkAndPunish(guild, executorId, actionType) {
     if (executorId === client.user.id) return false; // البوت نفسه
 
     const settings = await db.getSettings(guild.id);
-    if (!settings.antiNuke.enabled) return false;
-    if (!settings.antiNuke[actionType]) return false; // هذا النوع من الحماية مطفي
+    if (!settings.antiNuke.enabled) return false; // المفتاح الرئيسي مطفي
+
+    const typeSettings = settings.antiNuke[actionType];
+    if (!typeSettings || !typeSettings.enabled) return false; // هذا النوع بالذات مطفي
 
     const isWL = await db.isWhitelisted(guild.id, executorId);
     if (isWL) return false;
 
-    const member = await guild.members.fetch(executorId).catch(() => null);
-    if (member && isAdmin(member) && isOwner(guild.ownerId) === false) {
-        // نكمل نفحص حتى لو أدمن، لأن أدمن مو بالضرورة موثوق — إلا إذا محطوط بالوايت ليست
+    // نعفي أي عضو رتبته أعلى أو تساوي رتبة البوت — أصلاً البوت ما يقدر يعاقبه (Discord ما يخليه)
+    const me = guild.members.me;
+    const execMember = await guild.members.fetch(executorId).catch(() => null);
+    if (execMember && me && execMember.roles.highest.position >= me.roles.highest.position) {
+        return false;
     }
 
-    const key = `${guild.id}:${executorId}`;
+    // مفتاح منفصل لكل (سيرفر + شخص + نوع عملية) عشان حذف الرومات ما يأثر بعداد حذف الرولات مثلاً
+    const key = `${guild.id}:${executorId}:${actionType}`;
     let list = pruneOld(actionTracker.get(key) || [], settings.antiNuke.timeWindowMs);
     list.push(Date.now());
     actionTracker.set(key, list);
 
-    if (list.length >= settings.antiNuke.maxActions) {
+    if (list.length >= typeSettings.threshold) {
         actionTracker.delete(key); // نصفر العداد بعد العقاب
-        await punishUser(guild, executorId, `تجاوز الحد المسموح (${actionType}) — نشاط نيوك مشبوه`);
+        await punishUser(guild, executorId, `تجاوز الحد المسموح (${actionType}) — نشاط نيوك مشبوه`, typeSettings.punishment);
         return true;
     }
     return false;
 }
 
-async function punishUser(guild, userId, reason) {
-    const settings = await db.getSettings(guild.id);
-    const method = settings.antiNuke.punishment; // 'ban' or 'kick'
-
+async function punishUser(guild, userId, reason, method = 'ban') {
     try {
         if (method === 'ban') {
             await guild.members.ban(userId, { reason: `[Anti-Nuke] ${reason}` });
@@ -556,7 +603,7 @@ client.on('guildMemberAdd', async (member) => {
     if (!member.user.bot) return; // مو بوت، تجاهل
 
     const settings = await db.getSettings(member.guild.id);
-    if (!settings.antiNuke.enabled || !settings.antiNuke.botAdd) return;
+    if (!settings.antiNuke.enabled || !settings.antiNuke.botAdd.enabled) return;
 
     const isWL = await db.isWhitelisted(member.guild.id, member.id);
     if (isWL) return;
@@ -737,65 +784,98 @@ client.on('ready', async () => {
             .setName('settings')
             .setDescription('عرض إعدادات البوت الحالية'),
 
-        // ─── Anti-Nuke ───
+        // ─── Anti-Nuke: المفتاح الرئيسي (لازم يكون مفعّل عشان أي حماية تشتغل) ───
         new SlashCommandBuilder()
             .setName('antinuke')
-            .setDescription('التحكم بنظام الحماية من النيوك')
+            .setDescription('التحكم بالمفتاح الرئيسي لنظام الحماية من النيوك')
             .addSubcommand(sub =>
-                sub.setName('تفعيل')
-                    .setDescription('تشغيل نظام الحماية من النيوك بالكامل')
+                sub.setName('تفعيل').setDescription('تشغيل نظام الحماية من النيوك بالكامل')
             )
             .addSubcommand(sub =>
-                sub.setName('تعطيل')
-                    .setDescription('إيقاف نظام الحماية من النيوك بالكامل')
+                sub.setName('تعطيل').setDescription('إيقاف نظام الحماية من النيوك بالكامل')
             )
             .addSubcommand(sub =>
-                sub.setName('تحديد')
-                    .setDescription('تفعيل/تعطيل نوع معين من الحماية')
-                    .addStringOption(option =>
-                        option.setName('نوع')
-                            .setDescription('نوع الحماية')
-                            .setRequired(true)
-                            .addChoices(
-                                { name: 'حذف الرومات', value: 'channelDelete' },
-                                { name: 'إنشاء الرومات', value: 'channelCreate' },
-                                { name: 'حذف الرولات', value: 'roleDelete' },
-                                { name: 'إنشاء الرولات', value: 'roleCreate' },
-                                { name: 'الويبهوك', value: 'webhookCreate' },
-                                { name: 'البانات', value: 'memberBan' },
-                                { name: 'الطرد', value: 'memberKick' },
-                                { name: 'دخول البوتات', value: 'botAdd' }
-                            )
-                    )
-                    .addBooleanOption(option =>
-                        option.setName('الحالة')
-                            .setDescription('تفعيل أو تعطيل')
-                            .setRequired(true)
-                    )
-            )
-            .addSubcommand(sub =>
-                sub.setName('اعدادات')
-                    .setDescription('تحديد الحد الأقصى للعمليات والعقوبة')
+                sub.setName('المدة')
+                    .setDescription('خلال كم ثانية تُحسب العمليات المشبوهة (نافذة زمنية عامة لكل الأنواع)')
                     .addIntegerOption(option =>
-                        option.setName('الحد')
-                            .setDescription('كم عملية مشبوهة مسموحة قبل العقاب')
-                            .setRequired(false)
-                    )
-                    .addIntegerOption(option =>
-                        option.setName('المدة_بالثواني')
-                            .setDescription('خلال كم ثانية تُحسب العمليات')
-                            .setRequired(false)
-                    )
-                    .addStringOption(option =>
-                        option.setName('العقوبة')
-                            .setDescription('نوع العقوبة')
-                            .setRequired(false)
-                            .addChoices(
-                                { name: 'بان', value: 'ban' },
-                                { name: 'طرد', value: 'kick' }
-                            )
+                        option.setName('ثواني').setDescription('مثلاً 10').setRequired(true)
                     )
             ),
+
+        // ─── حماية الرومات ───
+        new SlashCommandBuilder()
+            .setName('protect-channels')
+            .setDescription('حماية إنشاء أو حذف الرومات من النيوك')
+            .addStringOption(option =>
+                option.setName('نوع').setDescription('حذف أو إنشاء الرومات').setRequired(true)
+                    .addChoices(
+                        { name: 'حذف الرومات', value: 'channelDelete' },
+                        { name: 'إنشاء الرومات', value: 'channelCreate' }
+                    )
+            )
+            .addBooleanOption(option => option.setName('تفعيل').setDescription('تشغيل أو إيقاف هذي الحماية').setRequired(true))
+            .addIntegerOption(option => option.setName('عدد').setDescription('كم عملية قبل ما يتعاقب، مثلاً 3').setRequired(false))
+            .addStringOption(option =>
+                option.setName('عقوبة').setDescription('نوع العقوبة').setRequired(false)
+                    .addChoices({ name: 'بان', value: 'ban' }, { name: 'طرد', value: 'kick' })
+            ),
+
+        // ─── حماية الرولات ───
+        new SlashCommandBuilder()
+            .setName('protect-roles')
+            .setDescription('حماية إنشاء أو حذف الرولات من النيوك')
+            .addStringOption(option =>
+                option.setName('نوع').setDescription('حذف أو إنشاء الرولات').setRequired(true)
+                    .addChoices(
+                        { name: 'حذف الرولات', value: 'roleDelete' },
+                        { name: 'إنشاء الرولات', value: 'roleCreate' }
+                    )
+            )
+            .addBooleanOption(option => option.setName('تفعيل').setDescription('تشغيل أو إيقاف هذي الحماية').setRequired(true))
+            .addIntegerOption(option => option.setName('عدد').setDescription('كم عملية قبل ما يتعاقب، مثلاً 3').setRequired(false))
+            .addStringOption(option =>
+                option.setName('عقوبة').setDescription('نوع العقوبة').setRequired(false)
+                    .addChoices({ name: 'بان', value: 'ban' }, { name: 'طرد', value: 'kick' })
+            ),
+
+        // ─── حماية البانات ───
+        new SlashCommandBuilder()
+            .setName('protect-bans')
+            .setDescription('حماية من إساءة استخدام البان (بان جماعي)')
+            .addBooleanOption(option => option.setName('تفعيل').setDescription('تشغيل أو إيقاف هذي الحماية').setRequired(true))
+            .addIntegerOption(option => option.setName('عدد').setDescription('كم بان قبل ما يتعاقب، مثلاً 3').setRequired(false))
+            .addStringOption(option =>
+                option.setName('عقوبة').setDescription('نوع العقوبة').setRequired(false)
+                    .addChoices({ name: 'بان', value: 'ban' }, { name: 'طرد', value: 'kick' })
+            ),
+
+        // ─── حماية الطرد ───
+        new SlashCommandBuilder()
+            .setName('protect-kicks')
+            .setDescription('حماية من إساءة استخدام الطرد (طرد جماعي)')
+            .addBooleanOption(option => option.setName('تفعيل').setDescription('تشغيل أو إيقاف هذي الحماية').setRequired(true))
+            .addIntegerOption(option => option.setName('عدد').setDescription('كم طرد قبل ما يتعاقب، مثلاً 3').setRequired(false))
+            .addStringOption(option =>
+                option.setName('عقوبة').setDescription('نوع العقوبة').setRequired(false)
+                    .addChoices({ name: 'بان', value: 'ban' }, { name: 'طرد', value: 'kick' })
+            ),
+
+        // ─── حماية الويبهوك ───
+        new SlashCommandBuilder()
+            .setName('protect-webhooks')
+            .setDescription('حماية من إنشاء ويبهوكات مشبوهة')
+            .addBooleanOption(option => option.setName('تفعيل').setDescription('تشغيل أو إيقاف هذي الحماية').setRequired(true))
+            .addIntegerOption(option => option.setName('عدد').setDescription('كم ويبهوك قبل ما يتعاقب، مثلاً 3').setRequired(false))
+            .addStringOption(option =>
+                option.setName('عقوبة').setDescription('نوع العقوبة').setRequired(false)
+                    .addChoices({ name: 'بان', value: 'ban' }, { name: 'طرد', value: 'kick' })
+            ),
+
+        // ─── حماية دخول البوتات ───
+        new SlashCommandBuilder()
+            .setName('protect-bots')
+            .setDescription('حماية من دخول بوتات غير مصرح لها (تعاقب فوري بدون عداد)')
+            .addBooleanOption(option => option.setName('تفعيل').setDescription('تشغيل أو إيقاف هذي الحماية').setRequired(true)),
 
         // ─── Whitelist ───
         new SlashCommandBuilder()
@@ -980,25 +1060,39 @@ client.on('interactionCreate', async (interaction) => {
             const vanityURL = s.vanityURL || 'غير محدد';
             const antiNukeStatus = s.antiNuke.enabled ? '✅ مفعلة' : '⚠️ معطلة';
 
+            const typeLine = (label, t) =>
+                `${label}: ${t.enabled ? '✅' : '❌'}${t.threshold !== undefined ? ` (${t.threshold} خلال ${s.antiNuke.timeWindowMs / 1000}ث، ${t.punishment === 'ban' ? 'بان' : 'طرد'})` : ''}`;
+
+            const details = [
+                typeLine('حذف الرومات', s.antiNuke.channelDelete),
+                typeLine('إنشاء الرومات', s.antiNuke.channelCreate),
+                typeLine('حذف الرولات', s.antiNuke.roleDelete),
+                typeLine('إنشاء الرولات', s.antiNuke.roleCreate),
+                typeLine('الويبهوك', s.antiNuke.webhookCreate),
+                typeLine('البانات', s.antiNuke.memberBan),
+                typeLine('الطرد', s.antiNuke.memberKick),
+                typeLine('دخول البوتات', s.antiNuke.botAdd)
+            ].join('\n');
+
             const embed = new EmbedBuilder()
                 .setTitle('⚙️ إعدادات البوت')
                 .addFields(
                     { name: '📝 روم اللوق', value: logCh, inline: true },
                     { name: '🔗 الرابط', value: `discord.gg/${vanityURL}`, inline: true },
                     { name: '🛡️ حماية الرابط', value: vanity, inline: true },
-                    { name: '⚔️ الحماية من النيوك', value: antiNukeStatus, inline: true },
+                    { name: '⚔️ المفتاح الرئيسي للحماية', value: antiNukeStatus, inline: true },
                     { name: '📋 الوايت ليست', value: `${s.whitelist.length} عضو`, inline: true },
-                    { name: '🔢 حد العمليات', value: `${s.antiNuke.maxActions} خلال ${s.antiNuke.timeWindowMs / 1000} ثانية`, inline: true }
+                    { name: '🔎 تفاصيل الحماية', value: details, inline: false }
                 )
                 .setColor(Colors.Gold)
                 .setTimestamp();
             return interaction.editReply({ embeds: [embed] }).catch(() => {});
         }
 
-        // ═══════════ antinuke ═══════════
+        // ═══════════ antinuke: المفتاح الرئيسي ═══════════
         if (commandName === 'antinuke') {
-            if (!isOwner(interaction.user.id) && !isAdmin(member)) {
-                return interaction.editReply({ content: '❌ ما عندك صلاحية.' }).catch(() => {});
+            if (!(await canManageProtection(interaction))) {
+                return interaction.editReply({ content: '❌ لازم تكون المالك، أو أدمن رتبتك أعلى من البوت، أو بالوايت ليست.' }).catch(() => {});
             }
             const sub = interaction.options.getSubcommand();
             const doc = await db.getOrCreate(guildId);
@@ -1006,32 +1100,60 @@ client.on('interactionCreate', async (interaction) => {
             if (sub === 'تفعيل') {
                 doc.antiNuke.enabled = true;
                 await doc.save();
-                return interaction.editReply({ content: '✅ تم تفعيل نظام الحماية من النيوك.' }).catch(() => {});
+                return interaction.editReply({ content: '✅ تم تفعيل نظام الحماية من النيوك. الآن فعّل كل نوع حماية على حدة بأوامر `/protect-*`.' }).catch(() => {});
             }
             if (sub === 'تعطيل') {
                 doc.antiNuke.enabled = false;
                 await doc.save();
-                return interaction.editReply({ content: '⚠️ تم تعطيل نظام الحماية من النيوك.' }).catch(() => {});
+                return interaction.editReply({ content: '⚠️ تم تعطيل نظام الحماية من النيوك بالكامل.' }).catch(() => {});
             }
-            if (sub === 'تحديد') {
-                const type = interaction.options.getString('نوع');
-                const state = interaction.options.getBoolean('الحالة');
-                doc.antiNuke[type] = state;
+            if (sub === 'المدة') {
+                const seconds = interaction.options.getInteger('ثواني');
+                doc.antiNuke.timeWindowMs = seconds * 1000;
                 await doc.save();
-                return interaction.editReply({ content: `✅ تم ${state ? 'تفعيل' : 'تعطيل'} حماية (${type}).` }).catch(() => {});
+                return interaction.editReply({ content: `✅ صارت النافذة الزمنية ${seconds} ثانية لكل أنواع الحماية.` }).catch(() => {});
             }
-            if (sub === 'اعدادات') {
-                const max = interaction.options.getInteger('الحد');
-                const seconds = interaction.options.getInteger('المدة_بالثواني');
-                const punishment = interaction.options.getString('العقوبة');
-                if (max) doc.antiNuke.maxActions = max;
-                if (seconds) doc.antiNuke.timeWindowMs = seconds * 1000;
-                if (punishment) doc.antiNuke.punishment = punishment;
-                await doc.save();
-                return interaction.editReply({
-                    content: `✅ تم تحديث إعدادات الحماية:\nالحد: ${doc.antiNuke.maxActions}\nالمدة: ${doc.antiNuke.timeWindowMs / 1000} ثانية\nالعقوبة: ${doc.antiNuke.punishment === 'ban' ? 'بان' : 'طرد'}`
-                }).catch(() => {});
+        }
+
+        // ═══════════ protect-* : كل نوع حماية له سلاش مستقل ═══════════
+        const PROTECT_COMMANDS = {
+            'protect-channels': { fromOption: true },   // نوع يحدده اليوزر: channelDelete / channelCreate
+            'protect-roles': { fromOption: true },       // roleDelete / roleCreate
+            'protect-bans': { type: 'memberBan' },
+            'protect-kicks': { type: 'memberKick' },
+            'protect-webhooks': { type: 'webhookCreate' },
+            'protect-bots': { type: 'botAdd', noThreshold: true }
+        };
+
+        if (PROTECT_COMMANDS[commandName]) {
+            if (!(await canManageProtection(interaction))) {
+                return interaction.editReply({ content: '❌ لازم تكون المالك، أو أدمن رتبتك أعلى من البوت، أو بالوايت ليست.' }).catch(() => {});
             }
+
+            const config = PROTECT_COMMANDS[commandName];
+            const type = config.fromOption ? interaction.options.getString('نوع') : config.type;
+            const enabled = interaction.options.getBoolean('تفعيل');
+
+            const doc = await db.getOrCreate(guildId);
+            doc.antiNuke[type].enabled = enabled;
+
+            if (!config.noThreshold) {
+                const threshold = interaction.options.getInteger('عدد');
+                const punishment = interaction.options.getString('عقوبة');
+                if (threshold) doc.antiNuke[type].threshold = threshold;
+                if (punishment) doc.antiNuke[type].punishment = punishment;
+            }
+
+            await doc.save();
+
+            let summary = `✅ حماية (${type}): ${enabled ? 'مفعلة' : 'معطلة'}`;
+            if (!config.noThreshold) {
+                summary += `\nالعدد المسموح: ${doc.antiNuke[type].threshold}\nالعقوبة: ${doc.antiNuke[type].punishment === 'ban' ? 'بان' : 'طرد'}`;
+            }
+            if (!doc.antiNuke.enabled) {
+                summary += '\n\n⚠️ تنبيه: المفتاح الرئيسي "antinuke تفعيل" لسا معطل، هذي الحماية ما راح تشتغل إلا لو فعّلته.';
+            }
+            return interaction.editReply({ content: summary }).catch(() => {});
         }
 
         // ═══════════ whitelist (المالك فقط) ═══════════
@@ -1333,4 +1455,8 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// تشخيص مؤقت: يطبع طول التوكن بدون ما يكشفه، عشان تتأكد إن Render يقرأه صح
+const _token = process.env.DISCORD_TOKEN;
+console.log('[DEBUG] DISCORD_TOKEN موجود؟', !!_token, '| الطول:', _token ? _token.length : 0);
+
+client.login(_token);
