@@ -1,179 +1,48 @@
-const http = require('http');
-const express = require('express');
-const fs = require('fs');
+const { Client, GatewayIntentBits, PermissionsBitField, EmbedBuilder, SlashCommandBuilder } = require('discord.js');
 const ms = require('ms');
-const mongoose = require('mongoose');
+const fs = require('fs');
+const express = require('express');
 
-const {
-    Client,
-    GatewayIntentBits,
-    PermissionsBitField,
-    EmbedBuilder,
-    SlashCommandBuilder,
-    Colors,
-    AuditLogEvent,
-    MessageFlags
-} = require('discord.js');
-
-// ==================== OWNER ID ====================
-const OWNER_ID = process.env.OWNER_ID || '1364275261398581279';
-
-function isOwner(userId) {
-    return userId === OWNER_ID;
-}
-
-function isAdmin(member) {
-    return member.permissions.has(PermissionsBitField.Flags.Administrator);
-}
-
-/* ─── Helper: canExecute ─── */
-function canExecute(message, target = null, requiredPermission = null, roleTarget = null) {
-    const authorIsOwner = isOwner(message.author.id);
-    if (authorIsOwner) return { allowed: true };
-
-    if (target && isOwner(target.id)) {
-        return { allowed: false, reason: 'فحلك المطيري ماتقدر تسوي له شي' };
-    }
-
-    if (requiredPermission && !message.member.permissions.has(requiredPermission)) {
-        return { allowed: false, reason: '❌ ما عندك صلاحية.' };
-    }
-
-    if (target && target.roles.highest.position >= message.member.roles.highest.position) {
-        return { allowed: false, reason: '❌ ما تقدر تسوي شي لعضو رتبته أعلى منك أو نفسك.' };
-    }
-
-    if (roleTarget && !isOwner(message.author.id) && roleTarget.position >= message.member.roles.highest.position) {
-        return { allowed: false, reason: '❌ ما تقدر تسوي شي على رتبة أعلى منك أو نفس رتبتك.' };
-    }
-
-    return { allowed: true };
-}
-
-// ==================== MONGODB DATABASE ====================
-// Schema compatible with both bots — uses guild_id to avoid index conflicts
-const guildSchema = new mongoose.Schema({
-    guild_id: { type: String, required: true, unique: true },
-    logChannelId: { type: String, default: null },
-    welcomeChannelId: { type: String, default: null },
-    jailRoles: { type: Map, of: [String], default: new Map() },
-    vanityURL: { type: String, default: null },
-    vanityProtection: { type: Boolean, default: false }
-});
-
-const warnSchema = new mongoose.Schema({
-    guildId: String,
-    userId: String,
-    number: Number,
-    reason: String,
-    by: String,
-    date: { type: Number, default: () => Date.now() }
-});
-
-const GuildSettings = mongoose.model('GuildSettings', guildSchema);
-const Warn = mongoose.model('Warn', warnSchema);
-
-// DB Helpers — all use guild_id instead of _id
-const db = {
-    async getOrCreate(guildId) {
-        let doc = await GuildSettings.findOne({ guild_id: guildId }).lean();
-        if (!doc) {
-            doc = await GuildSettings.create({ guild_id: guildId });
-        }
-        return doc;
-    },
-    async setLogChannel(guildId, channelId) {
-        await db.getOrCreate(guildId);
-        return GuildSettings.findOneAndUpdate(
-            { guild_id: guildId },
-            { logChannelId: channelId },
-            { upsert: true, new: true }
-        );
-    },
-    async getLogChannel(guildId) {
-        const s = await GuildSettings.findOne({ guild_id: guildId }).lean();
-        return s?.logChannelId || null;
-    },
-    async setVanityURL(guildId, url) {
-        await db.getOrCreate(guildId);
-        return GuildSettings.findOneAndUpdate(
-            { guild_id: guildId },
-            { vanityURL: url },
-            { upsert: true, new: true }
-        );
-    },
-    async getVanityURL(guildId) {
-        const s = await GuildSettings.findOne({ guild_id: guildId }).lean();
-        return s?.vanityURL || null;
-    },
-    async isVanityProtectionEnabled(guildId) {
-        const s = await GuildSettings.findOne({ guild_id: guildId }).lean();
-        return s?.vanityProtection || false;
-    },
-    async toggleVanityProtection(guildId, on) {
-        await db.getOrCreate(guildId);
-        return GuildSettings.findOneAndUpdate(
-            { guild_id: guildId },
-            { vanityProtection: on },
-            { upsert: true, new: true }
-        );
-    }
-};
-
-// Warning Helpers
-async function getWarnings(guildId, userId) {
-    return await Warn.find({ guildId, userId }).sort({ number: 1 }).lean();
-}
-
-async function getNextWarningNumber(guildId, userId) {
-    const lastWarn = await Warn.findOne({ guildId, userId }).sort({ number: -1 }).lean();
-    return (lastWarn?.number || 0) + 1;
-}
-
-async function addWarning(guildId, userId, reason, byId) {
-    const number = await getNextWarningNumber(guildId, userId);
-    await Warn.create({ guildId, userId, number, reason, by: byId });
-    return number;
-}
-
-async function removeWarning(guildId, userId, number) {
-    const result = await Warn.deleteOne({ guildId, userId, number });
-    return result.deletedCount > 0;
-}
-
-async function getLogChannel(guild) {
-    const id = await db.getLogChannel(guild.id);
-    return id ? guild.channels.cache.get(id) : null;
-}
-
-function logEmbed(title, fields, color = Colors.Blue, clientUser = null) {
-    const embed = new EmbedBuilder()
-        .setTitle(title)
-        .addFields(fields)
-        .setColor(color)
-        .setTimestamp();
-    if (clientUser) {
-        embed.setFooter({ text: 'Cypher Protection System', iconURL: clientUser.displayAvatarURL?.() || undefined });
-    }
-    return embed;
-}
-
-// ==================== HTTP SERVER ====================
 const app = express();
 const port = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is active!'));
 app.listen(port, () => console.log(`Server listening on port ${port}`));
 
-// ==================== DISCORD CLIENT ====================
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildInvites
+        GatewayIntentBits.GuildMembers
     ]
 });
+
+// ==================== DATABASE ====================
+const DB_FILE = './jailDatabase.json';
+const LOG_FILE = './logChannels.json';
+const WELCOME_FILE = './welcomeChannels.json';
+
+function loadJSON(file) {
+    if (!fs.existsSync(file)) return new Map();
+    try {
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return new Map(Object.entries(data));
+    } catch {
+        return new Map();
+    }
+}
+
+function saveJSON(file, data) {
+    fs.writeFileSync(file, JSON.stringify(Object.fromEntries(data), null, 2), 'utf8');
+}
+
+const jailDatabase = loadJSON(DB_FILE);
+let logChannels = loadJSON(LOG_FILE);
+let welcomeChannels = loadJSON(WELCOME_FILE);
+
+function saveJailDB() { saveJSON(DB_FILE, jailDatabase); }
+function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
+function saveWelcomeChannels() { saveJSON(WELCOME_FILE, welcomeChannels); }
 
 // ==================== WELCOME IMAGE SYSTEM ====================
 const WELCOME_BG_URL = 'https://cdn.discordapp.com/attachments/1451757101142642768/1538632664582725662/welcome2.png?ex=6a8362d5&is=6a821155&hm=8631d5bed72d0cc7cca1772a7ecbb1e57930a69ea06cd4a488695d270242076d';
@@ -271,48 +140,44 @@ async function getOrCreateMuteRole(guild) {
 
 // ==================== LOG SYSTEM ====================
 async function sendLog(guild, title, target, description, color = 0xFF0000) {
-    try {
-        const settings = await GuildSettings.findOne({ guild_id: guild.id }).lean();
-        if (!settings || !settings.logChannelId) return;
+    const logChannelId = logChannels.get(guild.id);
+    if (!logChannelId) return;
+    const channel = guild.channels.cache.get(logChannelId);
+    if (!channel) return;
 
-        const channel = guild.channels.cache.get(settings.logChannelId);
-        if (!channel) return;
+    const embed = new EmbedBuilder()
+        .setTitle(title)
+        .setColor(color)
+        .addFields(
+            { name: 'العضو', value: `<@${target.id}> (${target.user?.username || target.username})`, inline: true },
+            { name: 'الوصف', value: description, inline: false }
+        )
+        .setTimestamp();
 
-        const embed = new EmbedBuilder()
-            .setTitle(title)
-            .setColor(color)
-            .addFields(
-                { name: 'العضو', value: `<@${target.id}> (${target.user?.username || target.username})`, inline: true },
-                { name: 'الوصف', value: description, inline: false }
-            )
-            .setTimestamp();
-
-        await channel.send({ embeds: [embed] }).catch(() => {});
-    } catch (e) {
-        console.error('[LOG ERROR]', e);
-    }
+    await channel.send({ embeds: [embed] }).catch(() => {});
 }
 
 // ==================== SINGLE INSTANCE LOCK ====================
+const fs_lock = require('fs');
 const LOCK_FILE = './.bot.lock';
 
 try {
-    if (fs.existsSync(LOCK_FILE)) {
-        const lock = JSON.parse(fs.readFileSync(LOCK_FILE));
+    if (fs_lock.existsSync(LOCK_FILE)) {
+        const lock = JSON.parse(fs_lock.readFileSync(LOCK_FILE));
         if (Date.now() - lock.time < 15000) {
             console.log('🔒 بوت شغال، نطلع...');
             process.exit(0);
         }
     }
-    fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, time: Date.now() }));
+    fs_lock.writeFileSync(LOCK_FILE, JSON.stringify({pid: process.pid, time: Date.now()}));
     setInterval(() => {
-        fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, time: Date.now() }));
+        fs_lock.writeFileSync(LOCK_FILE, JSON.stringify({pid: process.pid, time: Date.now()}));
     }, 5000);
-} catch (e) {}
+} catch(e) {}
 
-process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE) } catch (e) {} });
-process.on('SIGINT', () => { try { fs.unlinkSync(LOCK_FILE) } catch (e) {} process.exit(0); });
-process.on('SIGTERM', () => { try { fs.unlinkSync(LOCK_FILE) } catch (e) {} process.exit(0); });
+process.on('exit', () => { try{fs_lock.unlinkSync(LOCK_FILE)}catch(e){} });
+process.on('SIGINT', () => { try{fs_lock.unlinkSync(LOCK_FILE)}catch(e){} process.exit(0); });
+process.on('SIGTERM', () => { try{fs_lock.unlinkSync(LOCK_FILE)}catch(e){} process.exit(0); });
 
 // ==================== ANTI-DUPLICATE ====================
 const processedMessages = new Set();
@@ -323,23 +188,17 @@ const PREFIX_COMMANDS = [
     'سجن', 'افراج',
     'تف', 'تميم.يسلم.عليك', 'بزبي',
     'طرد', 'kick',
-    'تكلم', 'تميم.يقولك.تكلم',
-    'r', 'تجريد',
-    'سد حلقك', 'تايم', 'تميم.يقولك.اسكت',
-    'فك', 'تميم.يبيك.ترجع',
-    'ق', 'ف', 'تح', 'شيل', 'تحذيرات'
+    'تكلم',
+    'r', 'شيل',
+    'سد حلقك', 'تايم',
+    'فك'
 ];
+
+// ==================== OWNER ID ====================
+const OWNER_ID = '1364275261398581279';
 
 // ==================== SLASH COMMANDS ====================
 client.on('ready', async () => {
-    try {
-        await mongoose.connect(process.env.MONGODB_URI);
-        console.log('✅ Connected to MongoDB');
-    } catch (err) {
-        console.error('❌ MongoDB connection error:', err);
-        process.exit(1);
-    }
-
     console.log(`✅ Bot online: ${client.user.tag}`);
 
     const commands = [
@@ -358,139 +217,48 @@ client.on('ready', async () => {
                 option.setName('channel')
                     .setDescription('اختر روم الترحيب')
                     .setRequired(true)
-            ),
-        new SlashCommandBuilder()
-            .setName('setvanity')
-            .setDescription('تحديد رابط السيرفر المخصص للحماية')
-            .addStringOption(option =>
-                option.setName('url')
-                    .setDescription('اكتب الرابط بدون discord.gg/ مثلاً: ab10')
-                    .setRequired(true)
-            ),
-        new SlashCommandBuilder()
-            .setName('vanity-protect')
-            .setDescription('تفعيل/تعطيل حماية رابط السيرفر')
-            .addBooleanOption(option =>
-                option.setName('enabled')
-                    .setDescription('تفعيل أو تعطيل')
-                    .setRequired(true)
-            ),
-        new SlashCommandBuilder()
-            .setName('settings')
-            .setDescription('عرض إعدادات البوت الحالية')
-    ].map(cmd => cmd.toJSON());
+            )
+    ];
 
-    try {
-        await client.application.commands.set(commands);
-        console.log('✅ Slash commands registered globally');
-    } catch (err) {
-        console.error('❌ Failed to register slash commands:', err.message);
-    }
-
-    client.user.setActivity('Cypher Protection', { type: 4 });
+    await client.application.commands.set(commands);
+    console.log('✅ Slash commands registered');
 });
 
-// ==================== INTERACTION CREATE ====================
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
-    try {
-        await interaction.deferReply({ ephemeral: true });
-    } catch (err) {
-        console.error('[Interaction] Failed to defer:', err.message);
-        return;
+    if (interaction.commandName === 'setlog') {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
+        }
+        const channel = interaction.options.getChannel('channel');
+        logChannels.set(interaction.guild.id, channel.id);
+        saveLogChannels();
+        return interaction.reply({ content: `✅ تم تحديد روم اللوقات: ${channel}`, ephemeral: true });
     }
 
-    if (!interaction.guild) {
-        return interaction.editReply({ content: 'هذا الأمر يعمل في السيرفرات فقط.' }).catch(() => {});
-    }
-
-    const { commandName } = interaction;
-    const member = interaction.member;
-    const guildId = interaction.guild.id;
-
-    try {
-        if (commandName === 'setlog') {
-            if (!isOwner(interaction.user.id) && !isAdmin(member)) {
-                return interaction.editReply({ content: '❌ ما عندك صلاحية.' }).catch(() => {});
-            }
-            const channel = interaction.options.getChannel('channel');
-            await db.setLogChannel(guildId, channel.id);
-            return interaction.editReply({ content: `✅ تم تحديد روم اللوقات: ${channel}` }).catch(() => {});
+    if (interaction.commandName === 'setwelcome') {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
         }
-
-        if (commandName === 'setwelcome') {
-            if (!isOwner(interaction.user.id) && !isAdmin(member)) {
-                return interaction.editReply({ content: '❌ ما عندك صلاحية.' }).catch(() => {});
-            }
-            const channel = interaction.options.getChannel('channel');
-            await db.getOrCreate(guildId);
-            await GuildSettings.findOneAndUpdate(
-                { guild_id: guildId },
-                { welcomeChannelId: channel.id },
-                { upsert: true, new: true }
-            );
-            return interaction.editReply({ content: `✅ تم تحديد روم الترحيب: ${channel}` }).catch(() => {});
-        }
-
-        if (commandName === 'setvanity') {
-            if (!isAdmin(member)) {
-                return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
-            }
-            const url = interaction.options.getString('url')?.trim();
-            await db.setVanityURL(guildId, url);
-            return interaction.editReply({ content: `✅ تم تحديد رابط السيرفر: discord.gg/${url}` }).catch(() => {});
-        }
-
-        if (commandName === 'vanity-protect') {
-            if (!isAdmin(member)) {
-                return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
-            }
-            const on = interaction.options.getBoolean('enabled');
-            await db.toggleVanityProtection(guildId, on);
-            return interaction.editReply({ content: on ? '✅ حماية الرابط مفعلة.' : '⚠️ معطلة.' }).catch(() => {});
-        }
-
-        if (commandName === 'settings') {
-            if (!isAdmin(member)) {
-                return interaction.editReply({ content: '❌ هذا الأمر للإدارة فقط.' }).catch(() => {});
-            }
-            const logChId = await db.getLogChannel(guildId);
-            const logCh = logChId ? `<#${logChId}>` : 'غير محدد';
-            const vanity = await db.isVanityProtectionEnabled(guildId) ? '✅ مفعلة' : '⚠️ معطلة';
-            const vanityURL = await db.getVanityURL(guildId) || 'غير محدد';
-
-            const embed = new EmbedBuilder()
-                .setTitle('⚙️ إعدادات البوت')
-                .addFields(
-                    { name: '📝 روم اللوق', value: logCh, inline: true },
-                    { name: '🔗 الرابط', value: `discord.gg/${vanityURL}`, inline: true },
-                    { name: '🛡️ الحماية', value: vanity, inline: true }
-                )
-                .setColor(Colors.Gold)
-                .setTimestamp();
-            return interaction.editReply({ embeds: [embed] }).catch(() => {});
-        }
-    } catch (err) {
-        console.error(`[Interaction Error] ${commandName}:`, err);
-        try {
-            await interaction.editReply({ content: `❌ حصل خطأ: ${err.message}` });
-        } catch {
-            // ignore
-        }
+        const channel = interaction.options.getChannel('channel');
+        welcomeChannels.set(interaction.guild.id, channel.id);
+        saveWelcomeChannels();
+        return interaction.reply({ content: `✅ تم تحديد روم الترحيب: ${channel}`, ephemeral: true });
     }
 });
 
 // ==================== WELCOME EVENT ====================
 client.on('guildMemberAdd', async (member) => {
+    const welcomeChannelId = welcomeChannels.get(member.guild.id);
+    if (!welcomeChannelId) return;
+
+    const channel = member.guild.channels.cache.get(welcomeChannelId);
+    if (!channel) return;
+
     try {
-        const settings = await GuildSettings.findOne({ guild_id: member.guild.id }).lean();
-        if (!settings || !settings.welcomeChannelId) return;
-
-        const channel = member.guild.channels.cache.get(settings.welcomeChannelId);
-        if (!channel) return;
-
         const imageBuffer = await createWelcomeImage(member);
+
         const memberCount = member.guild.memberCount;
 
         const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
@@ -505,6 +273,9 @@ client.on('guildMemberAdd', async (member) => {
         }
     } catch (error) {
         console.error('[WELCOME ERROR]', error);
+        await channel.send({
+            content: `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`
+        }).catch(() => {});
     }
 });
 
@@ -515,11 +286,10 @@ client.on('messageCreate', async (message) => {
     processedMessages.add(message.id);
     setTimeout(() => processedMessages.delete(message.id), 10000);
 
-    // Auto-replies
     if (message.content === "سلام عليكم") return message.reply("عليكم السلام ورحمة الله وبركاته، منور!");
     if (message.content === ".") return message.reply("العسل ينقط، يلبى بس!");
     if (message.content === "تفاعلو") {
-        if (!isOwner(message.author.id) && !message.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
+        if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
         return message.reply("سم معاليك ما طلبت شي، تفاعلو زي ما يقول @here");
     }
 
@@ -531,16 +301,225 @@ client.on('messageCreate', async (message) => {
 
     console.log(`[CMD] ${commandName} | target: ${target?.user?.username || 'none'} | by: ${message.author.username}`);
 
+    const isOwner = message.author.id === OWNER_ID;
+    const isAdmin = message.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
     try {
-        // ─── HELP ───
         if (commandName === 'مساعده' || commandName === 'help') {
             const embed = new EmbedBuilder()
                 .setTitle('أوامر البوت')
                 .setColor(0xFFD700)
                 .setDescription('الأوامر المتاحة:')
                 .addFields(
-                    { name: 'الاوامر الادارية', value: '`سجن @عضو`\n`افراج @عضو`\n`تف @عضو` - بان\n`طرد @عضو`\n`فك آيدي/يوزر` - فك بان', inline: true },
-                    { name: 'التايم', value: '`تايم @عضو 10m`\n`تكلم @عضو`', inline: true },
-                    { name: 'الرتب', value: '`r @عضو اسم_الرتبة`\n`تجريد @عضو اسم_الرتبة`', inline: true },
-                    { name: 'الشات', value: '`ق` - قفل الشات\n`ف` - فتح الشات', inline: true },
-                    { name: 'ا
+                    { name: 'العقوبات', value: '`سجن @عضو`\n`افراج @عضو`\n`تف @عضو` - بان\n`طرد @عضو`\n`فك آيدي/يوزر` - فك بان', inline: true },
+                    { name: 'الإسكات', value: '`تايم @عضو 10m`\n`تكلم @عضو`', inline: true },
+                    { name: 'الرتب', value: '`r @عضو اسم_الرتبة`\n`شيل @عضو اسم_الرتبة`', inline: true },
+                    { name: 'الإعدادات', value: '`/setlog` - تحديد روم اللوقات\n`/setwelcome` - تحديد روم الترحيب', inline: true }
+                )
+                .setFooter({ text: 'البوت يعمل بكفاءة' })
+                .setTimestamp();
+            return message.channel.send({ embeds: [embed] });
+        }
+
+        if (commandName === 'سجن') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+                return message.reply('❌ ما عندك صلاحية إدارة الرتب.');
+            if (!target) return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تسجن عضو رتبته أعلى منك أو نفسك.');
+
+            await message.guild.roles.fetch();
+            let jailRole = message.guild.roles.cache.find(r => r.name === 'سجين')
+                || await message.guild.roles.create({ name: 'سجين', color: '#FF0000' });
+
+            jailDatabase.set(target.id, target.roles.cache
+                .filter(r => r.id !== message.guild.id)
+                .map(r => r.id));
+            saveJailDB();
+
+            await target.roles.set([jailRole.id]);
+            await sendLog(message.guild, '🔒 سجن', target, `بواسطة: ${message.author.username}`);
+            return message.reply(`✅ تم سجن ${target.user.username}.`);
+        }
+
+        if (commandName === 'افراج') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+                return message.reply('❌ ما عندك صلاحية.');
+            if (!target) return message.reply('❌ حدد عضو.');
+            if (!jailDatabase.has(target.id)) return message.reply('❌ هذا العضو مو مسجون.');
+
+            await target.roles.set(jailDatabase.get(target.id));
+            jailDatabase.delete(target.id);
+            saveJailDB();
+            await sendLog(message.guild, '🔓 إفراج', target, `بواسطة: ${message.author.username}`);
+            return message.reply(`✅ تم فك السجن عن ${target.user.username}.`);
+        }
+
+        if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك' || commandName === 'بزبي') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+                return message.reply('❌ ما عندك صلاحية الحظر.');
+            if (!target) return message.reply('❌ حدد عضو.');
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تحظر عضو رتبته أعلى منك أو نفسك.');
+
+            await target.ban();
+            await sendLog(message.guild, '🔨 حظر', target, `بواسطة: ${message.author.username}`);
+            return message.reply(`✅ راح لندن ${target.user.username}.`);
+        }
+
+        if (commandName === 'فك') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+                return message.reply('❌ ما عندك صلاحية فك الحظر.');
+            if (!args[0]) return message.reply('❌ حدد آيدي أو يوزر. مثال: `فك 123456789` أو `فك username`');
+
+            const input = args[0];
+            let userId = input;
+            let username = input;
+
+            const mentionMatch = input.match(/^<@!?(\d{17,19})>$/);
+            if (mentionMatch) {
+                userId = mentionMatch[1];
+            } else if (!/^\d{17,19}$/.test(input)) {
+                const bans = await message.guild.bans.fetch();
+                const banned = bans.find(b => b.user.username.toLowerCase() === input.toLowerCase());
+                if (!banned) return message.reply(`❌ ما لقيت محظور باسم "${input}".`);
+                userId = banned.user.id;
+                username = banned.user.username;
+            }
+
+            if (!username || username === userId) {
+                try {
+                    const user = await client.users.fetch(userId);
+                    username = user.username;
+                } catch {
+                    username = userId;
+                }
+            }
+
+            await message.guild.members.unban(userId);
+            await sendLog(message.guild, '🔓 فك حظر', {id: userId, username: username}, `بواسطة: ${message.author.username}`, 0x00FF00);
+            return message.reply(`✅ تم فك الحظر عن **${username}**.`);
+        }
+
+        if (commandName === 'طرد' || commandName === 'kick') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.KickMembers))
+                return message.reply('❌ ما عندك صلاحية الطرد.');
+            if (!target) return message.reply('❌ حدد عضو.');
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تطير عضو رتبته أعلى منك أو نفسك.');
+
+            await target.kick();
+            await sendLog(message.guild, '👢 طرد', target, `بواسطة: ${message.author.username}`);
+            return message.reply(`✅ تم تسفيره ${target.user.username}.`);
+        }
+
+        if (commandName === 'تايم' || commandName === 'سد حلقك') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
+                return message.reply('❌ ما عندك صلاحية الإسكات.');
+            if (!target) return message.reply('❌ حدد عضو. مثال: `تايم @عضو 10m`');
+
+            const timeStr = args.slice(1).join(' ').trim() || args.find(arg => ms(arg));
+            if (!timeStr) return message.reply('❌ حدد المدة. مثال: `تايم @عضو 10m`');
+
+            const duration = ms(timeStr);
+            if (!duration) return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
+
+            if (!isOwner && target.roles.highest.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تعطي تايم لعضو رتبته أعلى منك أو نفسك.');
+
+            try {
+                await target.timeout(duration, `بواسطة: ${message.author.username}`);
+                await sendLog(message.guild, '🔇 تايم أوت', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
+                return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr}.`);
+            } catch (err) {
+                if (err.code === 50013) {
+                    const muteRole = await getOrCreateMuteRole(message.guild);
+                    await target.roles.add(muteRole);
+                    setTimeout(async () => {
+                        try {
+                            const freshMember = await message.guild.members.fetch(target.id);
+                            if (freshMember.roles.cache.has(muteRole.id)) {
+                                await freshMember.roles.remove(muteRole);
+                            }
+                        } catch (e) {}
+                    }, duration);
+                    await sendLog(message.guild, '🔇 تايم أوت (رتبة)', target, `المدة: ${timeStr} | بواسطة: ${message.author.username}`);
+                    return message.reply(`✅ تم صكه ${target.user.username} لمدة ${timeStr} (باستخدام رتبة الميوت).`);
+                }
+                throw err;
+            }
+        }
+
+        if (commandName === 'تكلم') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
+                return message.reply('❌ ما عندك صلاحية.');
+            if (!target) return message.reply('❌ حدد عضو.');
+
+            try { await target.timeout(null); } catch (e) {}
+
+            const muteRole = message.guild.roles.cache.find(r => r.name === 'Muted' || r.name === 'ميوت');
+            if (muteRole && target.roles.cache.has(muteRole.id)) await target.roles.remove(muteRole);
+
+            await sendLog(message.guild, '🔊 فك التايم', target, `بواسطة: ${message.author.username}`);
+            return message.reply(`✅ تم فك التايم عن ${target.user.username}.`);
+        }
+
+        if (commandName === 'r') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+                return message.reply('❌ ما معك صلاحية.');
+            if (!target) return message.reply('❌ حدد عضو. مثال: `r @عضو اسم_الرتبة`');
+
+            const filteredArgs = args.filter(a => !a.match(/^<@!?\d+$/) && !a.match(/^\d{17,19}$/));
+            const roleName = filteredArgs.join(' ').trim();
+            const roleId = args.find(a => a.match(/^\d{17,19}$/));
+
+            if (!roleName && !roleId) return message.reply('❌ حدد اسم الرتبة.');
+
+            await message.guild.roles.fetch();
+            const role = message.guild.roles.cache.get(roleId) ||
+                message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+
+            if (!role) return message.reply(`❌ ما لقيت رتبة باسم "${roleName}".`);
+            if (!isOwner && role.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تعطي رتبة أعلى منك أو نفس رتبتك.');
+
+            await target.roles.add(role);
+            await sendLog(message.guild, '🏷️ إعطاء رتبة', target, `الرتبة: ${role.name} | بواسطة: ${message.author.username}`, 0x00FF00);
+            return message.reply(`✅ تم إعطاء ${target.user.username} رتبة ${role.name}.`);
+        }
+
+        if (commandName === 'شيل') {
+            if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+                return message.reply('❌ ما معك صلاحية.');
+            if (!target) return message.reply('❌ حدد عضو. مثال: `شيل @عضو اسم_الرتبة`');
+
+            const filteredArgs = args.filter(a => !a.match(/^<@!?\d+$/) && !a.match(/^\d{17,19}$/));
+            const roleName = filteredArgs.join(' ').trim();
+            const roleId = args.find(a => a.match(/^\d{17,19}$/));
+
+            if (!roleName && !roleId) return message.reply('❌ حدد اسم الرتبة.');
+
+            await message.guild.roles.fetch();
+            const role = message.guild.roles.cache.get(roleId) ||
+                message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+
+            if (!role) return message.reply(`❌ ما لقيت رتبة باسم "${roleName}".`);
+            if (!isOwner && role.position >= message.member.roles.highest.position)
+                return message.reply('❌ ما تقدر تشيل رتبة أعلى منك أو نفس رتبتك.');
+            if (!target.roles.cache.has(role.id))
+                return message.reply(`❌ ${target.user.username} ما معه رتبة **${role.name}**.`);
+
+            await target.roles.remove(role);
+            await sendLog(message.guild, '🗑️ تجريد من رتبة', target, `الرتبة: ${role.name} | بواسطة: ${message.author.username}`, 0xFFA500);
+            return message.reply(`✅ تم تجريد ${target.user.username} من رتبة **${role.name}**.`);
+        }
+
+    } catch (error) {
+        console.error(`[ERROR] في أمر "${commandName}":`, error);
+        message.reply(`❌ صار خطأ: \`${error.message}\``).catch(() => {});
+    }
+});
+
+client.login(process.env.TOKEN).catch(err => {
+    console.error('❌ خطأ في تسجيل الدخول:', err);
+});
