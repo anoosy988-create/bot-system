@@ -2,6 +2,7 @@ const { Client, GatewayIntentBits, PermissionsBitField, EmbedBuilder, SlashComma
 const ms = require('ms');
 const fs = require('fs');
 const express = require('express');
+const mongoose = require('mongoose');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -17,32 +18,19 @@ const client = new Client({
     ]
 });
 
-// ==================== DATABASE ====================
-const DB_FILE = './jailDatabase.json';
-const LOG_FILE = './logChannels.json';
-const WELCOME_FILE = './welcomeChannels.json';
-
-function loadJSON(file) {
-    if (!fs.existsSync(file)) return new Map();
-    try {
-        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-        return new Map(Object.entries(data));
-    } catch {
-        return new Map();
+// ==================== MONGODB DATABASE ====================
+const guildSchema = new mongoose.Schema({
+    _id: { type: String, required: true }, // guildId
+    logChannelId: { type: String, default: null },
+    welcomeChannelId: { type: String, default: null },
+    jailRoles: {
+        type: Map,
+        of: [String],
+        default: new Map()
     }
-}
+});
 
-function saveJSON(file, data) {
-    fs.writeFileSync(file, JSON.stringify(Object.fromEntries(data), null, 2), 'utf8');
-}
-
-const jailDatabase = loadJSON(DB_FILE);
-let logChannels = loadJSON(LOG_FILE);
-let welcomeChannels = loadJSON(WELCOME_FILE);
-
-function saveJailDB() { saveJSON(DB_FILE, jailDatabase); }
-function saveLogChannels() { saveJSON(LOG_FILE, logChannels); }
-function saveWelcomeChannels() { saveJSON(WELCOME_FILE, welcomeChannels); }
+const GuildSettings = mongoose.model('GuildSettings', guildSchema);
 
 // ==================== WELCOME IMAGE SYSTEM ====================
 const WELCOME_BG_URL = 'https://cdn.discordapp.com/attachments/1451757101142642768/1538632664582725662/welcome2.png?ex=6a8362d5&is=6a821155&hm=8631d5bed72d0cc7cca1772a7ecbb1e57930a69ea06cd4a488695d270242076d';
@@ -140,21 +128,26 @@ async function getOrCreateMuteRole(guild) {
 
 // ==================== LOG SYSTEM ====================
 async function sendLog(guild, title, target, description, color = 0xFF0000) {
-    const logChannelId = logChannels.get(guild.id);
-    if (!logChannelId) return;
-    const channel = guild.channels.cache.get(logChannelId);
-    if (!channel) return;
+    try {
+        const settings = await GuildSettings.findById(guild.id).lean();
+        if (!settings || !settings.logChannelId) return;
+        
+        const channel = guild.channels.cache.get(settings.logChannelId);
+        if (!channel) return;
 
-    const embed = new EmbedBuilder()
-        .setTitle(title)
-        .setColor(color)
-        .addFields(
-            { name: 'العضو', value: `<@${target.id}> (${target.user?.username || target.username})`, inline: true },
-            { name: 'الوصف', value: description, inline: false }
-        )
-        .setTimestamp();
+        const embed = new EmbedBuilder()
+            .setTitle(title)
+            .setColor(color)
+            .addFields(
+                { name: 'العضو', value: `<@${target.id}> (${target.user?.username || target.username})`, inline: true },
+                { name: 'الوصف', value: description, inline: false }
+            )
+            .setTimestamp();
 
-    await channel.send({ embeds: [embed] }).catch(() => {});
+        await channel.send({ embeds: [embed] }).catch(() => {});
+    } catch (e) {
+        console.error('[LOG ERROR]', e);
+    }
 }
 
 // ==================== SINGLE INSTANCE LOCK ====================
@@ -188,10 +181,10 @@ const PREFIX_COMMANDS = [
     'سجن', 'افراج',
     'تف', 'تميم.يسلم.عليك', 'بزبي',
     'طرد', 'kick',
-    'تكلم',
+    'تكلم', 'تميم.يقولك.تكلم',
     'r', 'شيل',
-    'سد حلقك', 'تايم',
-    'فك'
+    'سد حلقك', 'تايم', 'تميم.يقولك.اسكت',
+    'فك', 'تميم.يبيك.ترجع'
 ];
 
 // ==================== OWNER ID ====================
@@ -199,6 +192,14 @@ const OWNER_ID = '1364275261398581279';
 
 // ==================== SLASH COMMANDS ====================
 client.on('ready', async () => {
+    try {
+        await mongoose.connect(process.env.MONGODB_URI);
+        console.log('✅ Connected to MongoDB');
+    } catch (err) {
+        console.error('❌ MongoDB connection error:', err);
+        process.exit(1);
+    }
+
     console.log(`✅ Bot online: ${client.user.tag}`);
 
     const commands = [
@@ -232,8 +233,13 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
         }
         const channel = interaction.options.getChannel('channel');
-        logChannels.set(interaction.guild.id, channel.id);
-        saveLogChannels();
+        
+        await GuildSettings.findByIdAndUpdate(
+            interaction.guild.id,
+            { logChannelId: channel.id },
+            { upsert: true, new: true }
+        );
+        
         return interaction.reply({ content: `✅ تم تحديد روم اللوقات: ${channel}`, ephemeral: true });
     }
 
@@ -242,23 +248,27 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
         }
         const channel = interaction.options.getChannel('channel');
-        welcomeChannels.set(interaction.guild.id, channel.id);
-        saveWelcomeChannels();
+        
+        await GuildSettings.findByIdAndUpdate(
+            interaction.guild.id,
+            { welcomeChannelId: channel.id },
+            { upsert: true, new: true }
+        );
+        
         return interaction.reply({ content: `✅ تم تحديد روم الترحيب: ${channel}`, ephemeral: true });
     }
 });
 
 // ==================== WELCOME EVENT ====================
 client.on('guildMemberAdd', async (member) => {
-    const welcomeChannelId = welcomeChannels.get(member.guild.id);
-    if (!welcomeChannelId) return;
-
-    const channel = member.guild.channels.cache.get(welcomeChannelId);
-    if (!channel) return;
-
     try {
-        const imageBuffer = await createWelcomeImage(member);
+        const settings = await GuildSettings.findById(member.guild.id).lean();
+        if (!settings || !settings.welcomeChannelId) return;
 
+        const channel = member.guild.channels.cache.get(settings.welcomeChannelId);
+        if (!channel) return;
+
+        const imageBuffer = await createWelcomeImage(member);
         const memberCount = member.guild.memberCount;
 
         const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
@@ -273,9 +283,6 @@ client.on('guildMemberAdd', async (member) => {
         }
     } catch (error) {
         console.error('[WELCOME ERROR]', error);
-        await channel.send({
-            content: `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${member.guild.memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`
-        }).catch(() => {});
     }
 });
 
@@ -332,10 +339,15 @@ client.on('messageCreate', async (message) => {
             let jailRole = message.guild.roles.cache.find(r => r.name === 'سجين')
                 || await message.guild.roles.create({ name: 'سجين', color: '#FF0000' });
 
-            jailDatabase.set(target.id, target.roles.cache
+            const savedRoles = target.roles.cache
                 .filter(r => r.id !== message.guild.id)
-                .map(r => r.id));
-            saveJailDB();
+                .map(r => r.id);
+
+            await GuildSettings.findByIdAndUpdate(
+                message.guild.id,
+                { $set: { [`jailRoles.${target.id}`]: savedRoles } },
+                { upsert: true }
+            );
 
             await target.roles.set([jailRole.id]);
             await sendLog(message.guild, '🔒 سجن', target, `بواسطة: ${message.author.username}`);
@@ -346,11 +358,19 @@ client.on('messageCreate', async (message) => {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
                 return message.reply('❌ ما عندك صلاحية.');
             if (!target) return message.reply('❌ حدد عضو.');
-            if (!jailDatabase.has(target.id)) return message.reply('❌ هذا العضو مو مسجون.');
 
-            await target.roles.set(jailDatabase.get(target.id));
-            jailDatabase.delete(target.id);
-            saveJailDB();
+            const settings = await GuildSettings.findById(message.guild.id).lean();
+            if (!settings || !settings.jailRoles || !settings.jailRoles.get(target.id))
+                return message.reply('❌ هذا العضو مو مسجون.');
+
+            const roles = settings.jailRoles.get(target.id);
+            await target.roles.set(roles);
+            
+            await GuildSettings.findByIdAndUpdate(
+                message.guild.id,
+                { $unset: { [`jailRoles.${target.id}`]: 1 } }
+            );
+            
             await sendLog(message.guild, '🔓 إفراج', target, `بواسطة: ${message.author.username}`);
             return message.reply(`✅ تم فك السجن عن ${target.user.username}.`);
         }
@@ -367,7 +387,7 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ راح لندن ${target.user.username}.`);
         }
 
-        if (commandName === 'فك') {
+        if (commandName === 'فك' || commandName === 'تميم.يبيك.ترجع') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
                 return message.reply('❌ ما عندك صلاحية فك الحظر.');
             if (!args[0]) return message.reply('❌ حدد آيدي أو يوزر. مثال: `فك 123456789` أو `فك username`');
@@ -413,7 +433,7 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ تم تسفيره ${target.user.username}.`);
         }
 
-        if (commandName === 'تايم' || commandName === 'سد حلقك') {
+        if (commandName === 'تايم' || commandName === 'سد حلقك' || commandName === 'تميم.يقولك.اسكت') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
                 return message.reply('❌ ما عندك صلاحية الإسكات.');
             if (!target) return message.reply('❌ حدد عضو. مثال: `تايم @عضو 10m`');
@@ -450,7 +470,7 @@ client.on('messageCreate', async (message) => {
             }
         }
 
-        if (commandName === 'تكلم') {
+        if (commandName === 'تكلم' || commandName === 'تميم.يقولك.تكلم') {
             if (!isAdmin && !message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers))
                 return message.reply('❌ ما عندك صلاحية.');
             if (!target) return message.reply('❌ حدد عضو.');
