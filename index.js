@@ -147,7 +147,7 @@ const processedMessages = new Set();
 // ==================== COMMANDS LIST ====================
 const PREFIX_COMMANDS = [
     'مساعده', 'help',
-    'سجن', 'افراج',
+    'سجن', 'تميم.مابيك', 'افراج',
     'تف', 'تميم.يسلم.عليك', 'بزبي',
     'طرد', 'kick',
     'تكلم', 'تميم.يقولك.تكلم',
@@ -285,7 +285,7 @@ client.on('messageCreate', async (message) => {
             return message.channel.send({ embeds: [embed] });
         }
 
-        if (commandName === 'سجن') {
+        if (commandName === 'سجن' || commandName === 'تميم.مابيك') {
             if (!target) return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
 
             const check = canExecute(message, target, PermissionsBitField.Flags.ManageRoles);
