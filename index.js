@@ -69,73 +69,6 @@ const guildSchema = new mongoose.Schema({
 
 const GuildSettings = mongoose.model('GuildSettings', guildSchema);
 
-// ==================== WELCOME IMAGE SYSTEM ====================
-const WELCOME_BG_URL = 'https://cdn.discordapp.com/attachments/1451757101142642768/1538632664582725662/welcome2.png?ex=6a8362d5&is=6a821155&hm=8631d5bed72d0cc7cca1772a7ecbb1e57930a69ea06cd4a488695d270242076d';
-
-async function getCanvas() {
-    try {
-        return require('@napi-rs/canvas');
-    } catch {
-        try {
-            return require('canvas');
-        } catch {
-            return null;
-        }
-    }
-}
-
-async function createWelcomeImage(member) {
-    const canvasLib = await getCanvas();
-    if (!canvasLib) {
-        console.log('[WARN] No canvas library found');
-        return null;
-    }
-
-    const { createCanvas, loadImage } = canvasLib;
-    const canvas = createCanvas(1425, 736);
-    const ctx = canvas.getContext('2d');
-
-    const background = await loadImage(WELCOME_BG_URL);
-    ctx.drawImage(background, 0, 0, canvas.width, canvas.height);
-
-    const avatarURL = member.user.displayAvatarURL({ extension: 'png', size: 512 });
-    const avatar = await loadImage(avatarURL);
-
-    const avatarX = 180;
-    const avatarY = 200;
-    const avatarSize = 280;
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
-    ctx.closePath();
-    ctx.clip();
-    ctx.drawImage(avatar, avatarX, avatarY, avatarSize, avatarSize);
-    ctx.restore();
-
-    ctx.beginPath();
-    ctx.arc(avatarX + avatarSize / 2, avatarY + avatarSize / 2, avatarSize / 2 + 8, 0, Math.PI * 2);
-    ctx.lineWidth = 8;
-    ctx.strokeStyle = '#d4af37';
-    ctx.stroke();
-
-    ctx.font = 'bold 42px DejaVu Sans, Arial, sans-serif';
-    ctx.fillStyle = '#d4af37';
-    ctx.textAlign = 'left';
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
-    ctx.shadowBlur = 10;
-    ctx.shadowOffsetX = 2;
-    ctx.shadowOffsetY = 2;
-
-    const username = `@${member.user.username}`;
-    const textX = avatarX + avatarSize + 50;
-    const textY = avatarY + avatarSize / 2 + 10;
-
-    ctx.fillText(username, textX, textY);
-
-    return canvas.toBuffer('image/png');
-}
-
 // ==================== MUTE ROLE SYSTEM ====================
 async function getOrCreateMuteRole(guild) {
     let muteRole = guild.roles.cache.find(r => r.name === 'Muted' || r.name === 'ميوت');
@@ -168,7 +101,7 @@ async function sendLog(guild, title, target, description, color = 0xFF0000) {
     try {
         const settings = await GuildSettings.findById(guild.id).lean();
         if (!settings || !settings.logChannelId) return;
-        
+
         const channel = guild.channels.cache.get(settings.logChannelId);
         if (!channel) return;
 
@@ -188,26 +121,25 @@ async function sendLog(guild, title, target, description, color = 0xFF0000) {
 }
 
 // ==================== SINGLE INSTANCE LOCK ====================
-const fs_lock = require('fs');
 const LOCK_FILE = './.bot.lock';
 
 try {
-    if (fs_lock.existsSync(LOCK_FILE)) {
-        const lock = JSON.parse(fs_lock.readFileSync(LOCK_FILE));
+    if (fs.existsSync(LOCK_FILE)) {
+        const lock = JSON.parse(fs.readFileSync(LOCK_FILE));
         if (Date.now() - lock.time < 15000) {
             console.log('🔒 بوت شغال، نطلع...');
             process.exit(0);
         }
     }
-    fs_lock.writeFileSync(LOCK_FILE, JSON.stringify({pid: process.pid, time: Date.now()}));
+    fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, time: Date.now() }));
     setInterval(() => {
-        fs_lock.writeFileSync(LOCK_FILE, JSON.stringify({pid: process.pid, time: Date.now()}));
+        fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, time: Date.now() }));
     }, 5000);
-} catch(e) {}
+} catch (e) {}
 
-process.on('exit', () => { try{fs_lock.unlinkSync(LOCK_FILE)}catch(e){} });
-process.on('SIGINT', () => { try{fs_lock.unlinkSync(LOCK_FILE)}catch(e){} process.exit(0); });
-process.on('SIGTERM', () => { try{fs_lock.unlinkSync(LOCK_FILE)}catch(e){} process.exit(0); });
+process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE) } catch (e) {} });
+process.on('SIGINT', () => { try { fs.unlinkSync(LOCK_FILE) } catch (e) {} process.exit(0); });
+process.on('SIGTERM', () => { try { fs.unlinkSync(LOCK_FILE) } catch (e) {} process.exit(0); });
 
 // ==================== ANTI-DUPLICATE ====================
 const processedMessages = new Set();
@@ -221,7 +153,8 @@ const PREFIX_COMMANDS = [
     'تكلم', 'تميم.يقولك.تكلم',
     'r', 'شيل',
     'سد حلقك', 'تايم', 'تميم.يقولك.اسكت',
-    'فك', 'تميم.يبيك.ترجع'
+    'فك', 'تميم.يبيك.ترجع',
+    'مسح'
 ];
 
 // ==================== SLASH COMMANDS ====================
@@ -267,13 +200,13 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
         }
         const channel = interaction.options.getChannel('channel');
-        
+
         await GuildSettings.findByIdAndUpdate(
             interaction.guild.id,
             { logChannelId: channel.id },
             { upsert: true, new: true }
         );
-        
+
         return interaction.reply({ content: `✅ تم تحديد روم اللوقات: ${channel}`, ephemeral: true });
     }
 
@@ -282,13 +215,13 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
         }
         const channel = interaction.options.getChannel('channel');
-        
+
         await GuildSettings.findByIdAndUpdate(
             interaction.guild.id,
             { welcomeChannelId: channel.id },
             { upsert: true, new: true }
         );
-        
+
         return interaction.reply({ content: `✅ تم تحديد روم الترحيب: ${channel}`, ephemeral: true });
     }
 });
@@ -302,19 +235,11 @@ client.on('guildMemberAdd', async (member) => {
         const channel = member.guild.channels.cache.get(settings.welcomeChannelId);
         if (!channel) return;
 
-        const imageBuffer = await createWelcomeImage(member);
         const memberCount = member.guild.memberCount;
 
-        const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1451025226342076457>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
+        const messageContent = `𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𓇻 • 𝟏𝟗𝟗𝟒 𝐅𝐀𝐌𝐈𝐋𝐘\n\n〢𝐌𝐄𝐌𝐁𝐄𝐑 : <@${member.id}>\n\n〢𝐂𝐇𝐀𝐓 : <#1541459798468464710>\n\n〢𝐑𝐔𝐋𝐄𝐒 : <#1459481940884459583>\n\n〢𝐍𝐔𝐌𝐁𝐄𝐑 : ${memberCount}\n\n〢𝐈𝐍𝐕𝐈𝐓𝐄𝐑 : <@${member.id}>`;
 
-        if (imageBuffer) {
-            await channel.send({
-                content: messageContent,
-                files: [{ attachment: imageBuffer, name: 'welcome.png' }]
-            });
-        } else {
-            await channel.send({ content: messageContent });
-        }
+        await channel.send({ content: messageContent });
     } catch (error) {
         console.error('[WELCOME ERROR]', error);
     }
@@ -352,6 +277,7 @@ client.on('messageCreate', async (message) => {
                     { name: 'العقوبات', value: '`سجن @عضو`\n`افراج @عضو`\n`تف @عضو` - بان\n`طرد @عضو`\n`فك آيدي/يوزر` - فك بان', inline: true },
                     { name: 'الإسكات', value: '`تايم @عضو 10m`\n`تكلم @عضو`', inline: true },
                     { name: 'الرتب', value: '`r @عضو اسم_الرتبة`\n`شيل @عضو اسم_الرتبة`', inline: true },
+                    { name: 'الرسايل', value: '`مسح <عدد>` - حذف رسايل (أقصى 100)', inline: true },
                     { name: 'الإعدادات', value: '`/setlog` - تحديد روم اللوقات\n`/setwelcome` - تحديد روم الترحيب', inline: true }
                 )
                 .setFooter({ text: 'البوت يعمل بكفاءة' })
@@ -361,7 +287,7 @@ client.on('messageCreate', async (message) => {
 
         if (commandName === 'سجن') {
             if (!target) return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
-            
+
             const check = canExecute(message, target, PermissionsBitField.Flags.ManageRoles);
             if (!check.allowed) return message.reply(check.reason);
 
@@ -390,25 +316,26 @@ client.on('messageCreate', async (message) => {
             const check = canExecute(message, target);
             if (!check.allowed) return message.reply(check.reason);
 
-            const settings = await GuildSettings.findById(message.guild.id).lean();
+            // لا نستخدم lean() هنا لأن jailRoles من نوع Map، و lean() يحوّله لـ Object عادي بدون دالة get()
+            const settings = await GuildSettings.findById(message.guild.id);
             if (!settings || !settings.jailRoles || !settings.jailRoles.get(target.id))
                 return message.reply('❌ هذا العضو مو مسجون.');
 
             const roles = settings.jailRoles.get(target.id);
             await target.roles.set(roles);
-            
+
             await GuildSettings.findByIdAndUpdate(
                 message.guild.id,
                 { $unset: { [`jailRoles.${target.id}`]: 1 } }
             );
-            
+
             await sendLog(message.guild, '🔓 إفراج', target, `بواسطة: ${message.author.username}`);
             return message.reply(`✅ تم فك السجن عن ${target.user.username}.`);
         }
 
         if (commandName === 'تف' || commandName === 'تميم.يسلم.عليك' || commandName === 'بزبي') {
             if (!target) return message.reply('❌ حدد عضو.');
-            
+
             const check = canExecute(message, target, PermissionsBitField.Flags.BanMembers);
             if (!check.allowed) return message.reply(check.reason);
 
@@ -420,7 +347,7 @@ client.on('messageCreate', async (message) => {
         if (commandName === 'فك' || commandName === 'تميم.يبيك.ترجع') {
             const check = canExecute(message, null, PermissionsBitField.Flags.BanMembers);
             if (!check.allowed) return message.reply(check.reason);
-            
+
             if (!args[0]) return message.reply('❌ حدد آيدي أو يوزر. مثال: `فك 123456789` أو `فك username`');
 
             const input = args[0];
@@ -453,13 +380,13 @@ client.on('messageCreate', async (message) => {
             }
 
             await message.guild.members.unban(userId);
-            await sendLog(message.guild, '🔓 فك حظر', {id: userId, username: username}, `بواسطة: ${message.author.username}`, 0x00FF00);
+            await sendLog(message.guild, '🔓 فك حظر', { id: userId, username: username }, `بواسطة: ${message.author.username}`, 0x00FF00);
             return message.reply(`✅ تم فك الحظر عن **${username}**.`);
         }
 
         if (commandName === 'طرد' || commandName === 'kick') {
             if (!target) return message.reply('❌ حدد عضو.');
-            
+
             const check = canExecute(message, target, PermissionsBitField.Flags.KickMembers);
             if (!check.allowed) return message.reply(check.reason);
 
@@ -479,6 +406,12 @@ client.on('messageCreate', async (message) => {
 
             const duration = ms(timeStr);
             if (!duration) return message.reply('❌ مدة غير صحيحة. أمثلة: `10m`, `1h`, `1d`');
+
+            // ديسكورد ما يسمح بتايم أوت أطول من 28 يوم
+            const MAX_TIMEOUT = 28 * 24 * 60 * 60 * 1000;
+            if (duration > MAX_TIMEOUT) {
+                return message.reply('❌ أقصى مدة مسموحة هي 28 يوم.');
+            }
 
             try {
                 await target.timeout(duration, `بواسطة: ${message.author.username}`);
@@ -564,6 +497,35 @@ client.on('messageCreate', async (message) => {
             await target.roles.remove(role);
             await sendLog(message.guild, '🗑️ تجريد من رتبة', target, `الرتبة: ${role.name} | بواسطة: ${message.author.username}`, 0xFFA500);
             return message.reply(`✅ تم تجريد ${target.user.username} من رتبة **${role.name}**.`);
+        }
+
+        if (commandName === 'مسح') {
+            // ما نحتاج target هنا لأن الأمر يشتغل على الروم كامل، مو على عضو
+            const check = canExecute(message, null, PermissionsBitField.Flags.ManageMessages);
+            if (!check.allowed) return message.reply(check.reason);
+
+            const amount = parseInt(args[0]);
+
+            if (isNaN(amount)) {
+                return message.reply('❌ حدد عدد صحيح. مثال: `مسح 20`');
+            }
+
+            if (amount < 1 || amount > 100) {
+                return message.reply('❌ العدد لازم يكون بين 1 و 100.');
+            }
+
+            try {
+                // true = يتجاهل بصمت الرسايل الأقدم من 14 يوم بدل ما يرمي خطأ
+                const deleted = await message.channel.bulkDelete(amount, true);
+
+                const confirmMsg = await message.channel.send(`🗑️ تم مسح **${deleted.size}** رسالة بواسطة ${message.author.username}.`);
+                setTimeout(() => confirmMsg.delete().catch(() => {}), 3000);
+
+                await sendLog(message.guild, '🗑️ مسح رسايل', message.author, `العدد: ${deleted.size} | في روم: <#${message.channel.id}>`, 0xFFA500);
+            } catch (error) {
+                console.error('[MESSAGE PURGE ERROR]', error);
+                return message.reply('❌ صار خطأ أثناء الحذف. تأكد إن الرسايل أقل من 14 يوم أو إن البوت عنده صلاحية Manage Messages.');
+            }
         }
 
     } catch (error) {
