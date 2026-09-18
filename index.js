@@ -60,6 +60,8 @@ const guildSchema = new mongoose.Schema({
     _id: { type: String, required: true }, // guildId
     logChannelId: { type: String, default: null },
     welcomeChannelId: { type: String, default: null },
+    aiChatChannelId: { type: String, default: null },
+    aiCodeChannelId: { type: String, default: null },
     jailRoles: {
         type: Map,
         of: [String],
@@ -94,6 +96,140 @@ async function getOrCreateMuteRole(guild) {
         } catch (e) {}
     }
     return muteRole;
+}
+
+// ==================== AI CODE GENERATION (multi-provider) ====================
+// يحتاج متغيرات بيئة: ANTHROPIC_API_KEY (أساسي)، OPENAI_API_KEY و DEEPSEEK_API_KEY (اختياريين للاحتياط)
+// يحتاج Node 18+ عشان fetch مدمج بدون مكتبات إضافية
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+
+const CODE_SYSTEM_PROMPT = 'أنت مبرمج خبير. لما يطلب منك المستخدم أداة أو كود، اكتب الكود كامل وجاهز للتشغيل داخل بلوك كود واحد فقط بالشكل ```language ... ```، مع تعليقات مختصرة داخل الكود توضح كل جزء. لا تكتب شرح طويل خارج بلوك الكود.';
+
+async function generateCodeWithClaude(userPrompt, systemPrompt) {
+    if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY غير موجود');
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 4096,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: userPrompt }]
+        })
+    });
+
+    if (!response.ok) throw new Error(`Claude API error (${response.status}): ${await response.text()}`);
+
+    const data = await response.json();
+    const textBlock = data.content.find(b => b.type === 'text');
+    return textBlock ? textBlock.text : '';
+}
+
+async function generateCodeWithOpenAI(userPrompt, systemPrompt) {
+    if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY غير موجود');
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+            model: 'gpt-4o',
+            max_tokens: 4096,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ]
+        })
+    });
+
+    if (!response.ok) throw new Error(`OpenAI API error (${response.status}): ${await response.text()}`);
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+}
+
+async function generateCodeWithDeepSeek(userPrompt, systemPrompt) {
+    if (!DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY غير موجود');
+
+    const response = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+        },
+        body: JSON.stringify({
+            model: 'deepseek-chat',
+            max_tokens: 4096,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ]
+        })
+    });
+
+    if (!response.ok) throw new Error(`DeepSeek API error (${response.status}): ${await response.text()}`);
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+}
+
+// يجرب المزودين بالترتيب: Claude أولاً، ثم OpenAI، ثم DeepSeek — أول وحد ينجح يوقف عنده
+// نفس الدالة تستخدم لتوليد الكود (اصنع) وللسوالف العامة (منشن البوت)، بس systemPrompt يتغير حسب الاستخدام
+async function generateAIResponse(userPrompt, systemPrompt) {
+    const providers = [
+        { name: 'Claude', fn: generateCodeWithClaude },
+        { name: 'OpenAI', fn: generateCodeWithOpenAI },
+        { name: 'DeepSeek', fn: generateCodeWithDeepSeek }
+    ];
+
+    const errors = [];
+    for (const provider of providers) {
+        try {
+            const result = await provider.fn(userPrompt, systemPrompt);
+            if (result && result.trim()) return { text: result, usedProvider: provider.name };
+        } catch (e) {
+            errors.push(`${provider.name}: ${e.message}`);
+        }
+    }
+
+    throw new Error('كل المزودين فشلوا:\n' + errors.join('\n'));
+}
+
+// شخصية السوالف العامة (لما حد يمنشن البوت)
+const CHAT_SYSTEM_PROMPT = 'انت بوت ديسكورد ودود وذكي، تسولف مع أعضاء السيرفر باللهجة العربية العامية بشكل طبيعي وعفوي، مو رسمي. ردودك قصيرة ومباشرة (كم سطر بس) إلا إذا الشخص طلب تفصيل أكثر أو شرح تقني. لو سألوك عن كود أو برمجة قدر تساعد، بس خل الرد المباشر مختصر ووجّههم لأمر `اصنع` لو يبون ملف كود كامل.';
+
+// يحاول يستخرج الكود من داخل ```language ... ``` ويحدد امتداد الملف حسب اللغة
+function extractCodeAndExtension(aiText) {
+    const codeBlockMatch = aiText.match(/```(\w+)?\n([\s\S]*?)```/);
+
+    const langToExt = {
+        javascript: 'js', js: 'js', node: 'js',
+        typescript: 'ts', ts: 'ts',
+        python: 'py', py: 'py',
+        html: 'html', css: 'css', json: 'json',
+        bash: 'sh', sh: 'sh', shell: 'sh',
+        batch: 'bat', bat: 'bat', cmd: 'bat',
+        java: 'java', c: 'c', cpp: 'cpp', csharp: 'cs', php: 'php'
+    };
+
+    if (codeBlockMatch) {
+        const lang = (codeBlockMatch[1] || '').toLowerCase();
+        const code = codeBlockMatch[2].trim();
+        const ext = langToExt[lang] || 'txt';
+        return { code, ext };
+    }
+
+    // ما فيه بلوك كود واضح، نحفظ الرد كامل كملف نصي
+    return { code: aiText.trim(), ext: 'txt' };
 }
 
 // ==================== LOG SYSTEM ====================
@@ -147,14 +283,15 @@ const processedMessages = new Set();
 // ==================== COMMANDS LIST ====================
 const PREFIX_COMMANDS = [
     'مساعده', 'help',
-    'سجن', 'تميم.مايبيك', 'افراج',
+    'سجن', 'تميم.مابيك', 'افراج',
     'تف', 'تميم.يسلم.عليك', 'بزبي',
     'طرد', 'kick',
     'تكلم', 'تميم.يقولك.تكلم',
     'r', 'شيل',
     'سد حلقك', 'تايم', 'تميم.يقولك.اسكت',
     'فك', 'تميم.يبيك.ترجع',
-    'مسح'
+    'مسح',
+    'اصنع'
 ];
 
 // ==================== SLASH COMMANDS ====================
@@ -184,6 +321,22 @@ client.on('ready', async () => {
             .addChannelOption(option =>
                 option.setName('channel')
                     .setDescription('اختر روم الترحيب')
+                    .setRequired(true)
+            ),
+        new SlashCommandBuilder()
+            .setName('setchat')
+            .setDescription('تحديد روم السوالف مع الذكاء الاصطناعي (أدمن بس)')
+            .addChannelOption(option =>
+                option.setName('channel')
+                    .setDescription('اختر الروم')
+                    .setRequired(true)
+            ),
+        new SlashCommandBuilder()
+            .setName('setcode')
+            .setDescription('تحديد روم صناعة الأكواد (معالي المطيري بس)')
+            .addChannelOption(option =>
+                option.setName('channel')
+                    .setDescription('اختر الروم')
                     .setRequired(true)
             )
     ];
@@ -224,6 +377,37 @@ client.on('interactionCreate', async (interaction) => {
 
         return interaction.reply({ content: `✅ تم تحديد روم الترحيب: ${channel}`, ephemeral: true });
     }
+
+    if (interaction.commandName === 'setchat') {
+        if (!isOwner(interaction.user.id) && !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: '❌ ما عندك صلاحية.', ephemeral: true });
+        }
+        const channel = interaction.options.getChannel('channel');
+
+        await GuildSettings.findByIdAndUpdate(
+            interaction.guild.id,
+            { aiChatChannelId: channel.id },
+            { upsert: true, new: true }
+        );
+
+        return interaction.reply({ content: `✅ تم تحديد روم السوالف: ${channel}`, ephemeral: true });
+    }
+
+    if (interaction.commandName === 'setcode') {
+        // مقفول على معالي المطيري بس — بدون أي استثناء
+        if (!isOwner(interaction.user.id)) {
+            return interaction.reply({ content: 'معالي المطيري ماتقدر تسوي له شي', ephemeral: true });
+        }
+        const channel = interaction.options.getChannel('channel');
+
+        await GuildSettings.findByIdAndUpdate(
+            interaction.guild.id,
+            { aiCodeChannelId: channel.id },
+            { upsert: true, new: true }
+        );
+
+        return interaction.reply({ content: `✅ تم تحديد روم صناعة الأكواد: ${channel}`, ephemeral: true });
+    }
 });
 
 // ==================== WELCOME EVENT ====================
@@ -259,6 +443,33 @@ client.on('messageCreate', async (message) => {
         return message.reply("سم معاليك ما طلبت شي، تفاعلو زي ما يقول @here");
     }
 
+    // ==================== سوالف عامة (لما حد يمنشن البوت) — متاح للكل ====================
+    if (message.mentions.has(client.user)) {
+        const aiSettings = await GuildSettings.findById(message.guild.id).lean();
+
+        // لو ما حد أحد روم السوالف بعد، نتجاهل بصمت
+        if (!aiSettings || !aiSettings.aiChatChannelId) return;
+
+        // نرد بس في الروم المحدد، وأي روم ثاني نتجاهله تمامًا
+        if (message.channel.id !== aiSettings.aiChatChannelId) return;
+
+        const chatPrompt = message.content
+            .replace(/<@!?\d+>/g, '')
+            .trim();
+
+        if (!chatPrompt) return message.reply('هلا! قول وش تبي تسولف؟ 👋');
+
+        try {
+            const { text } = await generateAIResponse(chatPrompt, CHAT_SYSTEM_PROMPT);
+            // ديسكورد ما يقبل رسالة أطول من 2000 حرف
+            const trimmed = text.length > 1900 ? text.slice(0, 1900) + '...' : text;
+            return message.reply(trimmed);
+        } catch (error) {
+            console.error('[AI CHAT ERROR]', error);
+            return message.reply('❌ ما قدرت أرد عليك الحين، جرب بعدين.');
+        }
+    }
+
     const args = message.content.trim().split(/ +/);
     const commandName = args.shift().toLowerCase();
     const target = message.mentions.members.first();
@@ -278,14 +489,15 @@ client.on('messageCreate', async (message) => {
                     { name: 'الإسكات', value: '`تايم @عضو 10m`\n`تكلم @عضو`', inline: true },
                     { name: 'الرتب', value: '`r @عضو اسم_الرتبة`\n`شيل @عضو اسم_الرتبة`', inline: true },
                     { name: 'الرسايل', value: '`مسح <عدد>` - حذف رسايل (أقصى 100)', inline: true },
-                    { name: 'الإعدادات', value: '`/setlog` - تحديد روم اللوقات\n`/setwelcome` - تحديد روم الترحيب', inline: true }
+                    { name: 'الذكاء الاصطناعي', value: '`اصنع <وصف>` - يولد كود ويرسله كملف (أونر بس)\nمنشن البوت + سؤال = يسولف معك', inline: true },
+                    { name: 'الإعدادات', value: '`/setlog` - تحديد روم اللوقات\n`/setwelcome` - تحديد روم الترحيب\n`/setchat` - تحديد روم السوالف (أدمن بس)\n`/setcode` - تحديد روم صناعة الأكواد (معالي المطيري بس)', inline: true }
                 )
                 .setFooter({ text: 'البوت يعمل بكفاءة' })
                 .setTimestamp();
             return message.channel.send({ embeds: [embed] });
         }
 
-        if (commandName === 'سجن' || commandName === 'تميم.مايبيك') {
+        if (commandName === 'سجن' || commandName === 'تميم.مابيك') {
             if (!target) return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
 
             const check = canExecute(message, target, PermissionsBitField.Flags.ManageRoles);
@@ -525,6 +737,48 @@ client.on('messageCreate', async (message) => {
             } catch (error) {
                 console.error('[MESSAGE PURGE ERROR]', error);
                 return message.reply('❌ صار خطأ أثناء الحذف. تأكد إن الرسايل أقل من 14 يوم أو إن البوت عنده صلاحية Manage Messages.');
+            }
+        }
+
+        if (commandName === 'اصنع') {
+            // مقفول على معالي المطيري بس
+            if (!isOwner(message.author.id)) {
+                return message.reply('معالي المطيري ماتقدر تسوي له شي');
+            }
+
+            // نفس قيد روم صناعة الأكواد المحدد بـ /setcode
+            const aiSettings = await GuildSettings.findById(message.guild.id).lean();
+            if (!aiSettings || !aiSettings.aiCodeChannelId) {
+                return message.reply('⚠️ ما حددت روم صناعة الأكواد بعد. استخدم `/setcode` وحدد الروم أول.');
+            }
+            if (message.channel.id !== aiSettings.aiCodeChannelId) {
+                return message.reply(`❌ هذا الأمر يشتغل بس في <#${aiSettings.aiCodeChannelId}>.`);
+            }
+
+            const userPrompt = args.join(' ').trim();
+            if (!userPrompt) {
+                return message.reply('❌ اكتب وش تبي تصنع. مثال: `اصنع اداة نسخ سيرفرات بـ node.js discord.js`');
+            }
+
+            const thinkingMsg = await message.reply('🧠 جاري توليد الكود، ثواني...');
+
+            try {
+                const { text: aiText, usedProvider } = await generateAIResponse(userPrompt, CODE_SYSTEM_PROMPT);
+                const { code, ext } = extractCodeAndExtension(aiText);
+
+                const fileName = `generated_${Date.now()}.${ext}`;
+                fs.writeFileSync(fileName, code);
+
+                await message.channel.send({
+                    content: `✅ تفضل الكود (تم توليده عبر ${usedProvider}):`,
+                    files: [{ attachment: fileName, name: fileName }]
+                });
+
+                fs.unlinkSync(fileName);
+                await thinkingMsg.delete().catch(() => {});
+            } catch (error) {
+                console.error('[AI GEN ERROR]', error);
+                await thinkingMsg.edit(`❌ صار خطأ أثناء توليد الكود: ${error.message}`).catch(() => {});
             }
         }
 
