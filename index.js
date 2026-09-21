@@ -99,13 +99,39 @@ async function getOrCreateMuteRole(guild) {
 }
 
 // ==================== AI CODE GENERATION (multi-provider) ====================
-// يحتاج متغيرات بيئة: ANTHROPIC_API_KEY (أساسي)، OPENAI_API_KEY و DEEPSEEK_API_KEY (اختياريين للاحتياط)
-// يحتاج Node 18+ عشان fetch مدمج بدون مكتبات إضافية
+// GROQ_API_KEY مجاني بالكامل وبدون بطاقة ائتمانية — سجل بـ console.groq.com
+// الباقي (ANTHROPIC/OPENAI/DEEPSEEK) اختياريين للاحتياط لو تبي جودة أعلى لاحقًا
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
 const CODE_SYSTEM_PROMPT = 'أنت مبرمج خبير. لما يطلب منك المستخدم أداة أو كود، اكتب الكود كامل وجاهز للتشغيل داخل بلوك كود واحد فقط بالشكل ```language ... ```، مع تعليقات مختصرة داخل الكود توضح كل جزء. لا تكتب شرح طويل خارج بلوك الكود.';
+
+async function generateCodeWithGroq(userPrompt, systemPrompt) {
+    if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY غير موجود');
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${GROQ_API_KEY}`
+        },
+        body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            max_tokens: 4096,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ]
+        })
+    });
+
+    if (!response.ok) throw new Error(`Groq API error (${response.status}): ${await response.text()}`);
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || '';
+}
 
 async function generateCodeWithClaude(userPrompt, systemPrompt) {
     if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY غير موجود');
@@ -182,10 +208,11 @@ async function generateCodeWithDeepSeek(userPrompt, systemPrompt) {
     return data.choices?.[0]?.message?.content || '';
 }
 
-// يجرب المزودين بالترتيب: Claude أولاً، ثم OpenAI، ثم DeepSeek — أول وحد ينجح يوقف عنده
+// يجرب المزودين بالترتيب: Groq (مجاني) أولاً، ثم Claude، ثم OpenAI، ثم DeepSeek — أول وحد ينجح يوقف عنده
 // نفس الدالة تستخدم لتوليد الكود (اصنع) وللسوالف العامة (منشن البوت)، بس systemPrompt يتغير حسب الاستخدام
 async function generateAIResponse(userPrompt, systemPrompt) {
     const providers = [
+        { name: 'Groq', fn: generateCodeWithGroq },
         { name: 'Claude', fn: generateCodeWithClaude },
         { name: 'OpenAI', fn: generateCodeWithOpenAI },
         { name: 'DeepSeek', fn: generateCodeWithDeepSeek }
@@ -288,7 +315,7 @@ const processedMessages = new Set();
 // ==================== COMMANDS LIST ====================
 const PREFIX_COMMANDS = [
     'مساعده', 'help',
-    'سجن', 'تميم.مايبيك', 'افراج',
+    'سجن', 'تميم.مابيك', 'افراج',
     'تف', 'تميم.يسلم.عليك', 'بزبي',
     'طرد', 'kick',
     'تكلم', 'تميم.يقولك.تكلم',
@@ -518,7 +545,7 @@ client.on('messageCreate', async (message) => {
             return message.channel.send({ embeds: [embed] });
         }
 
-        if (commandName === 'سجن' || commandName === 'تميم.مايبيك') {
+        if (commandName === 'سجن' || commandName === 'تميم.مابيك') {
             if (!target) return message.reply('❌ حدد عضو. مثال: `سجن @عضو`');
 
             const check = canExecute(message, target, PermissionsBitField.Flags.ManageRoles);
