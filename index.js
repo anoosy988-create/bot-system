@@ -2011,60 +2011,16 @@ const slashCommands = [
 ].map(command => command.toJSON());
 
 
-// ======================================================
-// REGISTER SLASH COMMANDS
-// ======================================================
-
-async function registerGlobalCommands() {
-
-    try {
-
-        await client.application.commands.set(slashCommands);
-
-        console.log(
-            `🌐 Slash commands registered globally: ${slashCommands.length} commands for ALL servers`
-        );
-
-        // رابط الإضافة الصحيح (بدونه ما تظهر الأوامر في أي سيرفر)
-        console.log(
-            '🔗 لإضافة البوت بشكل صحيح في كل سيرفر استخدم هذا الرابط (بديل):\n' +
-            '    https://discord.com/api/oauth2/authorize?client_id=' +
-            `${client.user.id}&permissions=8&scope=bot%20applications.commands` +
-            '\nإذا فيه سيرفر ما تظهر فيه الأوامر = البوت أضيف فيه برابط قديم بدون ' +
-            "'applications.commands'. أزله منه وأضفه مرة ثانية بالرابط أعلاه."
-        );
-
-        return true;
-
-    } catch (error) {
-
-        console.error(
-            '❌ Failed registering GLOBAL slash commands:',
-            error.message || error
-        );
-
-        // Missing Access (50001) = دخل البوت بدون scope الأوامر
-        const code = error.code || error.status || error.rawError?.code;
-
-        if (code === 50001 || code === 403) {
-
-            console.error(
-                '⚠️ البوت ناقص صلاحية `applications.commands`.\n' +
-                'الحل: أعد إضافة البوت للـ (كل) السيرفرات بالرابط الصحيح:\n' +
-                `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=8&scope=bot%20applications.commands\n` +
-                'ينصح بإزالة البوت من السيرفرات ثم إضافته بالرابط أعلاه.'
-            );
-        }
-
-        return false;
-    }
-}
-
 client.once('ready', async () => {
 
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // تسجيل الأوامر في كل سيرفر مباشرة: تظهر فوراً بدون انتظار تأخير الأوامر العامة
+    // إزالة الأوامر العامة القديمة نهائياً حتى لا تتكرر مع الأوامر المحلية
+    await client.application.commands.set([]).catch(() => {});
+
+    console.log('🧹 Cleared global slash commands');
+
+    // تسجيل الأوامر في كل سيرفر مباشرة (مرة وحدة لكل سيرفر = بدون تكرار، وتظهر فوراً)
     for (const guild of client.guilds.cache.values()) {
         await guild.commands.set(slashCommands).catch(() => {});
     }
@@ -2072,9 +2028,6 @@ client.once('ready', async () => {
     console.log(
         `⚡ Slash commands registered in ${client.guilds.cache.size} servers (instant)`
     );
-
-    // تسجيل عام كاحتياط لأي سيرفر جديد أو نشره لاحقاً
-    await registerGlobalCommands();
 
     try {
         await mongoose.connect(MONGO_URI);
@@ -2131,12 +2084,15 @@ client.once('ready', async () => {
     );
 });
 
-// لاحظ: الأوامر عامة الآن، أي سيرفر جديد يظهر به الأوامر تلقائياً
-client.on('guildCreate', guild => {
+// الأوامر تُسجَّل محلياً لكل سيرفر مباشرة عند التشغيل،
+// وأي سيرفر جديد ينضم نسجّل له الأوامر هنا حتى تظهر فوراً
+client.on('guildCreate', async guild => {
 
     console.log(
         `📥 Bot added to new server: ${guild.name}`
     );
+
+    await guild.commands.set(slashCommands).catch(() => {});
 
 });
 
