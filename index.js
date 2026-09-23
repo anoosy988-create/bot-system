@@ -154,6 +154,90 @@ async function requireAdmin(interaction) {
     return (await requireStaffPermission(interaction)) === true;
 }
 
+// فحص صلاحية استخدام أمر/اختصار:
+// لو فيه رتبة مخصصة للأمر = تشترطها، وإلا تشترط الرتبة الافتراضية (ستريتر فوق البوت)
+async function requireCommandPermission(interaction, commandKey) {
+    if (isOwner(interaction.user.id)) return true;
+
+    const member = interaction.member;
+    const guild = interaction.guild;
+
+    const replyContent = async content => {
+        const options = { content, ephemeral: true };
+
+        if (interaction.replied || interaction.deferred) {
+            return interaction.followUp(options);
+        }
+
+        return interaction.reply(options);
+    };
+
+    // رتبة مخصصة لهذا الأمر/الاختصار
+    let roleId = null;
+    let settings = null;
+
+    try {
+        settings = await getSettings(guild.id);
+        roleId = settings?.commandPermissions?.get(normalizeText(commandKey)) || null;
+    } catch {}
+
+    if (roleId) {
+        const role = guild.roles.cache.get(roleId);
+
+        if (!role) {
+            return replyContent(
+                `❌ الرتبة المخصصة لـ **${commandKey}** غير موجودة في السيرفر.\n` +
+                'حدد رتبة جديدة من أمر `/permission`.'
+            );
+        }
+
+        if (member.roles.cache.has(role.id)) return true;
+
+        return replyContent(
+            `❌ تحتاج رتبة **${role.name}** لاستخدام هذا الأمر.`
+        );
+    }
+
+    // الوضع الافتراضي: رتبة الصلاحيات (فوق رتبة البوت)
+    return requireStaffPermission(interaction);
+}
+
+// فحص صلاحية استخدام اختصار من رسالة عادية
+// (رتبة مخصصة للاختصار إن وُجدت، وإلا الرتبة الافتراضية، والـ warnings مفتوح للجميع)
+async function shortcutPermission(member, guild, shortcut, command) {
+    if (isOwner(member.id)) return { ok: true };
+
+    let settings = null;
+
+    try {
+        settings = await getSettings(guild.id);
+    } catch {}
+
+    const key = shortcut?.name ? normalizeText(shortcut.name) : null;
+    const roleId = key
+        ? settings?.commandPermissions?.get(key) || null
+        : null;
+
+    if (roleId) {
+        const role = guild.roles.cache.get(roleId);
+
+        if (!role) {
+            return { ok: false, roleMissing: true };
+        }
+
+        if (member.roles.cache.has(role.id)) return { ok: true };
+
+        return { ok: false, role };
+    }
+
+    // عرض تحذيراتك مفتوح للجميع، باقي الاختصارات تتطلب رتبة الصلاحيات
+    if (command === 'warnings') return { ok: true };
+
+    if (memberHasStaffRole(member, guild)) return { ok: true };
+
+    return { ok: false };
+}
+
 function normalizeText(text) {
     return String(text || '')
         .trim()
@@ -342,6 +426,15 @@ const guildSchema = new mongoose.Schema({
         }
     },
 
+    // الرتبة المسموح لها استخدام كل أمر/اختصار
+    // (المفتاح = اسم الأمر أو الاختصار | القيمة = آيدي الرتبة)
+    // لو ما فيه رتبة مخصصة = استخدام الرتبة الافتراضية STAFF_ROLE_NAME
+    commandPermissions: {
+        type: Map,
+        of: String,
+        default: new Map()
+    },
+
     // عدّاد رقم التحذير لكل سيرفر (يبدأ من 1 ولا يتكرر أبداً)
     warnCounter: {
         type: Number,
@@ -471,6 +564,27 @@ function sanitizeSettings(settings) {
                 settings.markModified('levelSettings.rewards');
                 changed = true;
             }
+        }
+    } catch {}
+
+    // commandPermissions يجب أن يكون Map وليس كائناً أو مفقوداً
+    try {
+        const cp = settings.commandPermissions;
+
+        if (!cp || !(cp instanceof mongoose.Types.Map)) {
+            const entries = cp && typeof cp.toObject === 'function'
+                ? cp.toObject()
+                : cp;
+
+            if (entries && typeof entries === 'object' && !Array.isArray(entries)) {
+                settings.commandPermissions =
+                    new Map(Object.entries(entries));
+            } else {
+                settings.commandPermissions = new Map();
+            }
+
+            settings.markModified('commandPermissions');
+            changed = true;
         }
     } catch {}
 
@@ -1824,6 +1938,37 @@ const slashCommands = [
                 .setDescription('العضو (الافتراضي: أنت)')
                 .setRequired(false)
         ),
+
+    new SlashCommandBuilder()
+        .setName('permission')
+        .setDescription('اختيار الرتبة المسموح لها استخدام أمر أو اختصار')
+        .addSubcommand(sub =>
+            sub.setName('set')
+                .setDescription('تحديد رتبة مسموح لها استخدام أمر أو اختصار')
+                .addStringOption(o =>
+                    o.setName('command')
+                        .setDescription('اسم الأمر (مثل ban/kick) أو اسم الاختصار')
+                        .setRequired(true)
+                )
+                .addRoleOption(o =>
+                    o.setName('role')
+                        .setDescription('الرتبة المسموح لها الاستخدام')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(sub =>
+            sub.setName('remove')
+                .setDescription('إزالة الرتبة المخصصة والعودة للرتبة الافتراضية')
+                .addStringOption(o =>
+                    o.setName('command')
+                        .setDescription('اسم الأمر (مثل ban/kick) أو اسم الاختصار')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(sub =>
+            sub.setName('list')
+                .setDescription('عرض الرتب المخصصة للأوامر والاختصارات')
+        ),
 ].map(command => command.toJSON());
 
 
@@ -2010,9 +2155,140 @@ client.on('interactionCreate', async interaction => {
             }
 
 
-            // EVERY SLASH COMMAND = STAFF ROLE ONLY
-            const staffOK = await requireStaffPermission(interaction);
+            // كل أمر سلاش = رتبة مخصصة له إن وُجدت، وإلا رتبة الصلاحيات الافتراضية
+            const staffOK = await requireCommandPermission(interaction, command);
             if (staffOK !== true) return staffOK;
+
+
+            // ==========================================
+            // PERMISSION (اختيار الرتبة المسموح لها استخدام أمر أو اختصار)
+            // ==========================================
+
+            if (command === 'permission') {
+
+                const sub = interaction.options.getSubcommand();
+                const settings = await getSettings(interaction.guild.id);
+
+                if (sub === 'set') {
+
+                    const raw = interaction.options.getString('command');
+                    const role = interaction.options.getRole('role');
+                    const key = normalizeText(raw);
+
+                    if (!key) {
+                        return interaction.reply({
+                            content: '❌ اكتب اسم الأمر أو الاختصار.',
+                            ephemeral: true
+                        });
+                    }
+
+                    const isSlash = slashCommands.some(c => c.name === key);
+
+                    const isShortcut = settings.shortcuts.some(
+                        s => normalizeText(s.name) === key
+                    );
+
+                    if (!isSlash && !isShortcut) {
+                        const shortcutsList = settings.shortcuts.length
+                            ? `**الاختصارات:** ${settings.shortcuts.map(s => s.name).join(', ')}`
+                            : '**الاختصارات:** لا توجد';
+
+                        return interaction.reply({
+                            content:
+                                `❌ ما لقيت أمر أو اختصار بالاسم \`${raw}\`.\n\n` +
+                                `**الأوامر:** ${slashCommands.map(c => c.name).join(', ')}\n` +
+                                shortcutsList,
+                            ephemeral: true
+                        });
+                    }
+
+                    settings.commandPermissions.set(key, role.id);
+                    settings.markModified('commandPermissions');
+                    await settings.save();
+
+                    const label = isShortcut
+                        ? `الاختصار **${raw}**`
+                        : `الأمر **${raw}**`;
+
+                    return interaction.reply(
+                        `✅ تم تحديد رتبة **${role.name}** لاستخدام ${label}.\n` +
+                        `من الآن استخدامه يتطلب ${role}.`
+                    );
+                }
+
+                if (sub === 'remove') {
+
+                    const raw = interaction.options.getString('command');
+                    const key = normalizeText(raw);
+
+                    if (!key) {
+                        return interaction.reply({
+                            content: '❌ اكتب اسم الأمر أو الاختصار.',
+                            ephemeral: true
+                        });
+                    }
+
+                    if (settings.commandPermissions.has(key)) {
+
+                        settings.commandPermissions.delete(key);
+                        settings.markModified('commandPermissions');
+                        await settings.save();
+
+                        return interaction.reply(
+                            `✅ تمت إزالة الرتبة المخصصة عن **${raw}**.\n` +
+                            `يرجع يستخدم الرتبة الافتراضية **${STAFF_ROLE_NAME}**.`
+                        );
+                    }
+
+                    return interaction.reply({
+                        content:
+                            `❌ ما فيه رتبة مخصصة لـ **${raw}**.\n` +
+                            'استخدم `/permission list` لعرض الرتب المخصصة الحالية.',
+                        ephemeral: true
+                    });
+                }
+
+                if (sub === 'list') {
+
+                    const entries = [...(settings.commandPermissions || new Map()).entries()];
+
+                    if (!entries.length) {
+
+                        return interaction.reply({
+                            content:
+                                `ℹ️ ما فيه رتب مخصصة حالياً.\n` +
+                                `كل الأوامر والاختصارات تستخدم رتبة **${STAFF_ROLE_NAME}**.`,
+                            ephemeral: true
+                        });
+                    }
+
+                    const lines = entries.map(([key, roleId]) => {
+
+                        const role = interaction.guild.roles.cache.get(roleId);
+
+                        const isShortcut = settings.shortcuts.some(
+                            s => normalizeText(s.name) === key
+                        );
+
+                        return `**${isShortcut ? '⚡ اختصار' : '🔹 أمر'}** \`${key}\` → ` +
+                            (role ? role.toString() : '❌ رتبة محذوفة/غير موجودة');
+                    }).join('\n');
+
+                    return interaction.reply({
+                        embeds: [
+                            new EmbedBuilder()
+                                .setTitle('🎛️ الرتب المسموحة للأوامر والاختصارات')
+                                .setColor(0x5865F2)
+                                .setDescription(lines)
+                                .setFooter({
+                                    text:
+                                        `الأوامر بدون رتبة مخصصة تستخدم ${STAFF_ROLE_NAME}`
+                                })
+                        ],
+                        ephemeral: true
+                    });
+                }
+            }
 
 
             // ==========================================
@@ -3535,6 +3811,14 @@ client.on('interactionCreate', async interaction => {
 
                 // REMOVE
                 if (action === 'remove') {
+
+                    // تنظيف الرتبة المخصصة لهذا الاختصار
+                    const removedKey = normalizeText(shortcut.name);
+
+                    if (settings.commandPermissions.has(removedKey)) {
+                        settings.commandPermissions.delete(removedKey);
+                        settings.markModified('commandPermissions');
+                    }
 
                     settings.shortcuts.splice(index, 1);
 
@@ -5198,7 +5482,8 @@ client.on('messageCreate', async message => {
                     .slice(
                         usedShortcut.shortcut.name.length
                     )
-                    .trim()
+                    .trim(),
+                usedShortcut.shortcut
             );
 
             return;
@@ -5332,17 +5617,36 @@ client.on('messageCreate', async message => {
 async function executeShortcut(
     message,
     command,
-    rawArgs
+    rawArgs,
+    shortcut
 ) {
 
-    // عرض التحذيرات مفتوح للجميع، بقية الأوامر تتطلب رتبة
-    if (
-        command !== 'warnings' &&
-        !memberHasStaffRole(message.member, message.guild)
-    ) {
-        return message.reply(
-            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** (فوق رتبة البوت) لاستخدام الاختصارات.`
-        );
+    // فحص الصلاحية: رتبة مخصصة للاختصار إن وُجدت، وإلا الرتبة الافتراضية
+    const perm = await shortcutPermission(
+        message.member,
+        message.guild,
+        shortcut,
+        command
+    );
+
+    if (!perm.ok) {
+        if (perm.roleMissing) {
+            return message.reply(
+                `❌ الرتبة المخصصة لاختصار **${shortcut?.name || ''}** غير موجودة في السيرفر.`
+            );
+        }
+
+        if (perm.role) {
+            return message.reply(
+                `❌ تحتاج رتبة **${perm.role.name}** لاستخدام هذا الاختصار.`
+            );
+        }
+
+        if (command !== 'warnings') {
+            return message.reply(
+                `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** (فوق رتبة البوت) لاستخدام الاختصارات.`
+            );
+        }
     }
 
 
@@ -5674,11 +5978,11 @@ async function executeShortcut(
 
         const target = mention || message.member;
 
-        // عرض تحذيرات شخص آخر يتطلب رتبة الصلاحيات
+        // عرض تحذيرات شخص آخر يتطلب نفس صلاحية الاختصار
         if (
             mention &&
             mention.id !== message.author.id &&
-            !memberHasStaffRole(message.member, message.guild)
+            !perm.ok
         ) {
             return message.reply(
                 '❌ تحتاج رتبة **' + STAFF_ROLE_NAME +
