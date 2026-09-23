@@ -154,13 +154,26 @@ async function requireAdmin(interaction) {
     return (await requireStaffPermission(interaction)) === true;
 }
 
+// أوامر الإعدادات والحماية: تتطلب أن تكون الرتبة **فوق** رتبة البوت
+const CONFIG_COMMANDS = [
+    'permission', 'protect', 'welcome', 'logs', 'setlog',
+    'level-settings', 'autorole', 'autoresponse', 'shortcut', 'embed'
+];
+
+function isConfigCommand(commandKey) {
+    return CONFIG_COMMANDS.includes(normalizeText(commandKey));
+}
+
 // فحص صلاحية استخدام أمر/اختصار:
-// لو فيه رتبة مخصصة للأمر = تشترطها، وإلا تشترط الرتبة الافتراضية (ستريتر فوق البوت)
+// لو فيه رتبة مخصصة للأمر = تشترطها، وإلا تشترط الرتبة الافتراضية.
+// أوامر الإعدادات والحماية فقط: تتطلب أن تكون الرتبة فوق رتبة البوت.
 async function requireCommandPermission(interaction, commandKey) {
     if (isOwner(interaction.user.id)) return true;
 
     const member = interaction.member;
     const guild = interaction.guild;
+    const key = normalizeText(commandKey);
+    const config = isConfigCommand(key);
 
     const replyContent = async content => {
         const options = { content, ephemeral: true };
@@ -178,28 +191,54 @@ async function requireCommandPermission(interaction, commandKey) {
 
     try {
         settings = await getSettings(guild.id);
-        roleId = settings?.commandPermissions?.get(normalizeText(commandKey)) || null;
+        roleId = settings?.commandPermissions?.get(key) || null;
     } catch {}
 
-    if (roleId) {
-        const role = guild.roles.cache.get(roleId);
+    let requiredRole = null;
 
-        if (!role) {
+    if (roleId) {
+        requiredRole = guild.roles.cache.get(roleId);
+
+        if (!requiredRole) {
             return replyContent(
                 `❌ الرتبة المخصصة لـ **${commandKey}** غير موجودة في السيرفر.\n` +
                 'حدد رتبة جديدة من أمر `/permission`.'
             );
         }
+    } else {
+        requiredRole = getStaffRole(guild);
 
-        if (member.roles.cache.has(role.id)) return true;
+        if (!requiredRole) {
+            return replyContent(
+                config
+                    ? `❌ ما فيه رتبة **${STAFF_ROLE_NAME}** في السيرفر.\n` +
+                      `أنشئها واجعلها **فوق** رتبة البوت حتى تشتغل أوامر الإعدادات والحماية.`
+                    : `❌ ما فيه رتبة **${STAFF_ROLE_NAME}** في السيرفر لتشغيل الأوامر.`
+            );
+        }
+    }
 
+    if (!member.roles.cache.has(requiredRole.id)) {
         return replyContent(
-            `❌ تحتاج رتبة **${role.name}** لاستخدام هذا الأمر.`
+            config
+                ? `❌ تحتاج رتبة **${requiredRole.name}** (فوق رتبة البوت) لاستخدام هذا الأمر.`
+                : `❌ تحتاج رتبة **${requiredRole.name}** لاستخدام هذا الأمر.`
         );
     }
 
-    // الوضع الافتراضي: رتبة الصلاحيات (فوق رتبة البوت)
-    return requireStaffPermission(interaction);
+    // أوامر الإعدادات والحماية فقط: الرتبة لازم تكون فوق رتبة البوت
+    if (config) {
+        const botHighest = guild?.members?.me?.roles?.highest;
+
+        if (botHighest && requiredRole.position <= botHighest.position) {
+            return replyContent(
+                `❌ رتبة **${requiredRole.name}** لازم تكون **فوق** رتبة البوت لأوامر الإعدادات والحماية.\n` +
+                `من إعدادات السيرفر: Roles = ارفع رتبة **${requiredRole.name}** فوق رتبة البوت ثم أعد المحاولة.`
+            );
+        }
+    }
+
+    return true;
 }
 
 // فحص صلاحية استخدام اختصار من رسالة عادية
@@ -2025,16 +2064,16 @@ client.once('ready', async () => {
 
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // مسح الأوامر المحلية القديمة من كل السيرفرات حتى لا تتكرر الأوامر
+    // تسجيل الأوامر في كل سيرفر مباشرة: تظهر فوراً بدون انتظار تأخير الأوامر العامة
     for (const guild of client.guilds.cache.values()) {
-        await guild.commands.set([]).catch(() => {});
+        await guild.commands.set(slashCommands).catch(() => {});
     }
 
     console.log(
-        '🧹 Cleared old per-guild (local) slash commands'
+        `⚡ Slash commands registered in ${client.guilds.cache.size} servers (instant)`
     );
 
-    // تسجيل عام يظهر في كل السيرفرات
+    // تسجيل عام كاحتياط لأي سيرفر جديد أو نشره لاحقاً
     await registerGlobalCommands();
 
     try {
@@ -2087,7 +2126,8 @@ client.once('ready', async () => {
     }
 
     console.log(
-        '🔐 جميع Slash Commands تتطلب رتبة ' + STAFF_ROLE_NAME + ' (فوق رتبة البوت)'
+        '🔐 أوامر التنفيذ تتطلب رتبة ' + STAFF_ROLE_NAME +
+        ' | أوامر الإعدادات والحماية تتطلب ' + STAFF_ROLE_NAME + ' فوق رتبة البوت'
     );
 });
 
@@ -2133,7 +2173,7 @@ client.on('interactionCreate', async interaction => {
                 // عرض تحذيرات شخص آخر يتطلب رتبة الصلاحيات
                 if (!own) {
                     const staffOK =
-                        await requireStaffPermission(interaction);
+                        await requireCommandPermission(interaction, 'warnings');
                     if (staffOK !== true) return staffOK;
                 }
 
@@ -5647,7 +5687,7 @@ async function executeShortcut(
 
         if (command !== 'warnings') {
             return message.reply(
-                `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** (فوق رتبة البوت) لاستخدام الاختصارات.`
+                `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام الاختصارات.`
             );
         }
     }
