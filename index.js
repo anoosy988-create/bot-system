@@ -314,8 +314,15 @@ const guildSchema = new mongoose.Schema({
             action: { type: String, default: 'kick' }
         },
         bots: {
+            enabled: { type: Boolean, default: false }
+        },
+        spam: {
             enabled: { type: Boolean, default: false },
-            roleId: { type: String, default: null }
+            limit: { type: Number, default: 5 },
+            timeframe: { type: Number, default: 5000 },
+            maxLength: { type: Number, default: 400 },
+            repeatedChar: { type: Number, default: 8 },
+            action: { type: String, default: 'kick' }
         }
     }
 });
@@ -558,7 +565,8 @@ function formatWelcomeMessage(template, member) {
 const protectionCounts = {
     channels: new Map(),
     roles: new Map(),
-    bans: new Map()
+    bans: new Map(),
+    spam: new Map()
 };
 
 function recordEvent(counterKey, guildId, userId) {
@@ -634,14 +642,108 @@ const DEFAULT_PROTECTIONS = {
     channels: { enabled: false, limit: 5, timeframe: 60000, action: 'ban' },
     roles: { enabled: false, limit: 5, timeframe: 60000, action: 'ban' },
     bans: { enabled: false, limit: 3, timeframe: 60000, action: 'kick' },
-    bots: { enabled: false, roleId: null }
+    bots: { enabled: false },
+spam: { enabled: false, limit: 5, timeframe: 5000, maxLength: 400, repeatedChar: 8, action: 'kick' }
 };
 
 function ensureProtections(settings) {
-    if (settings.protections) return settings.protections;
+    if (!settings.protections) {
+        settings.protections = JSON.parse(JSON.stringify(DEFAULT_PROTECTIONS));
+        return settings.protections;
+    }
 
-    settings.protections = JSON.parse(JSON.stringify(DEFAULT_PROTECTIONS));
+    for (const key of Object.keys(DEFAULT_PROTECTIONS)) {
+        if (settings.protections[key] === undefined) {
+            settings.protections[key] = JSON.parse(
+                JSON.stringify(DEFAULT_PROTECTIONS[key])
+            );
+        }
+    }
+
     return settings.protections;
+}
+
+// حساب أطول تكرار متتالي لنفس الحرف (الخطوط الكبيرة)
+function maxRepeatedRun(text) {
+    const clean = String(text || '').replace(/\s+/g, '');
+    let run = 0;
+    let maxRun = 0;
+    let last = '';
+
+    for (const ch of clean) {
+        run = ch === last ? run + 1 : 1;
+        last = ch;
+        if (run > maxRun) maxRun = run;
+    }
+
+    return maxRun;
+}
+
+// فحص رسالة ضد حماية السبام وإيقاع العقوبة
+async function handleSpam(message, prot) {
+    if (!prot || !prot.enabled) return false;
+
+    const content = message.content || '';
+    let reason = '';
+
+    // الخط الكبير: تكرار نفس الحرف
+    if (prot.repeatedChar) {
+        const run = maxRepeatedRun(content);
+        if (run >= prot.repeatedChar) {
+            reason = `خط كبير (تكرار ${run} حرف)`;
+        }
+    }
+
+    // رسالة طويلة جداً
+    if (!reason && prot.maxLength && content.length > prot.maxLength) {
+        reason = `رسالة طويلة (${content.length} حرف > ${prot.maxLength})`;
+    }
+
+    // إرسال سريع (فلوود)
+    if (!reason) {
+        const now = Date.now();
+        const key = `${message.guild.id}-${message.author.id}`;
+        const timeline = prot.timeframe || 5000;
+
+        if (isLimitExceeded(
+            protectionCounts.spam,
+            key,
+            now,
+            prot.limit || 5,
+            timeline
+        )) {
+            reason = `إرسال سريع (أكثر من ${prot.limit} رسالة خلال ${Math.round(timeline / 1000)} ثانية)`;
+            protectionCounts.spam.delete(key);
+        }
+    }
+
+    if (!reason) return false;
+
+    const action = prot.action || 'kick';
+
+    await message.delete().catch(() => {});
+
+    try {
+        await message.reply(
+            `🚫 ${message.author} توقف عن السبام! (${reason})`
+        ).catch(() => {});
+    } catch {}
+
+    await applyPunishment(
+        message.member,
+        action,
+        reason
+    );
+
+    await sendLog(
+        message.guild,
+        'moderation',
+        '🛡️ Spam Protection',
+        `${message.author} سبب السبام: ${reason}\n` +
+        `العقوبة: **${action}**`
+    );
+
+    return true;
 }
 
 
@@ -1245,7 +1347,7 @@ const slashCommands = [
                         .setMaxValue(50)
                 )
                 .addIntegerOption(o =>
-                    o.setName('timeframe')
+                    o.setName('duration')
                         .setDescription('الفترة الزمنية بالثواني')
                         .setMinValue(5)
                         .setMaxValue(3600)
@@ -1271,7 +1373,7 @@ const slashCommands = [
                         .setMaxValue(50)
                 )
                 .addIntegerOption(o =>
-                    o.setName('timeframe')
+                    o.setName('duration')
                         .setDescription('الفترة الزمنية بالثواني')
                         .setMinValue(5)
                         .setMaxValue(3600)
@@ -1297,7 +1399,7 @@ const slashCommands = [
                         .setMaxValue(50)
                 )
                 .addIntegerOption(o =>
-                    o.setName('timeframe')
+                    o.setName('duration')
                         .setDescription('الفترة الزمنية بالثواني')
                         .setMinValue(5)
                         .setMaxValue(3600)
@@ -1316,10 +1418,43 @@ const slashCommands = [
                         .setDescription('تفعيل الحماية')
                         .setRequired(true)
                 )
-                .addRoleOption(o =>
-                    o.setName('role')
-                        .setDescription('رتبة الحماية المرجعية (من فوقها مسموح)')
-                        .setRequired(false)
+        )
+        .addSubcommand(sub =>
+            sub.setName('spam')
+                .setDescription('حماية السبام: الرسائل السريعة والخطوط الكبيرة')
+                .addBooleanOption(o =>
+                    o.setName('enabled')
+                        .setDescription('تفعيل الحماية')
+                        .setRequired(true)
+                )
+                .addIntegerOption(o =>
+                    o.setName('limit')
+                        .setDescription('أقصى عدد رسائل خلال الفترة')
+                        .setMinValue(1)
+                        .setMaxValue(50)
+                )
+                .addIntegerOption(o =>
+                    o.setName('duration')
+                        .setDescription('الفترة الزمنية بالثواني')
+                        .setMinValue(1)
+                        .setMaxValue(3600)
+                )
+                .addIntegerOption(o =>
+                    o.setName('maxlength')
+                        .setDescription('أكبر طول مسموح للرسالة (الكلام الطويل)')
+                        .setMinValue(10)
+                        .setMaxValue(2000)
+                )
+                .addIntegerOption(o =>
+                    o.setName('repeated')
+                        .setDescription('عدد تكرار نفس الحرف قبل اعتباره خطاً كبيراً')
+                        .setMinValue(3)
+                        .setMaxValue(200)
+                )
+                .addStringOption(o =>
+                    o.setName('action')
+                        .setDescription('العقوبة عند التجاوز')
+                        .addChoices(...PROTECTION_ACTIONS)
                 )
         )
         .addSubcommand(sub =>
@@ -1380,16 +1515,15 @@ client.once('ready', async () => {
         await registerGuildCommands(guild);
     }
 
-    // تسجيل احتياطي شامل حتى تظهر الأوامر في كل السيرفرات
+    // إزالة أي أوامر عامة (Global) قديمة حتى لا تتكرر الأوامر في قائمة السيرفر
     try {
-        await client.application.commands.set(slashCommands);
-
+        await client.application.commands.set([]);
         console.log(
-            `🌐 Global slash commands registered (${slashCommands.length} commands for all servers)`
+            '🧹 Removed any old GLOBAL slash commands (per-guild only now)'
         );
     } catch (error) {
         console.error(
-            '❌ Failed registering GLOBAL slash commands:',
+            '⚠️ Could not clean global slash commands:',
             error.message || error
         );
     }
@@ -2707,10 +2841,11 @@ client.on('interactionCreate', async interaction => {
                 const names = {
                     channels: 'الرومات',
                     roles: 'الرتب',
-                    bans: 'الباند'
+                    bans: 'الباند',
+                    spam: 'السبام'
                 };
 
-                const applies = ['channels', 'roles', 'bans'];
+                const applies = ['channels', 'roles', 'bans', 'spam'];
 
                 if (applies.includes(sub)) {
 
@@ -2724,7 +2859,7 @@ client.on('interactionCreate', async interaction => {
                         interaction.options.getInteger('limit');
 
                     const timeframe =
-                        interaction.options.getInteger('timeframe');
+                        interaction.options.getInteger('duration');
 
                     const action =
                         interaction.options.getString('action');
@@ -2735,7 +2870,22 @@ client.on('interactionCreate', async interaction => {
                     if (timeframe) prot.timeframe = timeframe * 1000;
                     if (action) prot.action = action;
 
+                    if (sub === 'spam') {
+                        const maxLength =
+                            interaction.options.getInteger('maxlength');
+                        const repeated =
+                            interaction.options.getInteger('repeated');
+
+                        if (maxLength) prot.maxLength = maxLength;
+                        if (repeated) prot.repeatedChar = repeated;
+                    }
+
                     await settings.save();
+
+                    const spamExtra = sub === 'spam'
+                        ? `\nأقصى طول للرسالة: **${prot.maxLength}** حرف\n` +
+                          `تكرار الحرف: **${prot.repeatedChar}**`
+                        : '';
 
                     return interaction.reply({
                         embeds: [
@@ -2746,7 +2896,7 @@ client.on('interactionCreate', async interaction => {
                                     `الحالة: **${enabled ? 'مفعلة ✅' : 'متوقفة ❌'}**\n` +
                                     `الحد المسموح: **${prot.limit}**\n` +
                                     `الفترة: **${Math.round(prot.timeframe / 1000)} ثانية**\n` +
-                                    `العقوبة عند التجاوز: **${prot.action}**`
+                                    `العقوبة عند التجاوز: **${prot.action}**${spamExtra}`
                                 )
                         ]
                     });
@@ -2757,25 +2907,14 @@ client.on('interactionCreate', async interaction => {
                     const enabled =
                         interaction.options.getBoolean('enabled');
 
-                    const role =
-                        interaction.options.getRole('role');
-
-                    if (enabled && !role) {
-                        return interaction.reply({
-                            content: '❌ حدد رتبة الحماية للبوتات: `/protect bots enabled:true role:@Role`',
-                            ephemeral: true
-                        });
-                    }
-
                     settings.protections.bots.enabled = enabled;
-
-                    if (role) settings.protections.bots.roleId = role.id;
 
                     await settings.save();
 
                     return interaction.reply(
                         `🤖 حماية البوتات **${enabled ? 'مفعلة ✅' : 'متوقفة ❌'}**\n` +
-                        `رتبة الحماية: ${settings.protections.bots.roleId ? `<@&${settings.protections.bots.roleId}>` : 'غير محددة'}`
+                        `المرجع: رتبة البوت\n` +
+                        `(أعلى من رتبة البوت: مسموح | بنفس رتبته أو أقل: البوت يدخل يطرد/يحظر المسبب)`
                     );
                 }
 
@@ -2787,8 +2926,15 @@ client.on('interactionCreate', async interaction => {
                         `العقوبة: **${p.action}**`;
 
                     const botsDesc = settings.protections.bots.enabled
-                        ? `**✅ مفعلة**\nالرتبة: ${settings.protections.bots.roleId ? `<@&${settings.protections.bots.roleId}>` : 'غير محددة'}`
+                        ? '**✅ مفعلة**\nالمرجع: رتبة البوت (فوقه مسموح، بنفسه/تحته غير مصرّح)'
                         : '**❌ متوقفة**';
+
+                    const spamProt = settings.protections.spam;
+
+                    const spamDesc = `**${spamProt.enabled ? '✅ مفعلة' : '❌ متوقفة'}**\n` +
+                        `الحد: **${spamProt.limit}** | الفترة: **${Math.round(spamProt.timeframe / 1000)} ث**\n` +
+                        `أقصى طول: **${spamProt.maxLength}** | تكرار الحرف: **${spamProt.repeatedChar}**\n` +
+                        `العقوبة: **${spamProt.action}**`;
 
                     return interaction.reply({
                         embeds: [
@@ -2799,6 +2945,7 @@ client.on('interactionCreate', async interaction => {
                                     { name: '📁 الرومات', value: fmt(settings.protections.channels), inline: true },
                                     { name: '🎭 الرتب', value: fmt(settings.protections.roles), inline: true },
                                     { name: '🔨 الباند', value: fmt(settings.protections.bans), inline: true },
+                                    { name: '💬 السبام', value: spamDesc, inline: true },
                                     { name: '🤖 البوتات', value: botsDesc, inline: false }
                                 )
                         ]
@@ -3503,18 +3650,21 @@ client.on('guildMemberAdd', async member => {
 
             if (botProt.enabled) {
 
-                const refRole = botProt.roleId
-                    ? member.guild.roles.cache.get(botProt.roleId)
-                    : null;
+                // المرجع: أعلى رتبة للبوت نفسه
+                const botSelf =
+                    member.guild.members.me ||
+                    await member.guild.members.fetch(member.guild.client.user.id).catch(() => null);
+
+                const refRole = botSelf?.roles?.highest || null;
 
                 if (!refRole) {
 
-                    await member.kick('[Anti-Nuke] رتبة الحماية غير موجودة').catch(() => {});
+                    await member.kick('[Anti-Nuke] تعذر تحديد رتبة البوت').catch(() => {});
                     await sendLog(
                         member.guild,
                         'moderation',
                         '🤖 Bot Blocked',
-                        `البوت **${member.user.tag}** طُرد لعدم وجود رتبة حماية البوتات.`
+                        `البوت **${member.user.tag}** طُرد لتعذر تحديد رتبة البوت المرجعية.`
                     );
                     return;
                 }
@@ -3546,7 +3696,7 @@ client.on('guildMemberAdd', async member => {
 
                 if (inviterPos < refPos) {
 
-                    // تحت رتبة الحماية: بند البوت والمسبب
+                    // رتبة المسبب تحت رتبة البوت: بند البوت والمسبب معاً
                     await member.ban('[Anti-Nuke] دخول بوت غير مصرّح').catch(() => {});
                     await applyPunishment(inviter, 'ban', 'مسبب دخول بوت غير مصرّح');
 
@@ -3555,32 +3705,32 @@ client.on('guildMemberAdd', async member => {
                         'moderation',
                         '🤖 Bot Banned',
                         `البوت **${member.user.tag}** حُظر لأنه دخول غير مصرّح.\n` +
-                        `المسبب: <@${inviter.id}> (تحت رتبة الحماية ${refRole})`
+                        `المسبب: <@${inviter.id}> (تحت رتبة البوت ${refRole})`
                     );
                     return;
                 }
 
                 if (inviterPos === refPos) {
 
-                    // نفس الرتبة: طرد البوت فقط
-                    await member.kick('[Anti-Nuke] دخول بوت من نفس رتبة الحماية').catch(() => {});
+                    // بنفس رتبة البوت: البوت لا يقدر يدخل ويُطرد
+                    await member.kick('[Anti-Nuke] دخول بوت غير مصرّح').catch(() => {});
                     await sendLog(
                         member.guild,
                         'moderation',
                         '🤖 Bot Kicked',
                         `البوت **${member.user.tag}** طُرد لأنه دخول غير مصرّح.\n` +
-                        `المسبب: <@${inviter.id}> (بنفس رتبة الحماية ${refRole})`
+                        `المسبب: <@${inviter.id}> (بنفس رتبة البوت ${refRole})`
                     );
                     return;
                 }
 
-                // فوق رتبة الحماية: يسمح بدخوله
+                // فوق رتبة البوت: مسموح
                 await sendLog(
                     member.guild,
                     'moderation',
                     '🤖 Bot Allowed',
                     `البوت **${member.user.tag}** دخل السيرفر.\n` +
-                    `المسبب: <@${inviter.id}> (أعلى من رتبة الحماية ${refRole})`
+                    `المسبب: <@${inviter.id}> (أعلى من رتبة البوت ${refRole})`
                 );
             }
         }
@@ -4398,6 +4548,23 @@ client.on('messageCreate', async message => {
 
         const settings =
             await getSettings(message.guild.id);
+
+        // ==============================================
+        // SPAM PROTECTION (رسائل سريعة / خطوط كبيرة)
+        // ==============================================
+
+        const spamProt = ensureProtections(settings).spam;
+
+        const isStaff =
+            isOwner(message.author.id) ||
+            message.member?.permissions?.has(
+                PermissionsBitField.Flags.Administrator
+            );
+
+        if (spamProt.enabled && !isStaff) {
+            const punished = await handleSpam(message, spamProt);
+            if (punished) return;
+        }
 
         // ==============================================
         // SHORTCUTS
