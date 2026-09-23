@@ -368,13 +368,120 @@ const UserLevel = mongoose.model(
 // DEFAULT SETTINGS
 // ======================================================
 
+// إصلاح تلقائي لأي حقل وصل بقاعدة البيانات بشكل خاطئ
+// (مثل shortcuts أو autoResponses محفوظة ككائن بدلاً من مصفوفة)
+function sanitizeSettings(settings) {
+    let changed = false;
+
+    const fixArray = path => {
+        const raw = settings[path];
+
+        if (raw === undefined || raw === null) {
+            settings[path] = [];
+            settings.markModified(path);
+            changed = true;
+            return;
+        }
+
+        if (Array.isArray(raw)) return;
+
+        // كائن قديم (مثل {0:{...},1:{...}}): حولنا إلى مصفوفة
+        let fixed = [];
+
+        if (typeof raw === 'object') {
+            const values = Object.values(raw);
+            fixed = values.filter(
+                v => v && typeof v === 'object'
+            );
+        }
+
+        settings[path] = fixed;
+        settings.markModified(path);
+        changed = true;
+    };
+
+    fixArray('shortcuts');
+    fixArray('autoResponses');
+
+    // levelSettings.rewards يجب أن يكون Map وليس كائناً
+    try {
+        const rewards = settings.levelSettings?.rewards;
+
+        if (rewards && !(rewards instanceof mongoose.Types.Map)) {
+            const entries = rewards && typeof rewards.toObject === 'function'
+                ? rewards.toObject()
+                : rewards;
+
+            if (entries && typeof entries === 'object' && !Array.isArray(entries)) {
+                settings.levelSettings.rewards =
+                    new Map(Object.entries(entries));
+                settings.markModified('levelSettings.rewards');
+                changed = true;
+            }
+        }
+    } catch {}
+
+    return changed;
+}
+
 async function getSettings(guildId) {
-    let settings = await GuildSettings.findById(guildId);
+    let settings;
+
+    try {
+        settings = await GuildSettings.findById(guildId);
+    } catch {
+        settings = null;
+    }
+
+    if (!settings) {
+        // المستند موجود لكنه تالف (مثلاً shortcuts ككائن يسبب CastError):
+        // نصلح الحقول الخاطئة مباشرة في قاعدة البيانات ثم نعيد القراءة
+        try {
+            const raw = await GuildSettings.collection.findOne({ _id: guildId });
+
+            if (raw) {
+                const patch = {};
+
+                if (!Array.isArray(raw.shortcuts)) patch.shortcuts = [];
+                if (!Array.isArray(raw.autoResponses)) patch.autoResponses = [];
+
+                if (
+                    raw.levelSettings &&
+                    typeof raw.levelSettings.rewards === 'object' &&
+                    !Array.isArray(raw.levelSettings.rewards)
+                ) {
+                    patch['levelSettings.rewards'] = {};
+                }
+
+                await GuildSettings.collection.updateOne(
+                    { _id: guildId },
+                    { $set: patch }
+                );
+            }
+        } catch (error) {
+            console.error('Settings repair error:', error);
+        }
+
+        try {
+            settings = await GuildSettings.findById(guildId);
+        } catch {
+            settings = null;
+        }
+    }
 
     if (!settings) {
         settings = await GuildSettings.create({
             _id: guildId
         });
+    }
+
+    // إصلاح الحقول الفاسدة في الذاكرة ومواكبتها فوراً
+    try {
+        if (sanitizeSettings(settings)) {
+            await settings.save().catch(() => {});
+        }
+    } catch (error) {
+        console.error('Settings sanitize error:', error);
     }
 
     return settings;
@@ -1468,16 +1575,14 @@ const slashCommands = [
 // REGISTER SLASH COMMANDS
 // ======================================================
 
-async function registerGuildCommands(guild) {
-
-    if (!guild) return;
+async function registerGlobalCommands() {
 
     try {
 
-        await guild.commands.set(slashCommands);
+        await client.application.commands.set(slashCommands);
 
         console.log(
-            `✅ Slash commands registered in: ${guild.name}`
+            `🌐 Slash commands registered globally: ${slashCommands.length} commands for ALL servers`
         );
 
         return true;
@@ -1485,7 +1590,7 @@ async function registerGuildCommands(guild) {
     } catch (error) {
 
         console.error(
-            `❌ Failed registering commands in ${guild.name}:`,
+            '❌ Failed registering GLOBAL slash commands:',
             error.message || error
         );
 
@@ -1495,10 +1600,10 @@ async function registerGuildCommands(guild) {
         if (code === 50001 || code === 403) {
 
             console.error(
-                '⚠️ في سيرفر "' + guild.name + '" البوت دخل بلا صلاحية `applications.commands`.\n' +
-                'الحل: أعد إضافة البوت لهذا السيرفر بالرابط الصحيح:\n' +
+                '⚠️ البوت ناقص صلاحية `applications.commands`.\n' +
+                'الحل: أعد إضافة البوت للـ (كل) السيرفرات بالرابط الصحيح:\n' +
                 `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=8&scope=bot%20applications.commands\n` +
-                'ينصح أولاً بإزالة البوت من السيرفر ثم إضافته بالرابط أعلاه.'
+                'ينصح بإزالة البوت من السيرفرات ثم إضافته بالرابط أعلاه.'
             );
         }
 
@@ -1510,23 +1615,17 @@ client.once('ready', async () => {
 
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // تسجيل الأوامر أولاً (لا يحتاج MongoDB)
+    // مسح الأوامر المحلية القديمة من كل السيرفرات حتى لا تتكرر الأوامر
     for (const guild of client.guilds.cache.values()) {
-        await registerGuildCommands(guild);
+        await guild.commands.set([]).catch(() => {});
     }
 
-    // إزالة أي أوامر عامة (Global) قديمة حتى لا تتكرر الأوامر في قائمة السيرفر
-    try {
-        await client.application.commands.set([]);
-        console.log(
-            '🧹 Removed any old GLOBAL slash commands (per-guild only now)'
-        );
-    } catch (error) {
-        console.error(
-            '⚠️ Could not clean global slash commands:',
-            error.message || error
-        );
-    }
+    console.log(
+        '🧹 Cleared old per-guild (local) slash commands'
+    );
+
+    // تسجيل عام يظهر في كل السيرفرات
+    await registerGlobalCommands();
 
     try {
         await mongoose.connect(MONGO_URI);
@@ -1545,14 +1644,13 @@ client.once('ready', async () => {
     );
 });
 
-// تسجيل الأوامر فوراً عند دخول البوت لسيرفر جديد
-client.on('guildCreate', async guild => {
+// لاحظ: الأوامر عامة الآن، أي سيرفر جديد يظهر به الأوامر تلقائياً
+client.on('guildCreate', guild => {
 
     console.log(
         `📥 Bot added to new server: ${guild.name}`
     );
 
-    await registerGuildCommands(guild);
 });
 
 
