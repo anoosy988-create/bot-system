@@ -2008,6 +2008,15 @@ const slashCommands = [
             sub.setName('list')
                 .setDescription('عرض الرتب المخصصة للأوامر والاختصارات')
         ),
+
+    new SlashCommandBuilder()
+        .setName('ai')
+        .setDescription('اسأل الذكاء الاصطناعي (لصاحب البوت فقط)')
+        .addStringOption(o =>
+            o.setName('message')
+                .setDescription('سؤالك أو رسالتك للذكاء الاصطناعي')
+                .setRequired(true)
+        ),
 ].map(command => command.toJSON());
 
 
@@ -2140,6 +2149,64 @@ client.on('guildCreate', async guild => {
 
 
 // ======================================================
+// AI (الذكاء الاصطناعي عبر OpenAI)
+// ======================================================
+
+const AI_MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
+
+async function askAI(prompt) {
+    const apiKey = process.env.OPENAI_API_KEY;
+
+    if (!apiKey) {
+        throw new Error('NO_API_KEY');
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 45000);
+
+    try {
+        const res = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+            },
+            body: JSON.stringify({
+                model: AI_MODEL,
+                messages: [
+                    {
+                        role: 'system',
+                        content:
+                            'أنت مساعد ذكي خبير في جميع المجالات. أجب باللغة العربية ' +
+                            'بشكل واضح ومفيد ومختصر، وإذا طُلب منك شيء بالكود فأعطه مثلاً عملي.'
+                    },
+                    {
+                        role: 'user',
+                        content: String(prompt || '').slice(0, 3000)
+                    }
+                ],
+                max_tokens: 1500
+            }),
+            signal: controller.signal
+        });
+
+        clearTimeout(timer);
+
+        if (!res.ok) {
+            throw new Error(`OPENAI_HTTP_${res.status}`);
+        }
+
+        const data = await res.json();
+        const content = data?.choices?.[0]?.message?.content?.trim();
+
+        return content || '❌ ما رجعت أي إجابة من الذكاء الاصطناعي.';
+    } catch (error) {
+        clearTimeout(timer);
+        throw error;
+    }
+}
+
+// ======================================================
 // INTERACTION HANDLER
 // ======================================================
 
@@ -2154,6 +2221,59 @@ client.on('interactionCreate', async interaction => {
         if (interaction.isChatInputCommand()) {
 
             const command = interaction.commandName;
+
+
+            // ==========================================
+            // AI (الذكاء الاصطناعي) - مخصص لصاحب البوت فقط
+            // ==========================================
+
+            if (command === 'ai') {
+
+                if (!isOwner(interaction.user.id)) {
+                    return interaction.reply({
+                        content: '❌ هذا الأمر مخصص لصاحب البوت فقط.',
+                        ephemeral: true
+                    });
+                }
+
+                const prompt = interaction.options.getString('message');
+
+                await interaction.deferReply();
+
+                try {
+                    const answer = await askAI(prompt);
+
+                    // ديسكورد يسمح برسالة 2000 حرف للتذييلات embed و 4096 للنص
+                    const sliced =
+                        answer.length > 3900
+                            ? answer.slice(0, 3900) + '…'
+                            : answer;
+
+                    return interaction.editReply(sliced);
+                } catch (error) {
+                    let msg =
+                        '❌ صار خطأ بالتواصل مع الذكاء الاصطناعي، حاول مرة ثانية.';
+
+                    if (error.message === 'NO_API_KEY') {
+                        msg =
+                            '❌ ما فيه مفتاح OpenAI مضبوط.\n' +
+                            'أضف `OPENAI_API_KEY` في إعدادات البيئة بالاستضافة ثم أعد التشغيل.';
+                    } else if (error.message === 'OPENAI_HTTP_401') {
+                        msg = '❌ مفتاح OpenAI غير صحيح (401). تأكد من المفتاح.';
+                    } else if (error.message === 'OPENAI_HTTP_429') {
+                        msg =
+                            '❌ رصيد OpenAI خلص أو فيه ضغط عالي (429). حاول لاحقًا.';
+                    } else if (error.message === 'OPENAI_HTTP_402') {
+                        msg =
+                            '❌ حساب OpenAI مطلوب منه دفع (402). أضف رصيد.';
+                    } else if (error.name === 'AbortError') {
+                        msg =
+                            '❌ استغرقت الإجابة وقت طويل (أكثر من 45 ثانية) وألغينا الطلب.';
+                    }
+
+                    return interaction.editReply(msg);
+                }
+            }
 
 
             // ==========================================
