@@ -340,6 +340,12 @@ const guildSchema = new mongoose.Schema({
             type: String,
             default: null
         }
+    },
+
+    // عدّاد رقم التحذير لكل سيرفر (يبدأ من 1 ولا يتكرر أبداً)
+    warnCounter: {
+        type: Number,
+        default: 0
     }
 });
 
@@ -627,18 +633,27 @@ function recordEvent(counterKey, guildId, userId) {
     return key;
 }
 
-async function getAuditExecutor(guild, type, targetId = null) {
-    try {
-        const audit = await guild.fetchAuditLogs({ type, limit: 1 });
-        const entry = audit.entries.first();
+async function getAuditExecutor(guild, type, targetId = null, retries = 0) {
+    let attempt = 0;
 
-        if (!entry) return null;
-        if (Date.now() - entry.createdTimestamp > 15000) return null;
-        if (targetId && entry.targetId !== targetId) return null;
+    while (true) {
+        try {
+            const audit = await guild.fetchAuditLogs({ type, limit: 1 });
+            const entry = audit.entries.first();
 
-        return entry.executor?.id || null;
-    } catch {
-        return null;
+            if (
+                entry &&
+                Date.now() - entry.createdTimestamp <= 15000 &&
+                (!targetId || entry.targetId === targetId)
+            ) {
+                return entry.executor?.id || null;
+            }
+        } catch {}
+
+        if (attempt >= retries) return null;
+
+        attempt++;
+        await new Promise(r => setTimeout(r, 250));
     }
 }
 
@@ -4254,66 +4269,62 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 client.on('roleCreate', async role => {
 
-    const executor = await executorMention(
-        role.guild,
-        AuditLogEvent.RoleCreate,
-        role.id
-    );
-
-    await sendLog(
-        role.guild,
-        'role',
-        '🎭 Role Created',
-        `تم إنشاء الرتبة ${role}.\n` +
-        `المسبب: ${executor}`
-    );
-
-    // حماية الرتب
     try {
 
-        const settings = await getSettings(role.guild.id);
+        // جلب الإعدادات والمسبب بالتوازي (بدل انتظار السجل أولاً)
+        const [settings, executorId] = await Promise.all([
+            getSettings(role.guild.id),
+            getAuditExecutor(
+                role.guild,
+                AuditLogEvent.RoleCreate,
+                role.id,
+                3
+            )
+        ]);
+
+        // السجل يرسل بالخلفية ولا يحجب الحماية
+        sendLog(
+            role.guild,
+            'role',
+            '🎭 Role Created',
+            `تم إنشاء الرتبة ${role}.\n` +
+            `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
+        );
+
+        // حماية الرتب
         ensureProtections(settings);
         const prot = settings.protections.roles;
 
-        if (prot.enabled) {
+        if (prot.enabled && executorId) {
 
-            const executorId = await getAuditExecutor(
-                role.guild,
-                AuditLogEvent.RoleCreate,
-                role.id
-            );
+            const now = Date.now();
+            const key = `${role.guild.id}-${executorId}`;
 
-            if (executorId) {
+            if (isLimitExceeded(
+                protectionCounts.roles,
+                key,
+                now,
+                prot.limit,
+                prot.timeframe
+            )) {
 
-                const now = Date.now();
-                const key = `${role.guild.id}-${executorId}`;
+                const member = await getMember(role.guild, executorId);
 
-                if (isLimitExceeded(
-                    protectionCounts.roles,
-                    key,
-                    now,
-                    prot.limit,
-                    prot.timeframe
-                )) {
+                await applyPunishment(
+                    member,
+                    prot.action,
+                    `تجاوز حد إنشاء الرتب (${prot.limit})`
+                );
 
-                    const member = await getMember(role.guild, executorId);
+                await role.delete('[Anti-Nuke] تجاوز حد إنشاء الرتب').catch(() => {});
 
-                    await applyPunishment(
-                        member,
-                        prot.action,
-                        `تجاوز حد إنشاء الرتب (${prot.limit})`
-                    );
-
-                    await role.delete('[Anti-Nuke] تجاوز حد إنشاء الرتب').catch(() => {});
-
-                    await sendLog(
-                        role.guild,
-                        'moderation',
-                        '🛡️ Role Protection',
-                        `<@${executorId}> تجاوز حد إنشاء الرتب (**${prot.limit}**).\n` +
-                        `طبقت العقوبة: **${prot.action}**`
-                    );
-                }
+                sendLog(
+                    role.guild,
+                    'moderation',
+                    '🛡️ Role Protection',
+                    `<@${executorId}> تجاوز حد إنشاء الرتب (**${prot.limit}**).\n` +
+                    `طبقت العقوبة: **${prot.action}**`
+                );
             }
         }
     } catch (error) {
@@ -4386,64 +4397,64 @@ client.on('channelCreate', async channel => {
 
     if (!channel.guild) return;
 
-    const executor = await executorMention(
-        channel.guild,
-        AuditLogEvent.ChannelCreate,
-        channel.id
-    );
-
-    await sendLog(
-        channel.guild,
-        'channel',
-        '📁 Channel Created',
-        `تم إنشاء ${channel}.\n` +
-        `المسبب: ${executor}`
-    );
-
-    // حماية الرومات
     try {
 
-        const settings = await getSettings(channel.guild.id);
+        // جلب الإعدادات والمسبب بالتوازي (بدل انتظار السجل أولاً)
+        const [settings, executorId] = await Promise.all([
+            getSettings(channel.guild.id),
+            getAuditExecutor(
+                channel.guild,
+                AuditLogEvent.ChannelCreate,
+                channel.id,
+                3
+            )
+        ]);
+
+        // السجل يرسل بالخلفية ولا يحجب الحماية
+        sendLog(
+            channel.guild,
+            'channel',
+            '📁 Channel Created',
+            `تم إنشاء ${channel}.\n` +
+            `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
+        );
+
+        // حماية الرومات
         ensureProtections(settings);
         const prot = settings.protections.channels;
 
-        if (prot.enabled && channel.guild) {
+        if (prot.enabled && executorId) {
 
-            const executorId = await getAuditExecutor(
-                channel.guild,
-                AuditLogEvent.ChannelCreate,
-                channel.id
-            );
+            const now = Date.now();
+            const key = `${channel.guild.id}-${executorId}`;
 
-            if (executorId) {
+            if (isLimitExceeded(
+                protectionCounts.channels,
+                key,
+                now,
+                prot.limit,
+                prot.timeframe
+            )) {
 
-                const now = Date.now();
-                const key = `${channel.guild.id}-${executorId}`;
+                const member = await getMember(channel.guild, executorId);
 
-                if (isLimitExceeded(
-                    protectionCounts.channels,
-                    key,
-                    now,
-                    prot.limit,
-                    prot.timeframe
-                )) {
+                await applyPunishment(
+                    member,
+                    prot.action,
+                    `تجاوز حد إنشاء الرومات (${prot.limit})`
+                );
 
-                    const member = await getMember(channel.guild, executorId);
+                await channel.delete(
+                    '[Anti-Nuke] تجاوز حد إنشاء الرومات'
+                ).catch(() => {});
 
-                    await applyPunishment(
-                        member,
-                        prot.action,
-                        `تجاوز حد إنشاء الرومات (${prot.limit})`
-                    );
-
-                    await sendLog(
-                        channel.guild,
-                        'moderation',
-                        '🛡️ Channel Protection',
-                        `<@${executorId}> تجاوز حد إنشاء الرومات (**${prot.limit}**).\n` +
-                        `طبقت العقوبة: **${prot.action}**`
-                    );
-                }
+                sendLog(
+                    channel.guild,
+                    'moderation',
+                    '🛡️ Channel Protection',
+                    `<@${executorId}> تجاوز حد إنشاء الرومات (**${prot.limit}**).\n` +
+                    `طبقت العقوبة: **${prot.action}**`
+                );
             }
         }
     } catch (error) {
@@ -4582,64 +4593,70 @@ client.on(
 
 client.on('guildBanAdd', async ban => {
 
-    const executor = await executorMention(
-        ban.guild,
-        AuditLogEvent.MemberBanAdd,
-        ban.user?.id
-    );
-
-    await sendLog(
-        ban.guild,
-        'moderation',
-        '🔨 Member Banned',
-        `العضو **${ban.user?.tag || 'غير معروف'}** حُظر.\n` +
-        `السبب: ${ban.reason || 'بدون سبب'}\n` +
-        `المسبب: ${executor}`
-    );
-
     try {
 
-        const settings = await getSettings(ban.guild.id);
+        // جلب الإعدادات والمسبب بالتوازي (بدل انتظار السجل أولاً)
+        const [settings, executorId] = await Promise.all([
+            getSettings(ban.guild.id),
+            getAuditExecutor(
+                ban.guild,
+                AuditLogEvent.MemberBanAdd,
+                ban.user?.id,
+                3
+            )
+        ]);
+
+        // السجل يرسل بالخلفية ولا يحجب الحماية
+        sendLog(
+            ban.guild,
+            'moderation',
+            '🔨 Member Banned',
+            `العضو **${ban.user?.tag || 'غير معروف'}** حُظر.\n` +
+            `السبب: ${ban.reason || 'بدون سبب'}\n` +
+            `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
+        );
+
         ensureProtections(settings);
         const prot = settings.protections.bans;
 
-        if (prot.enabled) {
+        if (prot.enabled && executorId) {
 
-            const executorId = await getAuditExecutor(
-                ban.guild,
-                AuditLogEvent.MemberBanAdd,
-                ban.user?.id
-            );
+            const now = Date.now();
+            const key = `${ban.guild.id}-${executorId}`;
 
-            if (executorId) {
+            if (isLimitExceeded(
+                protectionCounts.bans,
+                key,
+                now,
+                prot.limit,
+                prot.timeframe
+            )) {
 
-                const now = Date.now();
-                const key = `${ban.guild.id}-${executorId}`;
+                const member = await getMember(ban.guild, executorId);
 
-                if (isLimitExceeded(
-                    protectionCounts.bans,
-                    key,
-                    now,
-                    prot.limit,
-                    prot.timeframe
+                await applyPunishment(
+                    member,
+                    prot.action,
+                    `تجاوز حد الباند (${prot.limit})`
+                );
+
+                // إلغاء الحظر الذي تم قبل العقوبة مباشرة
+                if (ban.guild.members.me?.permissions.has(
+                    'BanMembers'
                 )) {
-
-                    const member = await getMember(ban.guild, executorId);
-
-                    await applyPunishment(
-                        member,
-                        prot.action,
-                        `تجاوز حد الباند (${prot.limit})`
-                    );
-
-                    await sendLog(
-                        ban.guild,
-                        'moderation',
-                        '🛡️ Ban Protection',
-                        `<@${executorId}> تجاوز حد عمليات الحظر (**${prot.limit}**).\n` +
-                        `طبقت العقوبة: **${prot.action}**`
-                    );
+                    await ban.guild.members.unban(
+                        ban.user?.id,
+                        '[Anti-Nuke] تجاوز حد عمليات الحظر'
+                    ).catch(() => {});
                 }
+
+                sendLog(
+                    ban.guild,
+                    'moderation',
+                    '🛡️ Ban Protection',
+                    `<@${executorId}> تجاوز حد عمليات الحظر (**${prot.limit}**).\n` +
+                    `طبقت العقوبة: **${prot.action}**`
+                );
             }
         }
     } catch (error) {
