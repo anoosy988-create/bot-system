@@ -358,9 +358,9 @@ async function getSettings(guildId) {
 // ======================================================
 
 const AI_PROVIDERS = {
-    groq: {
-        model: 'llama-3.3-70b-versatile',
-        url: 'llama-3.1-70b-versatile',
+groq: {
+        model: 'llama-3.1-70b-versatile',
+        url: 'https://api.groq.com/openai/v1/chat/completions', // الرابط الصحيح هنا
         env: 'GROQ_API_KEY'
     },
     openai: {
