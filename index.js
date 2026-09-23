@@ -855,6 +855,57 @@ const slashCommands = [
         ),
 
     new SlashCommandBuilder()
+        .setName('embed')
+        .setDescription('إنشاء وإرسال إيمبد مخصص')
+        .setDefaultMemberPermissions(ADMIN)
+        .addStringOption(o =>
+            o.setName('title')
+                .setDescription('عنوان الإيمبد')
+                .setRequired(false)
+        )
+        .addStringOption(o =>
+            o.setName('description')
+                .setDescription('نص الإيمبد (مطلوب)')
+                .setRequired(true)
+        )
+        .addStringOption(o =>
+            o.setName('color')
+                .setDescription('اللون بصيغة Hex مثل #5865F2')
+                .setRequired(false)
+        )
+        .addStringOption(o =>
+            o.setName('footer')
+                .setDescription('النص السفلي للإيمبد')
+                .setRequired(false)
+        )
+        .addStringOption(o =>
+            o.setName('image')
+                .setDescription('رابط صورة كبيرة للإيمبد')
+                .setRequired(false)
+        )
+        .addStringOption(o =>
+            o.setName('thumbnail')
+                .setDescription('رابط صورة مصغرة للإيمبد')
+                .setRequired(false)
+        )
+        .addStringOption(o =>
+            o.setName('url')
+                .setDescription('رابط يفتح عند النقر على العنوان')
+                .setRequired(false)
+        )
+        .addChannelOption(o =>
+            o.setName('channel')
+                .setDescription('الروم الذي سيظهر فيه الإيمبد (الافتراضي: الروم الحالي)')
+                .addChannelTypes(ChannelType.GuildText)
+                .setRequired(false)
+        )
+        .addBooleanOption(o =>
+            o.setName('visible')
+                .setDescription('إظهار الإيمبد للجميع (الافتراضي: خاص لك فقط)')
+                .setRequired(false)
+        ),
+
+    new SlashCommandBuilder()
         .setName('autoresponse')
         .setDescription('إدارة الردود التلقائية')
         .setDefaultMemberPermissions(ADMIN)
@@ -2225,6 +2276,103 @@ client.on('interactionCreate', async interaction => {
                     });
 
                 }
+            }
+
+
+            // ==========================================
+            // EMBED
+            // ==========================================
+
+            if (command === 'embed') {
+
+                const channel =
+                    interaction.options.getChannel('channel') ||
+                    interaction.channel;
+
+                const visible =
+                    interaction.options.getBoolean('visible') || false;
+
+                const title =
+                    interaction.options.getString('title');
+
+                const description =
+                    interaction.options.getString('description');
+
+                const color =
+                    interaction.options.getString('color');
+
+                const footer =
+                    interaction.options.getString('footer');
+
+                const image =
+                    interaction.options.getString('image');
+
+                const thumbnail =
+                    interaction.options.getString('thumbnail');
+
+                const url =
+                    interaction.options.getString('url');
+
+                if (!channel || !channel.isTextBased()) {
+                    return interaction.reply({
+                        content: '❌ الروم غير صالح أو غير نصي.',
+                        ephemeral: true
+                    });
+                }
+
+                if (!description ||
+                    description.length > 4096 ||
+                    (title && title.length > 256)) {
+                    return interaction.reply({
+                        content: '❌ النص فارغ أو طويل جداً (الوصف 4096 حرفاً والعنوان 256 حرفاً).',
+                        ephemeral: true
+                    });
+                }
+
+                const embed = new EmbedBuilder()
+                    .setDescription(description);
+
+                if (title) embed.setTitle(title);
+                if (url) embed.setURL(url);
+                if (footer) embed.setFooter({ text: footer });
+
+                if (image) embed.setImage(image);
+                if (thumbnail) embed.setThumbnail(thumbnail);
+
+                if (color) {
+                    const hex = String(color).replace('#', '').trim();
+                    const parsed = parseInt(hex, 16);
+                    embed.setColor(!isNaN(parsed) && hex.length > 0 && hex.length <= 6
+                        ? parsed
+                        : 0x5865F2);
+                }
+
+                try {
+
+                    await channel.send({ embeds: [embed] });
+
+                } catch (error) {
+
+                    console.error('Embed send error:', error);
+
+                    return interaction.reply({
+                        content: `❌ تعذر إرسال الإيمبد: ${error.message}`,
+                        ephemeral: true
+                    });
+                }
+
+                await sendLog(
+                    interaction.guild,
+                    'moderation',
+                    '📝 Embed Sent',
+                    `${interaction.user} أرسل إيمبد في ${channel}.\n` +
+                    `العنوان: **${title || 'بدون عنوان'}**`
+                );
+
+                return interaction.reply({
+                    content: `✅ تم إرسال الإيمبد في ${channel}.`,
+                    ephemeral: !visible
+                });
             }
         }
 
