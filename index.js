@@ -2011,23 +2011,66 @@ const slashCommands = [
 ].map(command => command.toJSON());
 
 
+// ======================================================
+// FORCE COMMAND SYNC (فرض تسجيل موحد بدون تكرار)
+// ======================================================
+// 1) حذف كل الأوامر العامة نهائياً.
+// 2) إعادة تسجيل قائمة واحدة موحّدة في كل سيرفر (استبدال كامل =
+//    أي نسخ قديمة أو مكررة تُحذف تلقائياً، ويبقى أمر واحد فقط).
+// 3) تعاد دورياً لضمان عدم رجوع أي تكرار.
+
+async function forceSyncCommands() {
+
+    try {
+        await client.application.commands.set([]);
+        console.log('🧹 Cleared global slash commands');
+    } catch {}
+
+    let ok = 0;
+    let fail = 0;
+
+    for (const guild of client.guilds.cache.values()) {
+        let done = false;
+
+        for (let attempt = 1; attempt <= 3 && !done; attempt++) {
+            try {
+                await guild.commands.set(slashCommands);
+                done = true;
+                ok++;
+            } catch (error) {
+                if (attempt === 3) {
+                    fail++;
+                    console.error(
+                        `❌ Failed syncing commands in ${guild.name}:`,
+                        error.message || error
+                    );
+                } else {
+                    await new Promise(
+                        resolve => setTimeout(resolve, 1500 * attempt)
+                    );
+                }
+            }
+        }
+    }
+
+    console.log(
+        `✅ Force sync: commands set once in ${ok} servers` +
+        (fail ? ` (${fail} failed)` : '')
+    );
+
+    return ok;
+}
+
+
 client.once('ready', async () => {
 
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // إزالة الأوامر العامة القديمة نهائياً حتى لا تتكرر مع الأوامر المحلية
-    await client.application.commands.set([]).catch(() => {});
+    // فرض التسجيل الموحد أول شيء (يمسح العام ويسجل لكل سيرفر مجموعة واحدة)
+    await forceSyncCommands();
 
-    console.log('🧹 Cleared global slash commands');
-
-    // تسجيل الأوامر في كل سيرفر مباشرة (مرة وحدة لكل سيرفر = بدون تكرار، وتظهر فوراً)
-    for (const guild of client.guilds.cache.values()) {
-        await guild.commands.set(slashCommands).catch(() => {});
-    }
-
-    console.log(
-        `⚡ Slash commands registered in ${client.guilds.cache.size} servers (instant)`
-    );
+    // مزامنة دورية كل 10 دقائق: تضمن اختفاء أي تكرار حتى لو صار
+    setInterval(forceSyncCommands, 10 * 60 * 1000).unref();
 
     try {
         await mongoose.connect(MONGO_URI);
@@ -2084,15 +2127,14 @@ client.once('ready', async () => {
     );
 });
 
-// الأوامر تُسجَّل محلياً لكل سيرفر مباشرة عند التشغيل،
-// وأي سيرفر جديد ينضم نسجّل له الأوامر هنا حتى تظهر فوراً
+// أي سيرفر جديد ينضم: فرض تسجيل موحد له فوراً
 client.on('guildCreate', async guild => {
 
     console.log(
         `📥 Bot added to new server: ${guild.name}`
     );
 
-    await guild.commands.set(slashCommands).catch(() => {});
+    await forceSyncCommands();
 
 });
 
