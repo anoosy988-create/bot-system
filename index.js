@@ -3890,7 +3890,10 @@ client.on('interactionCreate', async interaction => {
                                             ['role-remove', '🎭 role-remove'],
                                             ['purge', '🗑️ purge'],
                                             ['lock', '🔒 lock'],
-                                            ['unlock', '🔓 unlock']
+                                            ['unlock', '🔓 unlock'],
+                                            ['warn', '⚠️ warn'],
+                                            ['unwarn', '⚠️ unwarn'],
+                                            ['warnings', '📋 warnings']
                                         ].map(([value, label]) => ({
                                             label,
                                             value
