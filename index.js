@@ -9,7 +9,8 @@ const {
     ModalBuilder,
     TextInputBuilder,
     TextInputStyle,
-    ChannelType
+    ChannelType,
+    AuditLogEvent
 } = require('discord.js');
 
 const mongoose = require('mongoose');
@@ -113,6 +114,26 @@ function safeChannelName(channel) {
     return channel?.name ? `#${channel.name}` : 'غير معروف';
 }
 
+function extractVanityCode(text) {
+
+    const match =
+        String(text || '').match(
+            /(?:discord\.gg\/|discord\.com\/invite\/|discordapp\.com\/invite\/)([a-zA-Z0-9-]+)/i
+        );
+
+    if (match) return match[1].toLowerCase();
+
+    // لو كتب الكود لحاله مثل: d4r
+    const clean =
+        String(text || '').trim().toLowerCase();
+
+    if (/^[a-z0-9][a-z0-9-]*$/.test(clean)) {
+        return clean;
+    }
+
+    return null;
+}
+
 async function sendLog(guild, type, title, description, color = 0x5865F2) {
     try {
         const settings = await GuildSettings.findById(guild.id);
@@ -199,6 +220,23 @@ const guildSchema = new mongoose.Schema({
         },
 
         message: {
+            type: String,
+            default: null
+        },
+
+        protection: {
+            type: String,
+            default: null
+        }
+    },
+
+    protection: {
+        enabled: {
+            type: Boolean,
+            default: false
+        },
+
+        vanityCode: {
             type: String,
             default: null
         }
@@ -599,6 +637,27 @@ const slashCommands = [
                 .setDescription('الروم المراد فتحه')
                 .addChannelTypes(ChannelType.GuildText)
                 .setRequired(false)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('protection')
+        .setDescription('حماية اختصار السيرفر (الفانيتي)')
+        .setDefaultMemberPermissions(ADMIN)
+        .addSubcommand(sub =>
+            sub
+                .setName('on')
+                .setDescription('تفعيل حماية الاختصار')
+                .addStringOption(o =>
+                    o
+                        .setName('link')
+                        .setDescription('رابط سيرفرك أو الاختصار مثل d4r')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(sub =>
+            sub
+                .setName('off')
+                .setDescription('إيقاف حماية الاختصار')
         ),
 
     new SlashCommandBuilder()
@@ -1345,6 +1404,60 @@ client.on('interactionCreate', async interaction => {
 
 
             // ==========================================
+            // PROTECTION - حماية اختصار السيرفر
+            // ==========================================
+
+            if (command === 'protection') {
+
+                const sub =
+                    interaction.options.getSubcommand();
+
+                const settings =
+                    await getSettings(interaction.guild.id);
+
+                if (sub === 'on') {
+
+                    const link =
+                        interaction.options.getString('link');
+
+                    const code =
+                        extractVanityCode(link);
+
+                    if (!code) {
+                        return interaction.reply({
+                            content:
+                                '❌ اكتب رابط صحيح أو الاختصار نفسه. مثال: `https://discord.gg/d4r` أو `d4r`',
+                            ephemeral: true
+                        });
+                    }
+
+                    settings.protection.enabled = true;
+                    settings.protection.vanityCode = code;
+
+                    await settings.save();
+
+                    return interaction.reply({
+                        content:
+                            `🛡️ تم تفعيل حماية الاختصار \`discord.gg/${code}\`\n` +
+                            `أي شخص يغيّره (وأنا فوق رتبته) راح ينحظر مباشرة.`
+                    });
+                }
+
+                if (sub === 'off') {
+
+                    settings.protection.enabled = false;
+                    settings.protection.vanityCode = null;
+
+                    await settings.save();
+
+                    return interaction.reply(
+                        '❌ تم إيقاف حماية الاختصار.'
+                    );
+                }
+            }
+
+
+            // ==========================================
             // WELCOME
             // ==========================================
 
@@ -1672,6 +1785,13 @@ client.on('interactionCreate', async interaction => {
                                         emoji: '💬',
                                         description:
                                             'سجلات الرسائل'
+                                    },
+                                    {
+                                        label: 'Protection Logs',
+                                        value: 'protection',
+                                        emoji: '🚨',
+                                        description:
+                                            'سجلات حماية اختصار السيرفر'
                                     }
                                 ])
                         );
@@ -2289,6 +2409,187 @@ client.on('interactionCreate', async interaction => {
             }).catch(() => {});
 
         }
+    }
+});
+
+
+// ======================================================
+// VANITY PROTECTION - حماية اختصار السيرفر
+// ======================================================
+
+client.on('guildUpdate', async (oldGuild, newGuild) => {
+
+    try {
+
+        // ما تغيّر الاختصار؟ لا شي
+        if (
+            oldGuild.vanityURLCode ===
+            newGuild.vanityURLCode
+        ) return;
+
+        const settings =
+            await getSettings(newGuild.id);
+
+        if (
+            !settings.protection?.enabled ||
+            !settings.protection?.vanityCode
+        ) return;
+
+        const protectedCode =
+            settings.protection.vanityCode;
+
+        // هل الاختصار المحمي هو اللي انغيّر؟
+        if (
+            oldGuild.vanityURLCode !==
+            protectedCode
+        ) return;
+
+        const newCode =
+            newGuild.vanityURLCode || 'انشال';
+
+
+        // منو اللي غيّره؟ من سجل التدقيق
+        const audit =
+            await newGuild.fetchAuditLogs({
+                type: AuditLogEvent.GuildUpdate,
+                limit: 5
+            }).catch(() => null);
+
+        const entry =
+            audit?.entries.find(e =>
+                e.changes.some(c =>
+                    c.key === 'vanity_url_code' ||
+                    c.key === 'vanity_url'
+                )
+            );
+
+        const executor =
+            entry?.executor;
+
+        if (!executor) return;
+        if (executor.id === OWNER_ID) return;
+        if (executor.id === client.user.id) return;
+
+
+        // نجيب البوت والعضو ونتأكد من ترتيب الرتب
+        const botMember =
+            await newGuild.members.fetchMe();
+
+        const targetMember =
+            await newGuild.members.fetch(executor.id)
+                .catch(() => null);
+
+        if (!targetMember) return;
+
+        const botPosition =
+            botMember.roles.highest.position;
+
+        const targetPosition =
+            targetMember.roles.highest.position;
+
+        const botIsAbove =
+            botPosition > targetPosition;
+
+
+        let resultText = '';
+
+        if (!botIsAbove) {
+
+            resultText =
+                `ما قدرت أحظره ❌ لأن رتبته فوق رتبتي. ` +
+                `ارفع رتبة البوت فوقه عشان الحماية تشتغل.`;
+
+        } else {
+
+            // محاولة رجوع الاختصار زي ما كان
+            let restored = false;
+
+            try {
+
+                await client.rest.put(
+                    `/guilds/${newGuild.id}/vanity-url`,
+                    {
+                        body: {
+                            code: protectedCode
+                        }
+                    }
+                );
+
+                restored = true;
+
+            } catch {
+                restored = false;
+            }
+
+            // الباند
+            try {
+
+                await targetMember.ban({
+                    reason:
+                        `غيّر اختصار السيرفر المحمي - ${protectedCode}`
+                });
+
+                resultText =
+                    `انحظر اللي غيّره ✅` +
+                    (
+                        restored
+                            ? ` ورجع الاختصار \`${protectedCode}\` زي ما كان.`
+                            : ` لكن ما قدرت أرجع الاختصار، رجّعه بنفسك.`
+                    );
+
+            } catch (err) {
+
+                resultText =
+                    `ما قدرت أحظره ❌ (السبب: ${err.message})` +
+                    (
+                        restored
+                            ? ` بس الاختصار رجع زي ما كان ✅`
+                            : ``
+                    );
+
+            }
+        }
+
+
+        // لوق الحماية - بأسلوب بشري
+        await sendLog(
+            newGuild,
+            'protection',
+            '🚨 اختصار السيرفر انغيّر!',
+            `👤 اللي غيّره: ${targetMember} (\`${executor.id}\`)\n` +
+            `🔗 الاختصار القديم: \`discord.gg/${protectedCode}\`\n` +
+            `🔗 صار الحين: \`${newCode}\`\n` +
+            `📊 النتيجة: ${resultText}`,
+            0xED4245
+        );
+
+
+        // رسالة للأونر
+        const owner =
+            await client.users.fetch(OWNER_ID)
+                .catch(() => null);
+
+        if (owner) {
+
+            owner.send({
+                content:
+                    `🚨 **فيه واحد غيّر اختصار سيرفرك!**\n\n` +
+                    `اللي غيّره: ${executor.tag}\n` +
+                    `السيرفر: ${newGuild.name}\n` +
+                    `الاختصار القديم: discord.gg/${protectedCode}\n` +
+                    `صار الحين: ${newCode}\n\n` +
+                    `${resultText}`
+            }).catch(() => {});
+
+        }
+
+    } catch (error) {
+
+        console.error(
+            'Protection error:',
+            error
+        );
+
     }
 });
 
