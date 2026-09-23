@@ -273,6 +273,27 @@ const guildSchema = new mongoose.Schema({
         default: 'You are a helpful assistant running inside a Discord server. Answer in the same language the user writes in. Be clear, friendly and concise.'
     },
 
+    // مزود وإعدادات منفصلة لكل روم (محادثة / أكواد)
+    aiChatProvider: {
+        type: String,
+        default: null
+    },
+
+    aiCodeProvider: {
+        type: String,
+        default: null
+    },
+
+    aiChatSystem: {
+        type: String,
+        default: null
+    },
+
+    aiCodeSystem: {
+        type: String,
+        default: null
+    },
+
     protections: {
         channels: {
             enabled: { type: Boolean, default: false },
@@ -1354,6 +1375,25 @@ client.once('ready', async () => {
 
     console.log(`✅ Logged in as ${client.user.tag}`);
 
+    // تسجيل الأوامر أولاً (لا يحتاج MongoDB)
+    for (const guild of client.guilds.cache.values()) {
+        await registerGuildCommands(guild);
+    }
+
+    // تسجيل احتياطي شامل حتى تظهر الأوامر في كل السيرفرات
+    try {
+        await client.application.commands.set(slashCommands);
+
+        console.log(
+            `🌐 Global slash commands registered (${slashCommands.length} commands for all servers)`
+        );
+    } catch (error) {
+        console.error(
+            '❌ Failed registering GLOBAL slash commands:',
+            error.message || error
+        );
+    }
+
     try {
         await mongoose.connect(MONGO_URI);
 
@@ -1361,11 +1401,9 @@ client.once('ready', async () => {
 
     } catch (error) {
         console.error('❌ MongoDB connection error:', error);
-        return;
-    }
-
-    for (const guild of client.guilds.cache.values()) {
-        await registerGuildCommands(guild);
+        console.error(
+            '⚠️ سيعمل البوت والأوامر لكن بدون حفظ بيانات دائمة حتى يتصل MongoDB.'
+        );
     }
 
     console.log(
@@ -2036,6 +2074,13 @@ client.on('interactionCreate', async interaction => {
                     const response =
                         interaction.options.getString('response');
 
+                    if (!normalizeText(trigger)) {
+                        return interaction.reply({
+                            content: '❌ الكلمة المطلوبة للرد التلقائي لا يمكن أن تكون فارغة.',
+                            ephemeral: true
+                        });
+                    }
+
                     const exists =
                         settings.autoResponses.some(
                             x =>
@@ -2146,6 +2191,13 @@ client.on('interactionCreate', async interaction => {
 
                     const cmd =
                         interaction.options.getString('command');
+
+                    if (!normalizeText(name)) {
+                        return interaction.reply({
+                            content: '❌ اسم الاختصار لا يمكن أن يكون فارغاً.',
+                            ephemeral: true
+                        });
+                    }
 
                     const exists =
                         settings.shortcuts.some(
@@ -2443,14 +2495,18 @@ client.on('interactionCreate', async interaction => {
 
                 settings.aiChatChannelId = channel.id;
 
-                if (provider) settings.aiProvider = provider;
-                if (system) settings.aiSystemPrompt = system;
+                if (provider) settings.aiChatProvider = provider;
+                if (system) settings.aiChatSystem = system;
 
                 await settings.save();
 
+                const effectiveProvider =
+                    provider || settings.aiChatProvider ||
+                    settings.aiProvider || 'groq';
+
                 return interaction.reply(
                     `🤖 تم تعيين ${channel} لروم الذكاء الاصطناعي.\n` +
-                    `🛰️ المزود: **${provider || settings.aiProvider}**`
+                    `🛰️ المزود: **${effectiveProvider}**`
                 );
             }
 
@@ -2475,14 +2531,18 @@ client.on('interactionCreate', async interaction => {
 
                 settings.aiCodeChannelId = channel.id;
 
-                if (provider) settings.aiProvider = provider;
-                if (system) settings.aiSystemPrompt = system;
+                if (provider) settings.aiCodeProvider = provider;
+                if (system) settings.aiCodeSystem = system;
 
                 await settings.save();
 
+                const effectiveProvider =
+                    provider || settings.aiCodeProvider ||
+                    settings.aiProvider || 'groq';
+
                 return interaction.reply(
                     `💻 تم تعيين ${channel} لروم الأكواد.\n` +
-                    `🛰️ المزود: **${provider || settings.aiProvider}**`
+                    `🛰️ المزود: **${effectiveProvider}**`
                 );
             }
 
@@ -2700,18 +2760,18 @@ client.on('interactionCreate', async interaction => {
                     const role =
                         interaction.options.getRole('role');
 
-                    settings.protections.bots.enabled = enabled;
-
-                    if (role) settings.protections.bots.roleId = role.id;
-
-                    await settings.save();
-
-                    if (enabled && !settings.protections.bots.roleId) {
+                    if (enabled && !role) {
                         return interaction.reply({
                             content: '❌ حدد رتبة الحماية للبوتات: `/protect bots enabled:true role:@Role`',
                             ephemeral: true
                         });
                     }
+
+                    settings.protections.bots.enabled = enabled;
+
+                    if (role) settings.protections.bots.roleId = role.id;
+
+                    await settings.save();
 
                     return interaction.reply(
                         `🤖 حماية البوتات **${enabled ? 'مفعلة ✅' : 'متوقفة ❌'}**\n` +
@@ -2775,8 +2835,11 @@ client.on('interactionCreate', async interaction => {
                     });
                 }
 
+                // في قائمة تعديل الأمر، فهرس الاختصار داخل الـ customId
                 const index =
-                    Number(interaction.values[0]);
+                    action === 'editcommand'
+                        ? Number(parts[parts.length - 1])
+                        : Number(interaction.values[0]);
 
                 const settings =
                     await getSettings(interaction.guild.id);
@@ -3190,7 +3253,8 @@ client.on('interactionCreate', async interaction => {
 
                 return sendAutoResponseList(
                     interaction,
-                    settings
+                    settings,
+                    true
                 );
             }
         }
@@ -4451,10 +4515,16 @@ client.on('messageCreate', async message => {
 
             await message.channel.sendTyping().catch(() => {});
 
-            const provider = settings.aiProvider || 'groq';
+            const provider = isAiCode
+                ? (settings.aiCodeProvider || settings.aiProvider || 'groq')
+                : (settings.aiChatProvider || settings.aiProvider || 'groq');
 
-            const baseSystem = settings.aiSystemPrompt ||
-                'You are a helpful assistant running inside a Discord server.';
+            const fallbackSystem =
+                'You are a helpful assistant running inside a Discord server. Answer in the same language the user writes in. Be clear, friendly and concise.';
+
+            const baseSystem = isAiCode
+                ? (settings.aiCodeSystem || settings.aiSystemPrompt || fallbackSystem)
+                : (settings.aiChatSystem || settings.aiSystemPrompt || fallbackSystem);
 
             const system = isAiCode
                 ? `${baseSystem}\nYou are a code assistant. Reply ONLY with code inside a single code block, with a very short Arabic explanation of what it does.`
