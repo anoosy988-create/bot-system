@@ -81,31 +81,77 @@ function isOwner(userId) {
     return userId === OWNER_ID;
 }
 
-function isAdmin(interaction) {
-    return (
-        isOwner(interaction.user.id) ||
-        interaction.member?.permissions?.has(
-            PermissionsBitField.Flags.Administrator
-        )
-    );
+// الرتبة المخوّلة لاستخدام الأوامر (يجب أن تكون فوق رتبة البوت)
+const STAFF_ROLE_NAME = process.env.STAFF_ROLE_NAME || 'ستريتر';
+
+// إرجاع رتبة الصلاحيات في سيرفر معين
+function getStaffRole(guild) {
+    return guild?.roles?.cache?.find(
+        role => role.name === STAFF_ROLE_NAME
+    ) || null;
 }
 
-async function requireAdmin(interaction) {
-    if (!isAdmin(interaction)) {
+// هل العضو يملك رتبة الصلاحيات؟
+function memberHasStaffRole(member, guild) {
+    if (!member || !guild) return false;
+    if (member.id === OWNER_ID) return true;
+
+    const staffRole = getStaffRole(guild);
+    if (!staffRole) return false;
+
+    return member.roles.cache.has(staffRole.id);
+}
+
+function isAdmin(interaction) {
+    return memberHasStaffRole(interaction.member, interaction.guild);
+}
+
+// فحص كامل لاستخدام الأوامر مع رسائل توضيحية
+async function requireStaffPermission(interaction) {
+    if (isOwner(interaction.user.id)) return true;
+
+    const member = interaction.member;
+    const guild = interaction.guild;
+
+    const replyContent = async content => {
+        const options = { content, ephemeral: true };
+
         if (interaction.replied || interaction.deferred) {
-            return interaction.followUp({
-                content: '❌ تحتاج صلاحية **Administrator** لاستخدام هذا الأمر.',
-                ephemeral: true
-            });
+            return interaction.followUp(options);
         }
 
-        return interaction.reply({
-            content: '❌ تحتاج صلاحية **Administrator** لاستخدام هذا الأمر.',
-            ephemeral: true
-        });
+        return interaction.reply(options);
+    };
+
+    const staffRole = getStaffRole(guild);
+
+    if (!staffRole) {
+        return replyContent(
+            `❌ ما فيه رتبة **${STAFF_ROLE_NAME}** في السيرفر.\n` +
+            `أنشئها واجعلها **فوق** رتبة البوت حتى تشتغل الأوامر.`
+        );
+    }
+
+    if (!memberHasStaffRole(member, guild)) {
+        return replyContent(
+            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`
+        );
+    }
+
+    const botHighest = guild?.members?.me?.roles?.highest;
+
+    if (botHighest && staffRole.position <= botHighest.position) {
+        return replyContent(
+            `❌ رتبة **${STAFF_ROLE_NAME}** لازم تكون **فوق** رتبة البوت.\n` +
+            `من إعدادات السيرفر: Roles = ارفع رتبة **${STAFF_ROLE_NAME}** فوق رتبة البوت ثم أعد المحاولة.`
+        );
     }
 
     return true;
+}
+
+async function requireAdmin(interaction) {
+    return (await requireStaffPermission(interaction)) === true;
 }
 
 function normalizeText(text) {
@@ -424,6 +470,9 @@ function sanitizeSettings(settings) {
     return changed;
 }
 
+// سيرفرات تم إصلاح حقولها في القاعدة (حتى لا يتكرر الإصلاح مع كل رسالة)
+const repairedSettingGuilds = new Set();
+
 async function getSettings(guildId) {
     let settings;
 
@@ -433,35 +482,46 @@ async function getSettings(guildId) {
         settings = null;
     }
 
-    if (!settings) {
-        // المستند موجود لكنه تالف (مثلاً shortcuts ككائن يسبب CastError):
-        // نصلح الحقول الخاطئة مباشرة في قاعدة البيانات ثم نعيد القراءة
-        try {
-            const raw = await GuildSettings.collection.findOne({ _id: guildId });
+    // إصلاح قسري مباشرة في القاعدة: إجبار الحقول الفاسدة على مصفوفات نظيفة
+    // (مرة واحدة لكل سيرفر) لضمان عدم وجود كائن مكان مصفوفة إطلاقاً
+    if (!repairedSettingGuilds.has(guildId)) {
+        let repairOk = true;
 
-            if (raw) {
+        try {
+            const current = await GuildSettings.collection.findOne({ _id: guildId });
+
+            if (current) {
                 const patch = {};
 
-                if (!Array.isArray(raw.shortcuts)) patch.shortcuts = [];
-                if (!Array.isArray(raw.autoResponses)) patch.autoResponses = [];
+                if (!Array.isArray(current.shortcuts)) patch.shortcuts = [];
+                if (!Array.isArray(current.autoResponses)) patch.autoResponses = [];
 
                 if (
-                    raw.levelSettings &&
-                    typeof raw.levelSettings.rewards === 'object' &&
-                    !Array.isArray(raw.levelSettings.rewards)
+                    current.levelSettings &&
+                    typeof current.levelSettings.rewards === 'object' &&
+                    !Array.isArray(current.levelSettings.rewards)
                 ) {
                     patch['levelSettings.rewards'] = {};
                 }
 
-                await GuildSettings.collection.updateOne(
-                    { _id: guildId },
-                    { $set: patch }
-                );
+                if (Object.keys(patch).length) {
+                    await GuildSettings.collection.updateOne(
+                        { _id: guildId },
+                        { $set: patch }
+                    );
+                    console.log(
+                        `🔧 Repaired corrupted settings for server ${guildId}`
+                    );
+                }
             }
         } catch (error) {
-            console.error('Settings repair error:', error);
+            repairOk = false;
+            console.error('Settings force repair error:', error);
         }
 
+        if (repairOk) repairedSettingGuilds.add(guildId);
+
+        // إعادة تحميل النسخة النظيفة بعد الإصلاح
         try {
             settings = await GuildSettings.findById(guildId);
         } catch {
@@ -995,14 +1055,12 @@ async function unjailMember(member) {
 // EVERY COMMAND = ADMINISTRATOR
 // ======================================================
 
-const ADMIN = PermissionsBitField.Flags.Administrator;
-
 const slashCommands = [
 
     new SlashCommandBuilder()
         .setName('jail')
         .setDescription('سجن عضو')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو المراد سجنه')
@@ -1012,7 +1070,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('unjail')
         .setDescription('فك سجن عضو')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو المراد فك سجنه')
@@ -1022,7 +1080,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('ban')
         .setDescription('حظر عضو من السيرفر')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو المراد حظره')
@@ -1037,7 +1095,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('unban')
         .setDescription('فك حظر عضو')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addStringOption(o =>
             o.setName('user_id')
                 .setDescription('آيدي العضو')
@@ -1047,7 +1105,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('kick')
         .setDescription('طرد عضو')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو المراد طرده')
@@ -1062,7 +1120,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('timeout')
         .setDescription('إعطاء تايم أوت لعضو')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو')
@@ -1077,7 +1135,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('untimeout')
         .setDescription('إزالة التايم أوت')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو')
@@ -1087,7 +1145,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('role-add')
         .setDescription('إعطاء رتبة لعضو')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو')
@@ -1102,7 +1160,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('role-remove')
         .setDescription('إزالة رتبة من عضو')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو')
@@ -1117,7 +1175,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('purge')
         .setDescription('حذف عدد من الرسائل')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addIntegerOption(o =>
             o.setName('amount')
                 .setDescription('عدد الرسائل من 1 إلى 100')
@@ -1129,7 +1187,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('lock')
         .setDescription('قفل الروم')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addChannelOption(o =>
             o.setName('channel')
                 .setDescription('الروم المراد قفله')
@@ -1140,7 +1198,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('unlock')
         .setDescription('فتح الروم')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addChannelOption(o =>
             o.setName('channel')
                 .setDescription('الروم المراد فتحه')
@@ -1151,7 +1209,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('welcome')
         .setDescription('إعداد نظام الترحيب')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addSubcommand(sub =>
             sub.setName('set')
                 .setDescription('تعيين الترحيب')
@@ -1188,7 +1246,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('ai')
         .setDescription('اسأل الذكاء الاصطناعي')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addStringOption(o =>
             o.setName('provider')
                 .setDescription('مزود الذكاء الاصطناعي')
@@ -1209,7 +1267,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('embed')
         .setDescription('إنشاء وإرسال إيمبد مخصص')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addStringOption(o =>
             o.setName('description')
                 .setDescription('نص الإيمبد (مطلوب)')
@@ -1260,7 +1318,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('autoresponse')
         .setDescription('إدارة الردود التلقائية')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addSubcommand(sub =>
             sub.setName('add')
                 .setDescription('إضافة رد تلقائي')
@@ -1291,7 +1349,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('shortcut')
         .setDescription('إدارة الاختصارات')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addSubcommand(sub =>
             sub.setName('add')
                 .setDescription('إضافة اختصار')
@@ -1336,12 +1394,12 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('logs')
         .setDescription('إعداد سجلات السيرفر')
-        .setDefaultMemberPermissions(ADMIN),
+        ,
 
     new SlashCommandBuilder()
         .setName('level')
         .setDescription('عرض مستواك أو مستوى عضو')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addUserOption(o =>
             o.setName('user')
                 .setDescription('العضو')
@@ -1351,7 +1409,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('level-settings')
         .setDescription('إعداد نظام المستويات')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addIntegerOption(o =>
             o.setName('messages')
                 .setDescription('عدد الرسائل المطلوبة لكل مستوى')
@@ -1373,7 +1431,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('setlog')
         .setDescription('تعيين روم عام للسجلات')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addChannelOption(o =>
             o.setName('channel')
                 .setDescription('روم السجلات')
@@ -1384,7 +1442,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('setchat')
         .setDescription('تعيين روم الذكاء الاصطناعي')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addChannelOption(o =>
             o.setName('channel')
                 .setDescription('روم الذكاء الاصطناعي')
@@ -1411,7 +1469,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('setcode')
         .setDescription('تعيين روم توليد الأكواد')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addChannelOption(o =>
             o.setName('channel')
                 .setDescription('روم الأكواد')
@@ -1438,7 +1496,7 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName('protect')
         .setDescription('حماية السيرفر من السبام (رومات/رتب/باند/بوتات)')
-        .setDefaultMemberPermissions(ADMIN)
+        
         .addSubcommand(sub =>
             sub.setName('channels')
                 .setDescription('حماية الرومات: عدد الإنشاء المسموح ثم العقوبة')
@@ -1585,6 +1643,15 @@ async function registerGlobalCommands() {
             `🌐 Slash commands registered globally: ${slashCommands.length} commands for ALL servers`
         );
 
+        // رابط الإضافة الصحيح (بدونه ما تظهر الأوامر في أي سيرفر)
+        console.log(
+            '🔗 لإضافة البوت بشكل صحيح في كل سيرفر استخدم هذا الرابط (بديل):\n' +
+            '    https://discord.com/api/oauth2/authorize?client_id=' +
+            `${client.user.id}&permissions=8&scope=bot%20applications.commands` +
+            '\nإذا فيه سيرفر ما تظهر فيه الأوامر = البوت أضيف فيه برابط قديم بدون ' +
+            "'applications.commands'. أزله منه وأضفه مرة ثانية بالرابط أعلاه."
+        );
+
         return true;
 
     } catch (error) {
@@ -1632,6 +1699,43 @@ client.once('ready', async () => {
 
         console.log('✅ MongoDB connected successfully');
 
+        // فحص وإصلاح شامل لكل مستندات الإعدادات المخزنة
+        // (يضمن عدم وجود كائن مكان مصفوفة في shortcuts / autoResponses ...)
+        try {
+            const cursor = GuildSettings.collection.find({});
+
+            while (await cursor.hasNext()) {
+                const doc = await cursor.next();
+
+                const patch = {};
+
+                if (!Array.isArray(doc.shortcuts)) patch.shortcuts = [];
+                if (!Array.isArray(doc.autoResponses)) patch.autoResponses = [];
+
+                if (
+                    doc.levelSettings &&
+                    typeof doc.levelSettings.rewards === 'object' &&
+                    !Array.isArray(doc.levelSettings.rewards)
+                ) {
+                    patch['levelSettings.rewards'] = {};
+                }
+
+                if (Object.keys(patch).length) {
+                    await GuildSettings.collection.updateOne(
+                        { _id: doc._id },
+                        { $set: patch }
+                    );
+                    console.log(
+                        `🔧 Repaired settings for server ${doc._id}`
+                    );
+                }
+            }
+
+            console.log('🧹 Settings database scan complete');
+        } catch (error) {
+            console.error('Settings database scan error:', error);
+        }
+
     } catch (error) {
         console.error('❌ MongoDB connection error:', error);
         console.error(
@@ -1640,7 +1744,7 @@ client.once('ready', async () => {
     }
 
     console.log(
-        '🔐 جميع Slash Commands تتطلب Administrator'
+        '🔐 جميع Slash Commands تتطلب رتبة ' + STAFF_ROLE_NAME + ' (فوق رتبة البوت)'
     );
 });
 
@@ -1668,16 +1772,9 @@ client.on('interactionCreate', async interaction => {
 
         if (interaction.isChatInputCommand()) {
 
-            // EVERY SLASH COMMAND = ADMIN
-            if (!isAdmin(interaction)) {
-
-                return interaction.reply({
-                    content:
-                        '❌ تحتاج صلاحية **Administrator** لاستخدام هذا الأمر.',
-                    ephemeral: true
-                });
-
-            }
+            // EVERY SLASH COMMAND = STAFF ROLE ONLY
+            const staffOK = await requireStaffPermission(interaction);
+            if (staffOK !== true) return staffOK;
 
             const command = interaction.commandName;
 
@@ -3075,7 +3172,7 @@ client.on('interactionCreate', async interaction => {
                 if (!isAdmin(interaction)) {
                     return interaction.reply({
                         content:
-                            '❌ تحتاج Administrator.',
+                            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`,
                         ephemeral: true
                     });
                 }
@@ -3200,7 +3297,7 @@ client.on('interactionCreate', async interaction => {
                 if (!isAdmin(interaction)) {
                     return interaction.reply({
                         content:
-                            '❌ تحتاج Administrator.',
+                            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`,
                         ephemeral: true
                     });
                 }
@@ -3253,7 +3350,7 @@ client.on('interactionCreate', async interaction => {
                 if (!isAdmin(interaction)) {
                     return interaction.reply({
                         content:
-                            '❌ تحتاج Administrator.',
+                            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`,
                         ephemeral: true
                     });
                 }
@@ -3354,7 +3451,7 @@ client.on('interactionCreate', async interaction => {
                 if (!isAdmin(interaction)) {
                     return interaction.reply({
                         content:
-                            '❌ تحتاج Administrator.',
+                            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`,
                         ephemeral: true
                     });
                 }
@@ -3442,7 +3539,7 @@ client.on('interactionCreate', async interaction => {
             if (!isAdmin(interaction)) {
                 return interaction.reply({
                     content:
-                        '❌ تحتاج Administrator.',
+                        `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`,
                     ephemeral: true
                 });
             }
@@ -4655,9 +4752,7 @@ client.on('messageCreate', async message => {
 
         const isStaff =
             isOwner(message.author.id) ||
-            message.member?.permissions?.has(
-                PermissionsBitField.Flags.Administrator
-            );
+            memberHasStaffRole(message.member, message.guild);
 
         if (spamProt.enabled && !isStaff) {
             const punished = await handleSpam(message, spamProt);
@@ -4926,12 +5021,9 @@ async function executeShortcut(
     rawArgs
 ) {
 
-    if (!message.member.permissions.has(
-        PermissionsBitField.Flags.Administrator
-    ) && !isOwner(message.author.id)) {
-
+    if (!memberHasStaffRole(message.member, message.guild)) {
         return message.reply(
-            '❌ تحتاج صلاحية **Administrator** لاستخدام الاختصارات الإدارية.'
+            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** (فوق رتبة البوت) لاستخدام الاختصارات.`
         );
     }
 
