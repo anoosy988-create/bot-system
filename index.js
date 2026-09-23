@@ -358,8 +358,8 @@ async function getSettings(guildId) {
 // ======================================================
 
 const AI_PROVIDERS = {
-groq: {
-        model: 'llama-3.3-70b-specdec', // أو أي موديل شغال حالياً في منصتهم
+    groq: {
+        model: 'llama-3.3-70b-versatile',
         url: 'https://api.groq.com/openai/v1/chat/completions',
         env: 'GROQ_API_KEY'
     },
@@ -1312,6 +1312,31 @@ const slashCommands = [
 // REGISTER SLASH COMMANDS
 // ======================================================
 
+async function registerGuildCommands(guild) {
+
+    if (!guild) return;
+
+    try {
+
+        await guild.commands.set(slashCommands);
+
+        console.log(
+            `✅ Slash commands registered in: ${guild.name}`
+        );
+
+        return true;
+
+    } catch (error) {
+
+        console.error(
+            `❌ Failed registering commands in ${guild.name}:`,
+            error
+        );
+
+        return false;
+    }
+}
+
 client.once('ready', async () => {
 
     console.log(`✅ Logged in as ${client.user.tag}`);
@@ -1327,29 +1352,22 @@ client.once('ready', async () => {
     }
 
     for (const guild of client.guilds.cache.values()) {
-
-        try {
-
-            await guild.commands.set(slashCommands);
-
-            console.log(
-                `✅ Slash commands registered in: ${guild.name}`
-            );
-
-        } catch (error) {
-
-            console.error(
-                `❌ Failed registering commands in ${guild.name}:`,
-                error
-            );
-
-        }
-
+        await registerGuildCommands(guild);
     }
 
     console.log(
         '🔐 جميع Slash Commands تتطلب Administrator'
     );
+});
+
+// تسجيل الأوامر فوراً عند دخول البوت لسيرفر جديد
+client.on('guildCreate', async guild => {
+
+    console.log(
+        `📥 Bot added to new server: ${guild.name}`
+    );
+
+    await registerGuildCommands(guild);
 });
 
 
