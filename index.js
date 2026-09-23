@@ -33,6 +33,18 @@ const ALLOWED_COMMANDS = [
     { name: 'فتح الروم (unlock)', value: 'unlock' }
 ];
 
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+    res.send('Bot is running!');
+});
+
+app.listen(port, () => {
+    console.log(`🌐 السيرفر يعمل على المنفذ ${port}`);
+});
+
 // 1. بناء أمر السلاش
 const shortcutCommand = new SlashCommandBuilder()
     .setName('shortcut')
