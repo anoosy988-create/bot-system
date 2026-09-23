@@ -3792,13 +3792,27 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
     try {
 
+        const guild = newState.guild || oldState.guild;
+        const memberId = newState.member?.id || oldState.member?.id;
+
         if (!oldState.channelId && newState.channelId) {
 
+            // من نقله أو دخله بنفسه
+            const mover = await getAuditExecutor(
+                guild,
+                AuditLogEvent.MoveMember,
+                memberId
+            );
+
+            const moverText = mover
+                ? (mover === memberId ? '' : `\nمنقّل بواسطة: <@${mover}>`)
+                : '';
+
             await sendLog(
-                newState.guild,
+                guild,
                 'voice',
                 '🔊 Voice Join',
-                `${newState.member} دخل ${safeChannelName(newState.channel)}.`
+                `${newState.member} دخل ${safeChannelName(newState.channel)}.${moverText}`
             );
 
         } else if (
@@ -3806,23 +3820,53 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             !newState.channelId
         ) {
 
-            await sendLog(
-                newState.guild,
-                'voice',
-                '🔊 Voice Leave',
-                `${newState.member} خرج من ${safeChannelName(oldState.channel)}.`
+            // هل طُرد من الروم الصوتي أم خرج؟
+            const kicker = await getAuditExecutor(
+                guild,
+                AuditLogEvent.MemberDisconnect,
+                memberId
             );
+
+            if (kicker) {
+
+                await sendLog(
+                    guild,
+                    'voice',
+                    '👢 Kicked from Voice',
+                    `${newState.member} طُرد من الروم الصوتي ${safeChannelName(oldState.channel)}.\n` +
+                    `المُخرج: <@${kicker}>`
+                );
+
+            } else {
+
+                await sendLog(
+                    guild,
+                    'voice',
+                    '🔊 Voice Leave',
+                    `${newState.member} خرج من ${safeChannelName(oldState.channel)}.`
+                );
+            }
 
         } else if (
             oldState.channelId !==
             newState.channelId
         ) {
 
+            const mover = await getAuditExecutor(
+                guild,
+                AuditLogEvent.MoveMember,
+                memberId
+            );
+
+            const moverText = mover && mover !== memberId
+                ? `\nمنقّل بواسطة: <@${mover}>`
+                : '';
+
             await sendLog(
-                newState.guild,
+                guild,
                 'voice',
                 '🔄 Voice Move',
-                `${newState.member} انتقل من ${safeChannelName(oldState.channel)} إلى ${safeChannelName(newState.channel)}.`
+                `${newState.member} انتقل من ${safeChannelName(oldState.channel)} إلى ${safeChannelName(newState.channel)}.${moverText}`
             );
         }
 
@@ -3831,11 +3875,18 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             newState.serverMute
         ) {
 
+            const executor = await executorMention(
+                guild,
+                AuditLogEvent.MemberMute,
+                memberId
+            );
+
             await sendLog(
-                newState.guild,
+                guild,
                 'voice',
-                '🎙️ Server Mute',
-                `${newState.member} تم تغيير Server Mute.`
+                newState.serverMute ? '🔇 Voice Muted' : '🔊 Voice Unmuted',
+                `${newState.member} ${newState.serverMute ? 'تم كتمه في الروم الصوتي' : 'تم فك كتمه الصوتي'}.\n` +
+                `المسبب: ${executor}`
             );
         }
 
@@ -3844,11 +3895,18 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             newState.serverDeaf
         ) {
 
+            const executor = await executorMention(
+                guild,
+                AuditLogEvent.MemberDeafen,
+                memberId
+            );
+
             await sendLog(
-                newState.guild,
+                guild,
                 'voice',
-                '🔇 Server Deaf',
-                `${newState.member} تم تغيير Server Deaf.`
+                newState.serverDeaf ? '🎧 Voice Deafened' : '🎧 Voice Undeafened',
+                `${newState.member} ${newState.serverDeaf ? 'تم تعطيل سماعه في الروم' : 'تم تفعيل سماعه في الروم'}.\n` +
+                `المسبب: ${executor}`
             );
         }
 
@@ -3869,11 +3927,18 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 client.on('roleCreate', async role => {
 
+    const executor = await executorMention(
+        role.guild,
+        AuditLogEvent.RoleCreate,
+        role.id
+    );
+
     await sendLog(
         role.guild,
         'role',
         '🎭 Role Created',
-        `تم إنشاء الرتبة ${role}.`
+        `تم إنشاء الرتبة ${role}.\n` +
+        `المسبب: ${executor}`
     );
 
     // حماية الرتب
@@ -3947,6 +4012,44 @@ client.on('roleDelete', async role => {
 
 });
 
+client.on('roleUpdate', async (oldRole, newRole) => {
+
+    const changes = [];
+
+    if (oldRole.name !== newRole.name) {
+        changes.push(`الاسم: **${oldRole.name}** → **${newRole.name}**`);
+    }
+
+    if (oldRole.color !== newRole.color) {
+        changes.push(`اللون: \`#${oldRole.color.toString(16) || '000000'}\` → \`#${newRole.color.toString(16)}\``);
+    }
+
+    if (oldRole.hoist !== newRole.hoist) {
+        changes.push(`عرضها منفصلة في القائمة: ${newRole.hoist ? 'نعم ✅' : 'لا ❌'}`);
+    }
+
+    if (oldRole.mentionable !== newRole.mentionable) {
+        changes.push(`قابلية المنشن: ${newRole.mentionable ? 'نعم ✅' : 'لا ❌'}`);
+    }
+
+    if (!changes.length) return;
+
+    const executor = await executorMention(
+        newRole.guild,
+        AuditLogEvent.RoleUpdate,
+        newRole.id
+    );
+
+    await sendLog(
+        newRole.guild,
+        'role',
+        '✏️ Role Updated',
+        `الرتبة: ${newRole}\n` +
+        changes.join('\n') +
+        `\nالمسبب: ${executor}`
+    );
+});
+
 
 // ======================================================
 // CHANNEL LOGS
@@ -3956,11 +4059,18 @@ client.on('channelCreate', async channel => {
 
     if (!channel.guild) return;
 
+    const executor = await executorMention(
+        channel.guild,
+        AuditLogEvent.ChannelCreate,
+        channel.id
+    );
+
     await sendLog(
         channel.guild,
         'channel',
         '📁 Channel Created',
-        `تم إنشاء ${channel}.`
+        `تم إنشاء ${channel}.\n` +
+        `المسبب: ${executor}`
     );
 
     // حماية الرومات
@@ -4032,6 +4142,46 @@ client.on('channelDelete', async channel => {
         `المسبب: ${executor}`
     );
 
+});
+
+client.on('channelUpdate', async (oldChannel, newChannel) => {
+
+    if (!newChannel.guild) return;
+
+    const changes = [];
+
+    if (oldChannel.name !== newChannel.name) {
+        changes.push(`الاسم: **${oldChannel.name}** → **${newChannel.name}**`);
+    }
+
+    if (oldChannel.topic !== newChannel.topic) {
+        changes.push(`الموضوع: **${oldChannel.topic || 'بدون'}** → **${newChannel.topic || 'بدون'}**`);
+    }
+
+    if (oldChannel.rateLimitPerUser !== newChannel.rateLimitPerUser) {
+        changes.push(`مهلة الكتابة: ${oldChannel.rateLimitPerUser || 0} ث → ${newChannel.rateLimitPerUser || 0} ث`);
+    }
+
+    if (oldChannel.parentId !== newChannel.parentId) {
+        changes.push('تم نقل الروم ضمن الفئات (categories)');
+    }
+
+    if (!changes.length) return;
+
+    const executor = await executorMention(
+        newChannel.guild,
+        AuditLogEvent.ChannelUpdate,
+        newChannel.id
+    );
+
+    await sendLog(
+        newChannel.guild,
+        'channel',
+        '✏️ Channel Updated',
+        `${newChannel}\n` +
+        changes.join('\n') +
+        `\nالمسبب: ${executor}`
+    );
 });
 
 
