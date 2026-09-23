@@ -1330,8 +1330,21 @@ async function registerGuildCommands(guild) {
 
         console.error(
             `❌ Failed registering commands in ${guild.name}:`,
-            error
+            error.message || error
         );
+
+        // Missing Access (50001) = دخل البوت بدون scope الأوامر
+        const code = error.code || error.status || error.rawError?.code;
+
+        if (code === 50001 || code === 403) {
+
+            console.error(
+                '⚠️ في سيرفر "' + guild.name + '" البوت دخل بلا صلاحية `applications.commands`.\n' +
+                'الحل: أعد إضافة البوت لهذا السيرفر بالرابط الصحيح:\n' +
+                `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=8&scope=bot%20applications.commands\n` +
+                'ينصح أولاً بإزالة البوت من السيرفر ثم إضافته بالرابط أعلاه.'
+            );
+        }
 
         return false;
     }
