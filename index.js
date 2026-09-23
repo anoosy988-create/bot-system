@@ -299,47 +299,6 @@ const guildSchema = new mongoose.Schema({
         }
     },
 
-    aiChatChannelId: {
-        type: String,
-        default: null
-    },
-
-    aiCodeChannelId: {
-        type: String,
-        default: null
-    },
-
-    aiProvider: {
-        type: String,
-        default: 'gemini'
-    },
-
-    aiSystemPrompt: {
-        type: String,
-        default: 'You are a helpful assistant running inside a Discord server. Answer in the same language the user writes in. Be clear, friendly and concise.'
-    },
-
-    // مزود وإعدادات منفصلة لكل روم (محادثة / أكواد)
-    aiChatProvider: {
-        type: String,
-        default: null
-    },
-
-    aiCodeProvider: {
-        type: String,
-        default: null
-    },
-
-    aiChatSystem: {
-        type: String,
-        default: null
-    },
-
-    aiCodeSystem: {
-        type: String,
-        default: null
-    },
-
     protections: {
         channels: {
             enabled: { type: Boolean, default: false },
@@ -572,164 +531,6 @@ async function getSettings(guildId) {
     return settings;
 }
 
-
-// ======================================================
-// AI PROVIDERS (Gemini أساسي / Groq / Claude / OpenAI / DeepSeek)
-// ======================================================
-
-
-
-const AI_PROVIDERS = {
-    gemini: {
-        model: 'gemini-2.0-flash',
-        url: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
-        key: GEMINI_API_KEY
-    },
-    groq: {
-        model: 'llama-3.3-70b-versatile',
-        url: 'https://api.groq.com/openai/v1/chat/completions',
-        env: 'GROQ_API_KEY'
-    },
-    openai: {
-        model: 'gpt-4o-mini',
-        url: 'https://api.openai.com/v1/chat/completions',
-        env: 'OPENAI_API_KEY'
-    },
-    deepseek: {
-        model: 'deepseek-chat',
-        url: 'https://api.deepseek.com/chat/completions',
-        env: 'DEEPSEEK_API_KEY'
-    },
-    claude: {
-        model: 'claude-3-5-sonnet-latest',
-        url: 'https://api.anthropic.com/v1/messages',
-        env: 'CLAUDE_API_KEY'
-    }
-};
-
-// منع إرسال إجابة الذكاء لكل رسالة (عشر ثوان لكل عضو)
-const aiCooldowns = new Map();
-
-async function generateAI(provider = 'gemini', systemPrompt, prompt) {
-    const cfg = AI_PROVIDERS[provider];
-
-    if (!cfg) {
-        throw new Error('مزود الذكاء الاصطناعي غير مدعوم.');
-    }
-
-    if (provider === 'gemini') {
-        try {
-            const endpoint =
-                `${cfg.url}?key=${encodeURIComponent(cfg.key)}`;
-
-            const res = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json'
-                },
-                body: JSON.stringify({
-                    systemInstruction: systemPrompt
-                        ? { parts: [{ text: systemPrompt }] }
-                        : undefined,
-                    contents: [
-                        { parts: [{ text: prompt }] }
-                    ],
-                    generationConfig: { maxOutputTokens: 1024 }
-                })
-            });
-
-            if (!res.ok) {
-                throw new Error(
-                    `Gemini API: ${res.status} ${await res.text()}`
-                );
-            }
-
-            const data = await res.json();
-
-            return (data?.candidates?.[0]?.content?.parts || [])
-                .map(part => part.text || '')
-                .join('')
-                .trim();
-        } catch (geminiError) {
-            // OpenAI كاحتياطي لـ Gemini
-            if (process.env.OPENAI_API_KEY) {
-                return generateAI('openai', systemPrompt, prompt);
-            }
-
-            throw geminiError;
-        }
-    }
-
-    if (provider === 'claude') {
-        if (!process.env.CLAUDE_API_KEY) {
-            throw new Error('❌ ضع `CLAUDE_API_KEY` في Environment Variables.');
-        }
-
-        const res = await fetch(cfg.url, {
-            method: 'POST',
-            headers: {
-                'x-api-key': process.env.CLAUDE_API_KEY,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json'
-            },
-            body: JSON.stringify({
-                model: cfg.model,
-                max_tokens: 1024,
-                system: systemPrompt || '',
-                messages: [
-                    { role: 'user', content: prompt }
-                ]
-            })
-        });
-
-        if (!res.ok) {
-            throw new Error(`Claude API: ${res.status} ${await res.text()}`);
-        }
-
-        const data = await res.json();
-
-        return (data.content || [])
-            .map(block => block.text || '')
-            .join('')
-            .trim();
-    }
-
-    const key = process.env[cfg.env];
-
-    if (!key) {
-        throw new Error(`❌ ضع \`${cfg.env}\` في Environment Variables.`);
-    }
-
-    const res = await fetch(cfg.url, {
-        method: 'POST',
-        headers: {
-            'content-type': 'application/json',
-            authorization: `Bearer ${key}`
-        },
-        body: JSON.stringify({
-            model: cfg.model,
-            max_tokens: 1024,
-            messages: [
-                {
-                    role: 'system',
-                    content: systemPrompt || 'You are a helpful Discord assistant.'
-                },
-                {
-                    role: 'user',
-                    content: prompt
-                }
-            ]
-        })
-    });
-
-    if (!res.ok) {
-        throw new Error(`${provider} API: ${res.status} ${await res.text()}`);
-    }
-
-    const data = await res.json();
-
-    return (data.choices?.[0]?.message?.content || '').trim();
-}
 
 
 // ======================================================
@@ -1387,29 +1188,11 @@ const slashCommands = [
         .addSubcommand(sub =>
             sub.setName('off')
                 .setDescription('إيقاف الترحيب')
-        ),
+        ), 
 
     new SlashCommandBuilder()
-        .setName('ai')
-        .setDescription('اسأل الذكاء الاصطناعي')
-        
-        .addStringOption(o =>
-            o.setName('provider')
-                .setDescription('مزود الذكاء الاصطناعي')
-                .setRequired(true)
-                .addChoices(
-                    { name: '✨ Gemini', value: 'gemini' },
-                    { name: '🤖 Groq', value: 'groq' },
-                    { name: '🧠 Claude', value: 'claude' },
-                    { name: '🟢 OpenAI', value: 'openai' },
-                    { name: '🐳 DeepSeek', value: 'deepseek' }
-                )
-        )
-        .addStringOption(o =>
-            o.setName('prompt')
-                .setDescription('السؤال أو الطلب')
-                .setRequired(true)
-        ),
+        .setName('stats')
+        .setDescription('عرض عدد السيرفرات التي فيها البوت'),
 
     new SlashCommandBuilder()
         .setName('embed')
@@ -1606,62 +1389,6 @@ const slashCommands = [
         .addSubcommand(sub =>
             sub.setName('status')
                 .setDescription('حالة الرتبة التلقائية')
-        ),
-
-    new SlashCommandBuilder()
-        .setName('setchat')
-        .setDescription('تعيين روم الذكاء الاصطناعي')
-        
-        .addChannelOption(o =>
-            o.setName('channel')
-                .setDescription('روم الذكاء الاصطناعي')
-                .addChannelTypes(ChannelType.GuildText)
-                .setRequired(true)
-        )
-        .addStringOption(o =>
-            o.setName('provider')
-                .setDescription('مزود الذكاء الاصطناعي')
-                .setRequired(false)
-                .addChoices(
-                    { name: 'Gemini', value: 'gemini' },
-                    { name: 'Groq', value: 'groq' },
-                    { name: 'Claude', value: 'claude' },
-                    { name: 'OpenAI', value: 'openai' },
-                    { name: 'DeepSeek', value: 'deepseek' }
-                )
-        )
-        .addStringOption(o =>
-            o.setName('system')
-                .setDescription('تعليمات النظام لروم المحادثة')
-                .setRequired(false)
-        ),
-
-    new SlashCommandBuilder()
-        .setName('setcode')
-        .setDescription('تعيين روم توليد الأكواد')
-        
-        .addChannelOption(o =>
-            o.setName('channel')
-                .setDescription('روم الأكواد')
-                .addChannelTypes(ChannelType.GuildText)
-                .setRequired(true)
-        )
-        .addStringOption(o =>
-            o.setName('provider')
-                .setDescription('مزود الذكاء الاصطناعي')
-                .setRequired(false)
-                .addChoices(
-                    { name: 'Gemini', value: 'gemini' },
-                    { name: 'Groq', value: 'groq' },
-                    { name: 'Claude', value: 'claude' },
-                    { name: 'OpenAI', value: 'openai' },
-                    { name: 'DeepSeek', value: 'deepseek' }
-                )
-        )
-        .addStringOption(o =>
-            o.setName('system')
-                .setDescription('تعليمات النظام لروم الأكواد')
-                .setRequired(false)
         ),
 
     new SlashCommandBuilder()
@@ -1945,24 +1672,9 @@ client.on('interactionCreate', async interaction => {
 
             const command = interaction.commandName;
 
-            // أوامر الذكاء الاصطناعي مخصصة لمالك البوت فقط
-            if (['ai', 'setchat', 'setcode'].includes(command)) {
-
-                if (!isOwner(interaction.user.id)) {
-                    return interaction.reply({
-                        content:
-                            '❌ أوامر الذكاء الاصطناعي مخصصة مالك البوت فقط.',
-                        ephemeral: true
-                    });
-                }
-
-            } else {
-
-                // EVERY OTHER SLASH COMMAND = STAFF ROLE ONLY
-                const staffOK = await requireStaffPermission(interaction);
-                if (staffOK !== true) return staffOK;
-
-            }
+            // EVERY SLASH COMMAND = STAFF ROLE ONLY
+            const staffOK = await requireStaffPermission(interaction);
+            if (staffOK !== true) return staffOK;
 
 
             // ==========================================
@@ -2970,6 +2682,31 @@ client.on('interactionCreate', async interaction => {
 
 
             // ==========================================
+            // STATS (عدد السيرفرات)
+            // ==========================================
+
+            if (command === 'stats') {
+
+                const guilds = client.guilds.cache;
+
+                const list = guilds
+                    .map(g =>
+                        `${g.name} ( ${g.memberCount} عضو )`
+                    )
+                    .join('\n');
+
+                return interaction.reply({
+                    content:
+                        `📊 **إحصائيات البوت**\n\n` +
+                        `🖥️ السيرفرات: **${guilds.size}**\n` +
+                        `👥 إجمالي الأعضاء: **${guilds.reduce((sum, g) => sum + g.memberCount, 0)}**\n\n` +
+                        (guilds.size ? `**السيرفرات:**\n${list || 'لا توجد بيانات.'}` : 'البوت غير مفعل في أي سيرفر بعد.'),
+                    ephemeral: false
+                });
+            }
+
+
+            // ==========================================
             // SETLOG
             // ==========================================
 
@@ -3056,124 +2793,6 @@ client.on('interactionCreate', async interaction => {
                         `🎭 الرتبة: ${autoRoleRole ? autoRoleRole.toString() : 'غير محددة'}`,
                     ephemeral: true
                 });
-            }
-
-
-            // ==========================================
-            // SET CHAT
-            // ==========================================
-
-            if (command === 'setchat') {
-
-                const channel =
-                    interaction.options.getChannel('channel');
-
-                const provider =
-                    interaction.options.getString('provider');
-
-                const system =
-                    interaction.options.getString('system');
-
-                const settings =
-                    await getSettings(interaction.guild.id);
-
-                settings.aiChatChannelId = channel.id;
-
-                if (provider) settings.aiChatProvider = provider;
-                if (system) settings.aiChatSystem = system;
-
-                await settings.save();
-
-                const effectiveProvider =
-                    provider || settings.aiChatProvider ||
-                    settings.aiProvider || 'gemini';
-
-                return interaction.reply(
-                    `🤖 تم تعيين ${channel} لروم الذكاء الاصطناعي.\n` +
-                    `🛰️ المزود: **${effectiveProvider}**`
-                );
-            }
-
-
-            // ==========================================
-            // SET CODE
-            // ==========================================
-
-            if (command === 'setcode') {
-
-                const channel =
-                    interaction.options.getChannel('channel');
-
-                const provider =
-                    interaction.options.getString('provider');
-
-                const system =
-                    interaction.options.getString('system');
-
-                const settings =
-                    await getSettings(interaction.guild.id);
-
-                settings.aiCodeChannelId = channel.id;
-
-                if (provider) settings.aiCodeProvider = provider;
-                if (system) settings.aiCodeSystem = system;
-
-                await settings.save();
-
-                const effectiveProvider =
-                    provider || settings.aiCodeProvider ||
-                    settings.aiProvider || 'gemini';
-
-                return interaction.reply(
-                    `💻 تم تعيين ${channel} لروم الأكواد.\n` +
-                    `🛰️ المزود: **${effectiveProvider}**`
-                );
-            }
-
-
-            // ==========================================
-            // AI
-            // ==========================================
-
-            if (command === 'ai') {
-
-                const provider =
-                    interaction.options.getString('provider');
-
-                const prompt =
-                    interaction.options.getString('prompt');
-
-                const settings =
-                    await getSettings(interaction.guild.id);
-
-                const system =
-                    settings.aiSystemPrompt;
-
-                await interaction.deferReply({ ephemeral: false });
-
-                await interaction.editReply({
-                    content: '🤔 أفكر في إجابة...'
-                });
-
-                try {
-
-                    const answer =
-                        await generateAI(provider, system, prompt);
-
-                    return interaction.editReply({
-                        content:
-                            `🛰️ **${provider}** | ${interaction.user}\n\n` +
-                            (answer.slice(0, 1900) || 'لا توجد إجابة.')
-                    });
-
-                } catch (error) {
-
-                    return interaction.editReply({
-                        content:
-                            `❌ ${error.message || 'حدث خطأ في الاتصال بالمزود.'}`
-                    });
-
-                }
             }
 
 
@@ -5150,68 +4769,6 @@ client.on('messageCreate', async message => {
 
                 break;
             }
-        }
-
-
-        // ==============================================
-        // AI CHAT / AI CODE (ذكاء البوت)
-        // ==============================================
-
-        const isAiChat =
-            message.channel.id === settings.aiChatChannelId;
-
-        const isAiCode =
-            message.channel.id === settings.aiCodeChannelId;
-
-        if (isAiChat || isAiCode) {
-
-            const now = Date.now();
-            const last = aiCooldowns.get(message.author.id);
-
-            if (last && now - last < 10000) return;
-
-            aiCooldowns.set(message.author.id, now);
-
-            await message.channel.sendTyping().catch(() => {});
-
-            const provider = isAiCode
-                ? (settings.aiCodeProvider || settings.aiProvider || 'gemini')
-                : (settings.aiChatProvider || settings.aiProvider || 'gemini');
-
-            const fallbackSystem =
-                'You are a helpful assistant running inside a Discord server. Answer in the same language the user writes in. Be clear, friendly and concise.';
-
-            const baseSystem = isAiCode
-                ? (settings.aiCodeSystem || settings.aiSystemPrompt || fallbackSystem)
-                : (settings.aiChatSystem || settings.aiSystemPrompt || fallbackSystem);
-
-            const system = isAiCode
-                ? `${baseSystem}\nYou are a code assistant. Reply ONLY with code inside a single code block, with a very short Arabic explanation of what it does.`
-                : baseSystem;
-
-            try {
-
-                const answer = await generateAI(
-                    provider,
-                    system,
-                    message.content
-                );
-
-                const content = (answer || '').slice(0, 1900);
-
-                await message.reply(content).catch(() => {});
-
-            } catch (error) {
-
-                console.error('AI error:', error);
-
-                await message.reply(
-                    `❌ ${error.message || 'حدث خطأ أثناء الاتصال بالمزود.'}`
-                ).catch(() => {});
-
-            }
-
-            return;
         }
 
 
