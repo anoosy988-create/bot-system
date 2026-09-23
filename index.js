@@ -386,6 +386,37 @@ const UserLevel = mongoose.model(
 );
 
 
+const warningSchema = new mongoose.Schema({
+    guildId: String,
+    // رقم التحذير داخل السيرفر (يبدأ من 1 ولا يتكرر)
+    number: Number,
+    userId: String,
+    moderatorId: String,
+    reason: {
+        type: String,
+        required: true
+    },
+    expiresAt: {
+        type: Date,
+        default: null
+    },
+    createdAt: {
+        type: Date,
+        default: Date.now
+    }
+});
+
+warningSchema.index(
+    { guildId: 1, number: 1 },
+    { unique: true }
+);
+
+const Warning = mongoose.model(
+    'Warning',
+    warningSchema
+);
+
+
 // ======================================================
 // DEFAULT SETTINGS
 // ======================================================
@@ -1013,6 +1044,212 @@ async function unjailMember(member) {
 
 
 // ======================================================
+// WARNING SYSTEM (نظام التحذيرات)
+// ======================================================
+
+// تحويل نص مدة إلى تاريخ انتهاء، أو null لو مش صحيحة
+// يدعم: 10m / 2h / 7d / تاريخ مثل 2026/6/6 / 2026/6/6 15:30
+function parseWarningDuration(input) {
+    if (!input) return null;
+
+    const text = String(input).trim();
+
+    // تاريخ مطلق: 2026/6/6
+    const dateOnly = text.match(
+        /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/
+    );
+
+    if (dateOnly) {
+        const d = new Date(
+            Number(dateOnly[1]),
+            Number(dateOnly[2]) - 1,
+            Number(dateOnly[3])
+        );
+
+        if (isNaN(d.getTime())) return null;
+        if (d.getTime() <= Date.now()) return null; // تاريخ فات = غير صالح
+
+        return d;
+    }
+
+    // تاريخ مع وقت: 2026/6/6 15:30
+    const dateTime = text.match(
+        /^(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{1,2})$/
+    );
+
+    if (dateTime) {
+        const d = new Date(
+            Number(dateTime[1]),
+            Number(dateTime[2]) - 1,
+            Number(dateTime[3]),
+            Number(dateTime[4]),
+            Number(dateTime[5])
+        );
+
+        if (isNaN(d.getTime())) return null;
+        if (d.getTime() <= Date.now()) return null;
+
+        return d;
+    }
+
+    // مدة نسبية: 10m / 2h / 7d / 30s
+    const relative = text.match(
+        /^(\d+)\s*(s|m|h|d)$/i
+    );
+
+    if (relative) {
+        const amount = Number(relative[1]);
+        const unit = relative[2].toLowerCase();
+        const multipliers = {
+            s: 1000,
+            m: 60000,
+            h: 3600000,
+            d: 86400000
+        };
+
+        return new Date(
+            Date.now() + amount * multipliers[unit]
+        );
+    }
+
+    return null;
+}
+
+// تنسيق التاريخ دائم صيغة: 2026/6/6
+function formatWarnDate(date) {
+    if (!date) return 'بدون مدة';
+
+    const d = new Date(date);
+
+    if (isNaN(d.getTime())) return 'غير معروف';
+
+    return (
+        d.getFullYear() + '/' +
+        (d.getMonth() + 1) + '/' +
+        d.getDate()
+    );
+}
+
+// رقم تحذير جديد للسيرفر (يزيد دائماً، لا يتكرر)
+async function nextWarningNumber(guildId) {
+    try {
+        const updated = await GuildSettings.findByIdAndUpdate(
+            guildId,
+            { $inc: { warnCounter: 1 } },
+            { new: true }
+        ).lean();
+
+        if (updated && typeof updated.warnCounter === 'number') {
+            return updated.warnCounter;
+        }
+    } catch {}
+
+    // لو الإعدادات غير موجودة: ننشئها ونبدأ من 1
+    const settings = await getSettings(guildId);
+    settings.warnCounter = (settings.warnCounter || 0) + 1;
+    await settings.save().catch(() => {});
+    return settings.warnCounter;
+}
+
+// إضافة تحذير وإرجاعه
+async function addWarning({
+    guildId,
+    userId,
+    moderatorId,
+    reason,
+    duration
+}) {
+    const number = await nextWarningNumber(guildId);
+
+    return Warning.create({
+        guildId,
+        number,
+        userId,
+        moderatorId,
+        reason,
+        expiresAt: duration || null
+    });
+}
+
+// مسح التحذيرات المنتهية تلقائياً (يُنفّذ عند العرض)
+async function cleanExpiredWarnings(guildId) {
+    try {
+        await Warning.deleteMany({
+            guildId,
+            expiresAt: {
+                $ne: null,
+                $lte: new Date()
+            }
+        });
+    } catch (error) {
+        console.error('Clean expired warnings error:', error);
+    }
+}
+
+// تحذيرات عضو نشطة (مرتّبة من الأصغر للأكبر)
+async function getWarnings(guildId, userId) {
+    await cleanExpiredWarnings(guildId);
+
+    return Warning.find({
+        guildId,
+        userId
+    }).sort({ number: 1 }).lean();
+}
+
+// إزالة تحذير محدد، ترجع true لو حُذف فعلاً
+async function removeWarning(guildId, userId, number) {
+    if (!number || number < 1) return false;
+
+    const res = await Warning.deleteOne({
+        guildId,
+        userId,
+        number
+    });
+
+    return res.deletedCount > 0;
+}
+
+// تبني رسالة عرض التحذيرات
+function buildWarningsEmbed(target, warnings, own) {
+    const total = warnings.length;
+
+    let description;
+
+    if (!total) {
+        description = own
+            ? '✅ ماعندك أي تحذيرات.'
+            : `✅ ${target} ماعنده أي تحذيرات.`;
+    } else {
+        description =
+            `إجمالي التحذيرات: **${total}**\n\n` +
+            warnings.map(w => {
+                const modName = w.moderatorId
+                    ? `<@${w.moderatorId}>`
+                    : 'غير معروف';
+
+                const expiry = w.expiresAt
+                    ? formatWarnDate(w.expiresAt)
+                    : 'بدون مدة';
+
+                return (
+                    `**#${w.number}** ${w.reason}\n` +
+                    `👤 بواسطة: ${modName} | ` +
+                    `📅 الانتهاء: **${expiry}**`
+                );
+            }).join('\n\n');
+    }
+
+    return new EmbedBuilder()
+        .setTitle(
+            `⚠️ تحذيرات ${target.user?.tag || target.username || 'العضو'}`
+        )
+        .setColor(0xED4245)
+        .setDescription(description)
+        .setTimestamp();
+}
+
+
+// ======================================================
 // SLASH COMMANDS
 // EVERY COMMAND = ADMINISTRATOR
 // ======================================================
@@ -1319,7 +1556,10 @@ const slashCommands = [
                             { name: '🎭 role-remove', value: 'role-remove' },
                             { name: '🗑️ purge', value: 'purge' },
                             { name: '🔒 lock', value: 'lock' },
-                            { name: '🔓 unlock', value: 'unlock' }
+                            { name: '🔓 unlock', value: 'unlock' },
+                            { name: '⚠️ warn', value: 'warn' },
+                            { name: '⚠️ unwarn', value: 'unwarn' },
+                            { name: '📋 warnings', value: 'warnings' }
                         )
                 )
         )
@@ -1539,6 +1779,51 @@ const slashCommands = [
             sub.setName('status')
                 .setDescription('عرض حالة جميع الحمايات')
         ),
+
+    new SlashCommandBuilder()
+        .setName('warn')
+        .setDescription('إعطاء تحذير لعضو')
+
+        .addUserOption(o =>
+            o.setName('user')
+                .setDescription('العضو المراد تحذيره')
+                .setRequired(true)
+        )
+        .addStringOption(o =>
+            o.setName('reason')
+                .setDescription('سبب التحذير (مطلوب)')
+                .setRequired(true)
+        )
+        .addStringOption(o =>
+            o.setName('duration')
+                .setDescription('مدة التحذير مثل 7d أو 2026/6/6 (اختياري)')
+                .setRequired(false)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('unwarn')
+        .setDescription('إزالة تحذير عن عضو')
+
+        .addUserOption(o =>
+            o.setName('user')
+                .setDescription('العضو')
+                .setRequired(true)
+        )
+        .addIntegerOption(o =>
+            o.setName('number')
+                .setDescription('رقم التحذير المراد إزالته')
+                .setMinValue(1)
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('warnings')
+        .setDescription('عرض تحذيرات عضو')
+        .addUserOption(o =>
+            o.setName('user')
+                .setDescription('العضو (الافتراضي: أنت)')
+                .setRequired(false)
+        ),
 ].map(command => command.toJSON());
 
 
@@ -1687,6 +1972,44 @@ client.on('interactionCreate', async interaction => {
 
             const command = interaction.commandName;
 
+
+            // ==========================================
+            // WARNINGS (عرض التحذيرات) - متاح للجميع
+            // ==========================================
+
+            if (command === 'warnings') {
+
+                const requested =
+                    interaction.options.getUser('user') ||
+                    interaction.user;
+
+                const own = requested.id === interaction.user.id;
+
+                // عرض تحذيرات شخص آخر يتطلب رتبة الصلاحيات
+                if (!own) {
+                    const staffOK =
+                        await requireStaffPermission(interaction);
+                    if (staffOK !== true) return staffOK;
+                }
+
+                const warnings = await getWarnings(
+                    interaction.guild.id,
+                    requested.id
+                );
+
+                return interaction.reply({
+                    embeds: [
+                        buildWarningsEmbed(
+                            requested,
+                            warnings,
+                            own
+                        )
+                    ],
+                    ephemeral: !own
+                });
+            }
+
+
             // EVERY SLASH COMMAND = STAFF ROLE ONLY
             const staffOK = await requireStaffPermission(interaction);
             if (staffOK !== true) return staffOK;
@@ -1820,6 +2143,124 @@ client.on('interactionCreate', async interaction => {
 
                 return interaction.reply(
                     `🔨 تم حظر ${user}.\nالسبب: ${reason}`
+                );
+            }
+
+
+            // ==========================================
+            // WARN (تحذير)
+            // ==========================================
+
+            if (command === 'warn') {
+
+                const user = interaction.options.getUser('user');
+                const reason =
+                    (interaction.options.getString('reason') || '')
+                        .trim();
+                const duration =
+                    interaction.options.getString('duration');
+
+                if (!reason) {
+                    return interaction.reply({
+                        content: '❌ اكتب سبب التحذير (السبب مطلوب).',
+                        ephemeral: true
+                    });
+                }
+
+                const member =
+                    await interaction.guild.members.fetch(user.id)
+                        .catch(() => null);
+
+                if (!member) {
+                    return interaction.reply({
+                        content: '❌ العضو غير موجود في السيرفر.',
+                        ephemeral: true
+                    });
+                }
+
+                let expiresAt = null;
+
+                if (duration) {
+                    expiresAt = parseWarningDuration(duration);
+
+                    if (!expiresAt) {
+                        return interaction.reply({
+                            content:
+                                '❌ صيغة المدة غير صحيحة.\n' +
+                                'مثال: `7d` أو `10m` أو تاريخ مثل `2026/6/6`.',
+                            ephemeral: true
+                        });
+                    }
+                }
+
+                const warn = await addWarning({
+                    guildId: interaction.guild.id,
+                    userId: user.id,
+                    moderatorId: interaction.user.id,
+                    reason,
+                    duration: expiresAt
+                });
+
+                const desc =
+                    `⛔ تم تحذير ${user}.\n` +
+                    `رقم التحذير: **#${warn.number}**\n` +
+                    `السبب: **${reason}**\n` +
+                    `بواسطة: <@${warn.moderatorId}>\n` +
+                    `انتهاء التحذير: **${warn.expiresAt ? formatWarnDate(warn.expiresAt) : 'بدون مدة'}**`;
+
+                sendLog(
+                    interaction.guild,
+                    'moderation',
+                    '⚠️ Warning',
+                    desc,
+                    0xED4245
+                );
+
+                return interaction.reply({ content: desc });
+            }
+
+
+            // ==========================================
+            // UNWARN (إزالة تحذير)
+            // ==========================================
+
+            if (command === 'unwarn') {
+
+                const user = interaction.options.getUser('user');
+                const number =
+                    interaction.options.getInteger('number');
+
+                const removed = await removeWarning(
+                    interaction.guild.id,
+                    user.id,
+                    number
+                );
+
+                if (!removed) {
+                    return interaction.reply({
+                        content:
+                            `❌ لا يوجد تحذير رقم **#${number}** للعضو ${user}.`,
+                        ephemeral: true
+                    });
+                }
+
+                const remaining = await getWarnings(
+                    interaction.guild.id,
+                    user.id
+                );
+
+                sendLog(
+                    interaction.guild,
+                    'moderation',
+                    '✅ Warning Removed',
+                    `تم إزالة التحذير **#${number}** عن ${user} بواسطة ${interaction.user}.\n` +
+                    `التحذيرات المتبقية: **${remaining.length}**`,
+                    0x57F287
+                );
+
+                return interaction.reply(
+                    `✅ تم إزالة التحذير رقم **#${number}** عن ${user}.\n` +
+                    `التحذيرات المتبقية: **${remaining.length}**`
                 );
             }
 
@@ -4894,7 +5335,11 @@ async function executeShortcut(
     rawArgs
 ) {
 
-    if (!memberHasStaffRole(message.member, message.guild)) {
+    // عرض التحذيرات مفتوح للجميع، بقية الأوامر تتطلب رتبة
+    if (
+        command !== 'warnings' &&
+        !memberHasStaffRole(message.member, message.guild)
+    ) {
         return message.reply(
             `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** (فوق رتبة البوت) لاستخدام الاختصارات.`
         );
@@ -5103,6 +5548,158 @@ async function executeShortcut(
         return message.reply(
             `⏱️ تم إعطاء ${mention} تايم أوت ${duration}.`
         );
+    }
+
+
+    // ==============================================
+    // WARN (تحذير)
+    // ==============================================
+
+    if (command === 'warn') {
+
+        if (!mention) {
+            return message.reply(
+                '❌ استخدم الاختصار مع منشن العضو.'
+            );
+        }
+
+        // أول كلمة = المنشن، الباقي = السبب + (اختياري) المدة
+        const restTokens = args.slice(1);
+
+        if (!restTokens.length) {
+            return message.reply(
+                '❌ اكتب سبب التحذير بعد المنشن.'
+            );
+        }
+
+        let duration = null;
+        let reasonTokens = restTokens;
+
+        // لو آخِر كلمة على شكل مدة (7d / 10m / 2026/6/6) نعتبرها المدة
+        const lastToken =
+            restTokens[restTokens.length - 1];
+
+        const lastParsed =
+            parseWarningDuration(lastToken);
+
+        if (lastParsed && restTokens.length > 1) {
+            duration = lastParsed;
+            reasonTokens = restTokens.slice(0, -1);
+        }
+
+        const reason = reasonTokens.join(' ').trim();
+
+        if (!reason) {
+            return message.reply(
+                '❌ اكتب سبب التحذير بعد المنشن.'
+            );
+        }
+
+        const warn = await addWarning({
+            guildId: message.guild.id,
+            userId: mention.id,
+            moderatorId: message.author.id,
+            reason,
+            duration
+        });
+
+        sendLog(
+            message.guild,
+            'moderation',
+            '⚠️ Warning',
+            `⛔ تم تحذير ${mention}.\n` +
+            `رقم التحذير: **#${warn.number}**\n` +
+            `السبب: **${reason}**\n` +
+            `بواسطة: ${message.author}\n` +
+            `انتهاء التحذير: **${warn.expiresAt ? formatWarnDate(warn.expiresAt) : 'بدون مدة'}**`,
+            0xED4245
+        );
+
+        return message.reply(
+            `⛔ تم تحذير ${mention} (رقم **#${warn.number}**).\n` +
+            `السبب: **${reason}**`
+        );
+    }
+
+
+    // ==============================================
+    // UNWARN (إزالة تحذير)
+    // ==============================================
+
+    if (command === 'unwarn') {
+
+        if (!mention) {
+            return message.reply(
+                '❌ استخدم الاختصار مع منشن العضو.'
+            );
+        }
+
+        const number = parseInt(args[1], 10);
+
+        if (isNaN(number) || number < 1) {
+            return message.reply(
+                '❌ اكتب رقم التحذير. مثال: `unwarn @فلان 3`'
+            );
+        }
+
+        const removed = await removeWarning(
+            message.guild.id,
+            mention.id,
+            number
+        );
+
+        if (!removed) {
+            return message.reply(
+                `❌ لا يوجد تحذير رقم **#${number}** للعضو ${mention}.`
+            );
+        }
+
+        const remaining = await getWarnings(
+            message.guild.id,
+            mention.id
+        );
+
+        return message.reply(
+            `✅ تم إزالة التحذير **#${number}** عن ${mention}.\n` +
+            `التحذيرات المتبقية: **${remaining.length}**`
+        );
+    }
+
+
+    // ==============================================
+    // WARNINGS (عرض التحذيرات)
+    // ==============================================
+
+    if (command === 'warnings') {
+
+        const target = mention || message.member;
+
+        // عرض تحذيرات شخص آخر يتطلب رتبة الصلاحيات
+        if (
+            mention &&
+            mention.id !== message.author.id &&
+            !memberHasStaffRole(message.member, message.guild)
+        ) {
+            return message.reply(
+                '❌ تحتاج رتبة **' + STAFF_ROLE_NAME +
+                '** لعرض تحذيرات شخص آخر.'
+            );
+        }
+
+        const warnings = await getWarnings(
+            message.guild.id,
+            target.id
+        );
+
+        return message.reply({
+            embeds: [
+                buildWarningsEmbed(
+                    target,
+                    warnings,
+                    target.id === message.author.id
+                )
+            ]
+        });
     }
 
 
