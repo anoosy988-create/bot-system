@@ -1002,14 +1002,14 @@ const slashCommands = [
         .setDescription('إنشاء وإرسال إيمبد مخصص')
         .setDefaultMemberPermissions(ADMIN)
         .addStringOption(o =>
-            o.setName('title')
-                .setDescription('عنوان الإيمبد')
-                .setRequired(false)
-        )
-        .addStringOption(o =>
             o.setName('description')
                 .setDescription('نص الإيمبد (مطلوب)')
                 .setRequired(true)
+        )
+        .addStringOption(o =>
+            o.setName('title')
+                .setDescription('عنوان الإيمبد')
+                .setRequired(false)
         )
         .addStringOption(o =>
             o.setName('color')
