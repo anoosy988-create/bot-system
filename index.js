@@ -474,6 +474,12 @@ const guildSchema = new mongoose.Schema({
         default: new Map()
     },
 
+    // روم الذكاء الاصطناعي (أي رسالة فيه يرد عليها البوت عن البوت فقط)
+    aiChannel: {
+        type: String,
+        default: null
+    },
+
     // عدّاد رقم التحذير لكل سيرفر (يبدأ من 1 ولا يتكرر أبداً)
     warnCounter: {
         type: Number,
@@ -2011,11 +2017,28 @@ const slashCommands = [
 
     new SlashCommandBuilder()
         .setName('ai')
-        .setDescription('اسأل الذكاء الاصطناعي (لصاحب البوت فقط)')
-        .addStringOption(o =>
-            o.setName('message')
-                .setDescription('سؤالك أو رسالتك للذكاء الاصطناعي')
-                .setRequired(true)
+        .setDescription('الذكاء الاصطناعي (لصاحب البوت فقط)')
+        .addSubcommand(sub =>
+            sub.setName('ask')
+                .setDescription('اسأل الذكاء الاصطناعي')
+                .addStringOption(o =>
+                    o.setName('message')
+                        .setDescription('سؤالك أو رسالتك')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(sub =>
+            sub.setName('channel')
+                .setDescription('تحديد روم يرد فيه البوت على الرسائل عن البوت')
+                .addChannelOption(o =>
+                    o.setName('channel')
+                        .setDescription('الروم المخصص للذكاء')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(sub =>
+            sub.setName('off')
+                .setDescription('تعطيل روم الذكاء نهائياً')
         ),
 ].map(command => command.toJSON());
 
@@ -2149,12 +2172,89 @@ client.on('guildCreate', async guild => {
 
 
 // ======================================================
-// AI (الذكاء الاصطناعي عبر OpenAI)
+// AI (الذكاء الاصطناعي: جيمناي أولاً، OpenAI بديل)
 // ======================================================
 
 const AI_MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
 
-async function askAI(prompt) {
+// ترتيب المزودين قابل للتغيير من البيئة:
+// AI_PROVIDER_ORDER=openai,gemini لو بغيت OpenAI الأول
+const AI_PROVIDER_ORDER = process.env.AI_PROVIDER_ORDER || 'gemini,openai';
+
+function getProviderOrder() {
+    const list = String(AI_PROVIDER_ORDER)
+        .split(',')
+        .map(p => p.trim().toLowerCase())
+        .filter(p => p === 'gemini' || p === 'openai');
+
+    return list.length ? list : ['gemini', 'openai'];
+}
+
+async function askGemini(prompt) {
+    const apiKey = process.env.GOOGLE_API_KEY;
+
+    if (!apiKey) {
+        throw new Error('NO_GEMINI_KEY');
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 45000);
+
+    try {
+        const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    contents: [
+                        {
+                            parts: [
+                                {
+                                    text: String(prompt || '')
+                                        .slice(0, 3000)
+                                }
+                            ]
+                        }
+                    ],
+                    generationConfig: {
+                        maxOutputTokens: 1500,
+                        temperature: 0.7
+                    }
+                }),
+                signal: controller.signal
+            }
+        );
+
+        clearTimeout(timer);
+
+        if (!res.ok) {
+            throw new Error(`GEMINI_HTTP_${res.status}`);
+        }
+
+        const data = await res.json();
+        const content =
+            data?.candidates?.[0]?.content?.parts
+                ?.map(part => part.text)
+                .filter(Boolean)
+                .join('')
+                ?.trim();
+
+        if (!content) {
+            throw new Error('GEMINI_EMPTY');
+        }
+
+        return { provider: '🔮 جيمناي', text: content };
+    } catch (error) {
+        clearTimeout(timer);
+        throw error;
+    }
+}
+
+async function askOpenAI(prompt, systemHint) {
     const apiKey = process.env.OPENAI_API_KEY;
 
     if (!apiKey) {
@@ -2174,12 +2274,9 @@ async function askAI(prompt) {
             body: JSON.stringify({
                 model: AI_MODEL,
                 messages: [
-                    {
-                        role: 'system',
-                        content:
-                            'أنت مساعد ذكي خبير في جميع المجالات. أجب باللغة العربية ' +
-                            'بشكل واضح ومفيد ومختصر، وإذا طُلب منك شيء بالكود فأعطه مثلاً عملي.'
-                    },
+                    ...(systemHint
+                        ? [{ role: 'system', content: systemHint }]
+                        : [{ role: 'system', content: 'أنت مساعد ذكي خبير في جميع المجالات. أجب باللغة العربية بشكل واضح ومفيد ومختصر' }]),
                     {
                         role: 'user',
                         content: String(prompt || '').slice(0, 3000)
@@ -2199,10 +2296,95 @@ async function askAI(prompt) {
         const data = await res.json();
         const content = data?.choices?.[0]?.message?.content?.trim();
 
-        return content || '❌ ما رجعت أي إجابة من الذكاء الاصطناعي.';
+        return {
+            provider: '🤖 OpenAI',
+            text: content || '❌ ما رجعت أي إجابة من الذكاء الاصطناعي.'
+        };
     } catch (error) {
         clearTimeout(timer);
         throw error;
+    }
+}
+
+async function askAI(prompt, systemHint) {
+    const providers = getProviderOrder();
+    let lastError = null;
+
+    for (const name of providers) {
+        try {
+            if (name === 'gemini') return await askGemini(prompt);
+            return await askOpenAI(prompt, systemHint);
+        } catch (error) {
+            lastError = error;
+        }
+    }
+
+    throw lastError || new Error('NO_API_KEY');
+}
+
+// ======================================================
+// AI CHANNEL (روم يرد فيه البوت عن البوت فقط)
+// ======================================================
+
+const aiChatCooldowns = new Map();
+
+const AI_CHANNEL_HINT =
+    'أنت مساعد دعم متخصص في بوت "Cypher Security" فقط.\n' +
+    'أجب عن الأسئلة المتعلقة بالبوت حصراً: كيف يشغّل البوت، كيف يضبط السيرفر، ' +
+    'كيف يسوي اللوجات (سجل الأحداث: تحذير/حماية/أوامر)، كيف يضيف رتبة الصلاحية (ستريتر)، ' +
+    'ما هي الأوامر المتوفرة (ban/kick/jail/warn/unwarn/warnings/timeout/role-add/purge/lock/unlock/' +
+    'shortcut/protect/welcome/logs/level/ai...)، كيف يضيف اختصارات، كيف يضبط الحماية من السبام، ' +
+    'كيف يتركب على الاستضافة. إذا سُئلت عن أي شيء آخر غير البوت اعتذر بلطف وقل إنك هنا فقط ' +
+    'لتعليم استخدام البوت. أجب باللغة العربية بوضوح وبإيجاز عملي ومفيد.';
+
+async function handleAIChannelMessage(message) {
+    const key = `${message.guild.id}-${message.author.id}`;
+    const now = Date.now();
+    const last = aiChatCooldowns.get(key) || 0;
+
+    if (now - last < 6000) {
+        const lastNotice = aiChatCooldowns.get(`${key}-notice`) || 0;
+
+        if (now - lastNotice >= 8000) {
+            aiChatCooldowns.set(`${key}-notice`, now);
+            await message.reply('⏳ انتظر شوي، نسولف بهدوء…').catch(() => {});
+        }
+
+        return;
+    }
+
+    aiChatCooldowns.set(key, now);
+
+    const content = (message.content || '').trim().slice(0, 1000);
+
+    if (!content) return;
+
+    try {
+        await message.channel.sendTyping().catch(() => {});
+
+        const result = await askAI(content, AI_CHANNEL_HINT);
+
+        const text = result.provider
+            ? `${result.provider}\n${result.text}`
+            : result.text;
+
+        await message.reply(
+            text.length > 1900 ? text.slice(0, 1900) + '…' : text
+        ).catch(() => {});
+    } catch (error) {
+        const messages = {
+            NO_API_KEY:
+                '❌ ما فيه مفتاح ذكاء مضبوط (OpenAI أو جيمناي). يخبر المالك.',
+            NO_GEMINI_KEY:
+                '❌ OpenAI مضغوط عليه وما فيه مفتاح جيمناي للبديل. يخبر المالك.'
+        };
+
+        await message.reply(
+            messages[error.message] ||
+                (error.name === 'AbortError'
+                    ? '❌ استغرقت الإجابة وقت طويل وتم إلغاء الطلب.'
+                    : '❌ صار خطأ بالذكاء، حاول مرة ثانية.')
+        ).catch(() => {});
     }
 }
 
@@ -2236,18 +2418,80 @@ client.on('interactionCreate', async interaction => {
                     });
                 }
 
+                const sub = interaction.options.getSubcommand();
+
+                // تعيين روم المحادثة التلقائية
+                if (sub === 'channel') {
+                    const channel = interaction.options.getChannel('channel');
+
+                    try {
+                        const settings =
+                            await getSettings(interaction.guild.id);
+
+                        settings.aiChannel = channel.id;
+                        await settings.save();
+
+                        console.log(
+                            `🤖 AI channel set to ${channel.name} in ${interaction.guild.name}`
+                        );
+
+                        return interaction.reply({
+                            content:
+                                `✅ سويت روم الذكاء على **${channel}**.\n` +
+                                'أي رسالة تجي فيه البوت يرد عليها (عن البوت فقط).',
+                            ephemeral: true
+                        });
+                    } catch (error) {
+                        console.error('❌ Failed setting AI channel:', error);
+                        return interaction.reply({
+                            content: '❌ صار خطأ بحفظ الروم، حاول مرة ثانية.',
+                            ephemeral: true
+                        });
+                    }
+                }
+
+                // تعطيل روم المحادثة
+                if (sub === 'off') {
+                    try {
+                        const settings =
+                            await getSettings(interaction.guild.id);
+
+                        settings.aiChannel = null;
+                        await settings.save();
+
+                        console.log(
+                            `🤖 AI channel disabled in ${interaction.guild.name}`
+                        );
+
+                        return interaction.reply({
+                            content: '✅ سويت إيقاف روم الذكاء.',
+                            ephemeral: true
+                        });
+                    } catch (error) {
+                        console.error('❌ Failed disabling AI channel:', error);
+                        return interaction.reply({
+                            content: '❌ صار خطأ بالحفظ، حاول مرة ثانية.',
+                            ephemeral: true
+                        });
+                    }
+                }
+
+                // اسأل الذكاء مباشرة
                 const prompt = interaction.options.getString('message');
 
                 await interaction.deferReply();
 
                 try {
-                    const answer = await askAI(prompt);
+                    const result = await askAI(prompt);
 
-                    // ديسكورد يسمح برسالة 2000 حرف للتذييلات embed و 4096 للنص
+                    const text = result.provider
+                        ? `${result.provider}\n${result.text}`
+                        : result.text;
+
                     const sliced =
-                        answer.length > 3900
-                            ? answer.slice(0, 3900) + '…'
-                            : answer;
+                        text.length > 3900
+                            ? text.slice(0, 3900) + '…'
+                            : text;
 
                     return interaction.editReply(sliced);
                 } catch (error) {
@@ -2256,16 +2500,18 @@ client.on('interactionCreate', async interaction => {
 
                     if (error.message === 'NO_API_KEY') {
                         msg =
-                            '❌ ما فيه مفتاح OpenAI مضبوط.\n' +
-                            'أضف `OPENAI_API_KEY` في إعدادات البيئة بالاستضافة ثم أعد التشغيل.';
+                            '❌ ما فيه مفتاح OpenAI ولا مفتاح جيمناي.\n' +
+                            'أضف `OPENAI_API_KEY` أو `GOOGLE_API_KEY` في البيئة ثم أعد التشغيل.';
+                    } else if (error.message === 'NO_GEMINI_KEY') {
+                        msg =
+                            '❌ ما فيه مفتاح جيمناي `GOOGLE_API_KEY` والبديل `OPENAI_API_KEY` فشل أيضًا.\n' +
+                            'أضف مفتاح جيمناي من aistudio.google.com في البيئة.';
                     } else if (error.message === 'OPENAI_HTTP_401') {
                         msg = '❌ مفتاح OpenAI غير صحيح (401). تأكد من المفتاح.';
-                    } else if (error.message === 'OPENAI_HTTP_429') {
-                        msg =
-                            '❌ رصيد OpenAI خلص أو فيه ضغط عالي (429). حاول لاحقًا.';
-                    } else if (error.message === 'OPENAI_HTTP_402') {
-                        msg =
-                            '❌ حساب OpenAI مطلوب منه دفع (402). أضف رصيد.';
+                    } else if (error.message === 'GEMINI_HTTP_429') {
+                        msg = '❌ جيمناي ضغط عالي (429) والبديل فشل أيضًا. حاول لاحقًا.';
+                    } else if (error.message === 'GEMINI_HTTP_400') {
+                        msg = '❌ مفتاح جيمناي غير صحيح (400). تأكد من المفتاح.';
                     } else if (error.name === 'AbortError') {
                         msg =
                             '❌ استغرقت الإجابة وقت طويل (أكثر من 45 ثانية) وألغينا الطلب.';
@@ -5564,6 +5810,18 @@ client.on('messageCreate', async message => {
 
         const settings =
             await getSettings(message.guild.id);
+
+        // ==============================================
+        // AI CHANNEL (روم الذكاء: يرد عن البوت فقط)
+        // ==============================================
+
+        if (
+            settings.aiChannel &&
+            message.channel.id === settings.aiChannel
+        ) {
+            await handleAIChannelMessage(message);
+            return;
+        }
 
         // ==============================================
         // SPAM PROTECTION (رسائل سريعة / خطوط كبيرة)
