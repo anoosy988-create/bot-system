@@ -311,7 +311,7 @@ const guildSchema = new mongoose.Schema({
 
     aiProvider: {
         type: String,
-        default: 'groq'
+        default: 'gemini'
     },
 
     aiSystemPrompt: {
@@ -368,7 +368,18 @@ const guildSchema = new mongoose.Schema({
             timeframe: { type: Number, default: 5000 },
             maxLength: { type: Number, default: 400 },
             repeatedChar: { type: Number, default: 8 },
-            action: { type: String, default: 'kick' }
+            action: { type: String, default: 'timeout' }
+        }
+    },
+
+    autoRole: {
+        enabled: {
+            type: Boolean,
+            default: false
+        },
+        roleId: {
+            type: String,
+            default: null
         }
     }
 });
@@ -467,6 +478,20 @@ function sanitizeSettings(settings) {
         }
     } catch {}
 
+    // autoRole: التأكد من وجوده بالشكل الصحيح
+    const ar = settings.autoRole;
+
+    if (!ar || typeof ar !== 'object' || Array.isArray(ar) ||
+        ar.enabled === undefined || ar.roleId === undefined) {
+
+        settings.autoRole = {
+            enabled: !ar ? false : (ar.enabled === undefined ? false : !!ar.enabled),
+            roleId: !ar ? null : (ar.roleId === undefined || ar.roleId === null ? null : String(ar.roleId))
+        };
+        settings.markModified('autoRole');
+        changed = true;
+    }
+
     return changed;
 }
 
@@ -549,10 +574,17 @@ async function getSettings(guildId) {
 
 
 // ======================================================
-// AI PROVIDERS (Groq / Claude / OpenAI / DeepSeek)
+// AI PROVIDERS (Gemini أساسي / Groq / Claude / OpenAI / DeepSeek)
 // ======================================================
 
+
+
 const AI_PROVIDERS = {
+    gemini: {
+        model: 'gemini-2.0-flash',
+        url: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
+        key: GEMINI_API_KEY
+    },
     groq: {
         model: 'llama-3.3-70b-versatile',
         url: 'https://api.groq.com/openai/v1/chat/completions',
@@ -578,11 +610,54 @@ const AI_PROVIDERS = {
 // منع إرسال إجابة الذكاء لكل رسالة (عشر ثوان لكل عضو)
 const aiCooldowns = new Map();
 
-async function generateAI(provider = 'groq', systemPrompt, prompt) {
+async function generateAI(provider = 'gemini', systemPrompt, prompt) {
     const cfg = AI_PROVIDERS[provider];
 
     if (!cfg) {
         throw new Error('مزود الذكاء الاصطناعي غير مدعوم.');
+    }
+
+    if (provider === 'gemini') {
+        try {
+            const endpoint =
+                `${cfg.url}?key=${encodeURIComponent(cfg.key)}`;
+
+            const res = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json'
+                },
+                body: JSON.stringify({
+                    systemInstruction: systemPrompt
+                        ? { parts: [{ text: systemPrompt }] }
+                        : undefined,
+                    contents: [
+                        { parts: [{ text: prompt }] }
+                    ],
+                    generationConfig: { maxOutputTokens: 1024 }
+                })
+            });
+
+            if (!res.ok) {
+                throw new Error(
+                    `Gemini API: ${res.status} ${await res.text()}`
+                );
+            }
+
+            const data = await res.json();
+
+            return (data?.candidates?.[0]?.content?.parts || [])
+                .map(part => part.text || '')
+                .join('')
+                .trim();
+        } catch (geminiError) {
+            // OpenAI كاحتياطي لـ Gemini
+            if (process.env.OPENAI_API_KEY) {
+                return generateAI('openai', systemPrompt, prompt);
+            }
+
+            throw geminiError;
+        }
     }
 
     if (provider === 'claude') {
@@ -736,6 +811,16 @@ const protectionCounts = {
     spam: new Map()
 };
 
+// عدّاد تحذيرات السبام لكل عضو (قبل تطبيق Time-out)
+// { count, last }
+const spamWarnCounts = new Map();
+
+// فترة صلاحية التحذيرين (لو ما كرر السبام خلالها يصفّر العدّاد)
+const SPAM_WARN_WINDOW = 10 * 60 * 1000;
+
+// مدة الـ Time-out عند تجاوز التحذيرين
+const SPAM_TIMEOUT_MS = 10 * 60 * 1000;
+
 function recordEvent(counterKey, guildId, userId) {
     const key = `${guildId}-${userId}`;
     return key;
@@ -782,6 +867,10 @@ async function applyPunishment(member, action, reason) {
             if (member.bannable) await member.ban({ reason: fullReason });
         } else if (action === 'kick') {
             if (member.kickable) await member.kick(fullReason);
+        } else if (action === 'timeout') {
+            if (member.moderatable) {
+                await member.timeout(SPAM_TIMEOUT_MS, fullReason);
+            }
         } else if (action === 'removeroles') {
             const removable = member.roles.cache.filter(
                 role => role.id !== member.guild.id && role.editable
@@ -802,6 +891,7 @@ async function getMember(guild, userId) {
 const PROTECTION_ACTIONS = [
     { name: '🔨 Ban', value: 'ban' },
     { name: '👢 Kick', value: 'kick' },
+    { name: '🔇 Time-out (10 دقائق)', value: 'timeout' },
     { name: '🎭 إزالة كل الرتب', value: 'removeroles' }
 ];
 
@@ -810,8 +900,11 @@ const DEFAULT_PROTECTIONS = {
     roles: { enabled: false, limit: 5, timeframe: 60000, action: 'ban' },
     bans: { enabled: false, limit: 3, timeframe: 60000, action: 'kick' },
     bots: { enabled: false },
-spam: { enabled: false, limit: 5, timeframe: 5000, maxLength: 400, repeatedChar: 8, action: 'kick' }
+    spam: { enabled: false, limit: 5, timeframe: 5000, maxLength: 400, repeatedChar: 8, action: 'timeout' }
 };
+
+// سيرفرات تم تحويل عقوبة السبام القديمة (kick) إلى Timeout — مرة واحدة فقط
+const migratedSpamActions = new Set();
 
 function ensureProtections(settings) {
     if (!settings.protections) {
@@ -826,6 +919,24 @@ function ensureProtections(settings) {
             );
         }
     }
+
+    // تحويل القيمة القديمة الافتراضية (kick) إلى Timeout — مرة واحدة لكل سيرفر
+    try {
+        const spam = settings.protections.spam;
+        const id = settings._id;
+
+        if (
+            spam &&
+            spam.action === 'kick' &&
+            id &&
+            !migratedSpamActions.has(id)
+        ) {
+            migratedSpamActions.add(id);
+            spam.action = 'timeout';
+            settings.markModified('protections.spam');
+            settings.save().catch(() => {});
+        }
+    } catch {}
 
     return settings.protections;
 }
@@ -886,13 +997,48 @@ async function handleSpam(message, prot) {
 
     if (!reason) return false;
 
-    const action = prot.action || 'kick';
+    const action = prot.action || 'timeout';
 
     await message.delete().catch(() => {});
 
+    // ==============================================
+    // التحذيرين قبل تطبيق العقوبة (Timeout)
+    // ==============================================
+
+    const warnKey = `${message.guild.id}-${message.author.id}`;
+    const now = Date.now();
+    const prev = spamWarnCounts.get(warnKey);
+
+    let warnCount = (prev && now - prev.last <= SPAM_WARN_WINDOW)
+        ? prev.count + 1
+        : 1;
+
+    spamWarnCounts.set(warnKey, { count: warnCount, last: now });
+
+    // التحذير الأول والثاني فقط — بدون عقوبة بعد
+    if (warnCount <= 2) {
+        try {
+            await message.reply(
+                `⚠️ ${message.author} **تحذير ${warnCount} من 2** — توقف عن السبام! (${reason})`
+            ).catch(() => {});
+        } catch {}
+
+        await sendLog(
+            message.guild,
+            'moderation',
+            '🛡️ Spam Warning',
+            `${message.author} تحذير **${warnCount}/2** للسبام: ${reason}`
+        );
+
+        return true;
+    }
+
+    // وصل للتحذير الثالث: تطبيق العقوبة
+    spamWarnCounts.delete(warnKey);
+
     try {
         await message.reply(
-            `🚫 ${message.author} توقف عن السبام! (${reason})`
+            `🚫 ${message.author} وصلت للحد — تطبيق العقوبة. (${reason})`
         ).catch(() => {});
     } catch {}
 
@@ -907,7 +1053,7 @@ async function handleSpam(message, prot) {
         'moderation',
         '🛡️ Spam Protection',
         `${message.author} سبب السبام: ${reason}\n` +
-        `العقوبة: **${action}**`
+        `التحذيرات: **2** | العقوبة: **${action === 'timeout' ? 'Time-out (10 دقائق)' : action}**`
     );
 
     return true;
@@ -1252,6 +1398,7 @@ const slashCommands = [
                 .setDescription('مزود الذكاء الاصطناعي')
                 .setRequired(true)
                 .addChoices(
+                    { name: '✨ Gemini', value: 'gemini' },
                     { name: '🤖 Groq', value: 'groq' },
                     { name: '🧠 Claude', value: 'claude' },
                     { name: '🟢 OpenAI', value: 'openai' },
@@ -1440,6 +1587,28 @@ const slashCommands = [
         ),
 
     new SlashCommandBuilder()
+        .setName('autorole')
+        .setDescription('إعداد الرتبة التلقائية للعضو الجديد')
+
+        .addSubcommand(sub =>
+            sub.setName('set')
+                .setDescription('تحديد رتبة تُعطى تلقائياً لأي عضو جديد')
+                .addRoleOption(o =>
+                    o.setName('role')
+                        .setDescription('الرتبة التي تُعطى عند الدخول')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(sub =>
+            sub.setName('off')
+                .setDescription('إيقاف الرتبة التلقائية')
+        )
+        .addSubcommand(sub =>
+            sub.setName('status')
+                .setDescription('حالة الرتبة التلقائية')
+        ),
+
+    new SlashCommandBuilder()
         .setName('setchat')
         .setDescription('تعيين روم الذكاء الاصطناعي')
         
@@ -1454,6 +1623,7 @@ const slashCommands = [
                 .setDescription('مزود الذكاء الاصطناعي')
                 .setRequired(false)
                 .addChoices(
+                    { name: 'Gemini', value: 'gemini' },
                     { name: 'Groq', value: 'groq' },
                     { name: 'Claude', value: 'claude' },
                     { name: 'OpenAI', value: 'openai' },
@@ -1481,6 +1651,7 @@ const slashCommands = [
                 .setDescription('مزود الذكاء الاصطناعي')
                 .setRequired(false)
                 .addChoices(
+                    { name: 'Gemini', value: 'gemini' },
                     { name: 'Groq', value: 'groq' },
                     { name: 'Claude', value: 'claude' },
                     { name: 'OpenAI', value: 'openai' },
@@ -1772,11 +1943,26 @@ client.on('interactionCreate', async interaction => {
 
         if (interaction.isChatInputCommand()) {
 
-            // EVERY SLASH COMMAND = STAFF ROLE ONLY
-            const staffOK = await requireStaffPermission(interaction);
-            if (staffOK !== true) return staffOK;
-
             const command = interaction.commandName;
+
+            // أوامر الذكاء الاصطناعي مخصصة لمالك البوت فقط
+            if (['ai', 'setchat', 'setcode'].includes(command)) {
+
+                if (!isOwner(interaction.user.id)) {
+                    return interaction.reply({
+                        content:
+                            '❌ أوامر الذكاء الاصطناعي مخصصة مالك البوت فقط.',
+                        ephemeral: true
+                    });
+                }
+
+            } else {
+
+                // EVERY OTHER SLASH COMMAND = STAFF ROLE ONLY
+                const staffOK = await requireStaffPermission(interaction);
+                if (staffOK !== true) return staffOK;
+
+            }
 
 
             // ==========================================
@@ -2805,6 +2991,75 @@ client.on('interactionCreate', async interaction => {
 
 
             // ==========================================
+            // AUTO ROLE
+            // ==========================================
+
+            if (command === 'autorole') {
+
+                const settings =
+                    await getSettings(interaction.guild.id);
+
+                const sub =
+                    interaction.options.getSubcommand();
+
+                if (sub === 'set') {
+
+                    const role =
+                        interaction.options.getRole('role');
+
+                    // الرتبة لازم تكون تحت رتبة البوت حتى يقدّر يعطيها
+                    const botHighest =
+                        interaction.guild.members.me?.roles?.highest;
+
+                    if (botHighest && role.position >= botHighest.position) {
+                        return interaction.reply({
+                            content:
+                                `❌ الرتبة ${role} لازم تكون **تحت** رتبة البوت حتى يقدر البوت يعطيها للأعضاء.`,
+                            ephemeral: true
+                        });
+                    }
+
+                    settings.autoRole.enabled = true;
+                    settings.autoRole.roleId = role.id;
+                    await settings.save();
+
+                    return interaction.reply({
+                        content:
+                            `✅ الرتبة التلقائية مفعّلة.\n` +
+                            `🛡️ أي عضو جديد يدخل السيرفر بيحصل على ${role}.`,
+                        ephemeral: true
+                    });
+                }
+
+                if (sub === 'off') {
+
+                    settings.autoRole.enabled = false;
+                    await settings.save();
+
+                    return interaction.reply({
+                        content:
+                            `⛔ تم إيقاف الرتبة التلقائية.`,
+                        ephemeral: true
+                    });
+                }
+
+                // status
+                const autoRole = settings.autoRole;
+
+                const autoRoleRole = autoRole.roleId
+                    ? interaction.guild.roles.cache.get(autoRole.roleId)
+                    : null;
+
+                return interaction.reply({
+                    content:
+                        `🛡️ الرتبة التلقائية: **${autoRole.enabled ? 'مفعّلة ✅' : 'متوقفة ❌'}**\n` +
+                        `🎭 الرتبة: ${autoRoleRole ? autoRoleRole.toString() : 'غير محددة'}`,
+                    ephemeral: true
+                });
+            }
+
+
+            // ==========================================
             // SET CHAT
             // ==========================================
 
@@ -2831,7 +3086,7 @@ client.on('interactionCreate', async interaction => {
 
                 const effectiveProvider =
                     provider || settings.aiChatProvider ||
-                    settings.aiProvider || 'groq';
+                    settings.aiProvider || 'gemini';
 
                 return interaction.reply(
                     `🤖 تم تعيين ${channel} لروم الذكاء الاصطناعي.\n` +
@@ -2867,7 +3122,7 @@ client.on('interactionCreate', async interaction => {
 
                 const effectiveProvider =
                     provider || settings.aiCodeProvider ||
-                    settings.aiProvider || 'groq';
+                    settings.aiProvider || 'gemini';
 
                 return interaction.reply(
                     `💻 تم تعيين ${channel} لروم الأكواد.\n` +
@@ -3126,10 +3381,15 @@ client.on('interactionCreate', async interaction => {
 
                     const spamProt = settings.protections.spam;
 
+                    const spamActionLabel =
+                        spamProt.action === 'timeout'
+                            ? '🔇 Time-out (بعد تحذيرين)'
+                            : spamProt.action;
+
                     const spamDesc = `**${spamProt.enabled ? '✅ مفعلة' : '❌ متوقفة'}**\n` +
                         `الحد: **${spamProt.limit}** | الفترة: **${Math.round(spamProt.timeframe / 1000)} ث**\n` +
                         `أقصى طول: **${spamProt.maxLength}** | تكرار الحرف: **${spamProt.repeatedChar}**\n` +
-                        `العقوبة: **${spamProt.action}**`;
+                        `العقوبة: **${spamActionLabel}**`;
 
                     return interaction.reply({
                         embeds: [
@@ -3927,6 +4187,45 @@ client.on('guildMemberAdd', async member => {
                     `البوت **${member.user.tag}** دخل السيرفر.\n` +
                     `المسبب: <@${inviter.id}> (أعلى من رتبة البوت ${refRole})`
                 );
+            }
+        }
+
+        // ==============================================
+        // الرتبة التلقائية للعضو الجديد
+        // ==============================================
+
+        if (
+            !member.user.bot &&
+            settings.autoRole &&
+            settings.autoRole.enabled &&
+            settings.autoRole.roleId
+        ) {
+
+            const autoRole = member.guild.roles.cache.get(
+                settings.autoRole.roleId
+            );
+
+            if (
+                autoRole &&
+                member.manageable &&
+                !member.roles.cache.has(autoRole.id)
+            ) {
+
+                await member.roles
+                    .add(autoRole, 'Auto Role')
+                    .then(() => {
+
+                        sendLog(
+                            member.guild,
+                            'member',
+                            '🎭 Auto Role',
+                            `تم منح ${member} رتبة ${autoRole}.`
+                        );
+
+                    })
+                    .catch(error => {
+                        console.error('Auto role error:', error);
+                    });
             }
         }
 
@@ -4876,8 +5175,8 @@ client.on('messageCreate', async message => {
             await message.channel.sendTyping().catch(() => {});
 
             const provider = isAiCode
-                ? (settings.aiCodeProvider || settings.aiProvider || 'groq')
-                : (settings.aiChatProvider || settings.aiProvider || 'groq');
+                ? (settings.aiCodeProvider || settings.aiProvider || 'gemini')
+                : (settings.aiChatProvider || settings.aiProvider || 'gemini');
 
             const fallbackSystem =
                 'You are a helpful assistant running inside a Discord server. Answer in the same language the user writes in. Be clear, friendly and concise.';
