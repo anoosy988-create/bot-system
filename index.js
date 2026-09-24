@@ -106,7 +106,8 @@ function isAdmin(interaction) {
     return memberHasStaffRole(interaction.member, interaction.guild);
 }
 
-// فحص كامل لاستخدام الأوامر مع رسائل توضيحية
+// فحص امتلاك رتبة الستريتر فقط (بدون شرط رفعها فوق البوت)
+// تُستخدم لمعظم الأوامر الإدارية.
 async function requireStaffPermission(interaction) {
     if (isOwner(interaction.user.id)) return true;
 
@@ -128,7 +129,7 @@ async function requireStaffPermission(interaction) {
     if (!staffRole) {
         return replyContent(
             `❌ ما فيه رتبة **${STAFF_ROLE_NAME}** في السيرفر.\n` +
-            `أنشئها واجعلها **فوق** رتبة البوت حتى تشتغل الأوامر.`
+            `أنشئها في إعدادات السيرفر حتى تشتغل الأوامر.`
         );
     }
 
@@ -138,11 +139,46 @@ async function requireStaffPermission(interaction) {
         );
     }
 
+    return true;
+}
+
+// فحص صارم لأوامر الحماية: رتبة الستريتر لازم تكون فوق رتبة البوت
+async function requireProtectionPermission(interaction) {
+    if (isOwner(interaction.user.id)) return true;
+
+    const member = interaction.member;
+    const guild = interaction.guild;
+
+    const replyContent = async content => {
+        const options = { content, ephemeral: true };
+
+        if (interaction.replied || interaction.deferred) {
+            return interaction.followUp(options);
+        }
+
+        return interaction.reply(options);
+    };
+
+    const staffRole = getStaffRole(guild);
+
+    if (!staffRole) {
+        return replyContent(
+            `❌ ما فيه رتبة **${STAFF_ROLE_NAME}** في السيرفر.\n` +
+            `أنشئها واجعلها **فوق** رتبة البوت حتى تشتغل أوامر الحماية.`
+        );
+    }
+
+    if (!memberHasStaffRole(member, guild)) {
+        return replyContent(
+            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام أوامر الحماية.`
+        );
+    }
+
     const botHighest = guild?.members?.me?.roles?.highest;
 
     if (botHighest && staffRole.position <= botHighest.position) {
         return replyContent(
-            `❌ رتبة **${STAFF_ROLE_NAME}** لازم تكون **فوق** رتبة البوت.\n` +
+            `❌ لأوامر الحماية رتبة **${STAFF_ROLE_NAME}** لازم تكون **فوق** رتبة البوت.\n` +
             `من إعدادات السيرفر: Roles = ارفع رتبة **${STAFF_ROLE_NAME}** فوق رتبة البوت ثم أعد المحاولة.`
         );
     }
@@ -1883,7 +1919,7 @@ client.once('ready', async () => {
     }
 
     console.log(
-        '🔐 جميع Slash Commands تتطلب رتبة ' + STAFF_ROLE_NAME + ' (فوق رتبة البوت)'
+        '🔐 أوامر الحماية تتطلب رتبة ' + STAFF_ROLE_NAME + ' **فوق** رتبة البوت — باقي الأوامر تكفي رتبة ' + STAFF_ROLE_NAME + ' فقط'
     );
 });
 
@@ -1913,8 +1949,16 @@ client.on('interactionCreate', async interaction => {
 
             const command = interaction.commandName;
 
-            // EVERY SLASH COMMAND = STAFF ROLE ONLY
-            const staffOK = await requireStaffPermission(interaction);
+            // أوامر الحماية = رتبة ستريتر لازم تكون فوق رتبة البوت
+            // باقي الأوامر = رتبة ستريتر فقط
+            const isProtectionCommand =
+                command === 'protect' ||
+                command === 'whitelist';
+
+            const staffOK = isProtectionCommand
+                ? await requireProtectionPermission(interaction)
+                : await requireStaffPermission(interaction);
+
             if (staffOK !== true) return staffOK;
 
 
