@@ -2695,10 +2695,10 @@ const slashCommands = [
         ),
     new SlashCommandBuilder()
         .setName('backup')
-        .setDescription('Save everything in this server (channels, roles, permissions). Use /restore to bring it all back after a hack.'),
+        .setDescription('Save everything in this server (channels, roles). Use /restore after a hack.'),
     new SlashCommandBuilder()
         .setName('restore')
-        .setDescription('Restore everything from the last backup. OWNER ONLY — recreates deleted channels/roles and removes sabotage.'),
+        .setDescription('Restore from last backup. OWNER ONLY - recreates deleted channels/roles.'),
 ].map(command => command.toJSON());
 
 
