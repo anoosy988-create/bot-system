@@ -77,10 +77,6 @@ const client = new Client({
 // HELPERS
 // ======================================================
 
-function isOwner(userId) {
-    return userId === OWNER_ID;
-}
-
 // الرتبة المخوّلة لاستخدام الأوامر (يجب أن تكون فوق رتبة البوت)
 const STAFF_ROLE_NAME = process.env.STAFF_ROLE_NAME || 'ستريتر';
 
@@ -91,10 +87,32 @@ function getStaffRole(guild) {
     ) || null;
 }
 
+// هل العضو يملك صلاحية إدارية حقيقية في السيرفر؟
+// (مالك السيرفر / صلاحية Administrator / رتبته فوق رتبة البوت)
+function isServerAdmin(member, guild) {
+    if (!member || !guild) return false;
+    if (member.id === guild.ownerId) return true;
+    if (member.permissions?.has(PermissionsBitField.Flags.Administrator)) return true;
+
+    const botHighest = guild?.members?.me?.roles?.highest;
+
+    if (botHighest && member.roles?.highest?.position > botHighest.position) {
+        return true;
+    }
+
+    return false;
+}
+
+// هل العضو يملك صلاحية استخدام أوامر الإدارة؟
+// (رتبة الستريتر أو صلاحية إدارية حقيقية — بدون تجاوز أعمى لأي آيدي)
+function hasStaffAccess(member, guild) {
+    if (!member || !guild) return false;
+    return memberHasStaffRole(member, guild) || isServerAdmin(member, guild);
+}
+
 // هل العضو يملك رتبة الصلاحيات؟
 function memberHasStaffRole(member, guild) {
     if (!member || !guild) return false;
-    if (member.id === OWNER_ID) return true;
 
     const staffRole = getStaffRole(guild);
     if (!staffRole) return false;
@@ -103,16 +121,16 @@ function memberHasStaffRole(member, guild) {
 }
 
 function isAdmin(interaction) {
-    return memberHasStaffRole(interaction.member, interaction.guild);
+    return hasStaffAccess(interaction.member, interaction.guild);
 }
 
 // فحص امتلاك رتبة الستريتر فقط (بدون شرط رفعها فوق البوت)
 // تُستخدم لمعظم الأوامر الإدارية.
 async function requireStaffPermission(interaction) {
-    if (isOwner(interaction.user.id)) return true;
-
     const member = interaction.member;
     const guild = interaction.guild;
+
+    if (isServerAdmin(member, guild)) return true;
 
     const replyContent = async content => {
         const options = { content, ephemeral: true };
@@ -144,10 +162,10 @@ async function requireStaffPermission(interaction) {
 
 // فحص صارم لأوامر الحماية: رتبة الستريتر لازم تكون فوق رتبة البوت
 async function requireProtectionPermission(interaction) {
-    if (isOwner(interaction.user.id)) return true;
-
     const member = interaction.member;
     const guild = interaction.guild;
+
+    if (isServerAdmin(member, guild)) return true;
 
     const replyContent = async content => {
         const options = { content, ephemeral: true };
@@ -5447,7 +5465,12 @@ client.on('messageCreate', async message => {
 
         if (pendingLog) {
 
-            if (
+            const stillStaff =
+                hasStaffAccess(message.member, message.guild);
+
+            if (!stillStaff) {
+                pendingLogChannelSet.delete(message.author.id);
+            } else if (
                 Date.now() > pendingLog.expires ||
                 message.guild.id !== pendingLog.guildId
             ) {
@@ -5495,8 +5518,7 @@ client.on('messageCreate', async message => {
         const spamProt = ensureProtections(settings).spam;
 
         const isStaff =
-            isOwner(message.author.id) ||
-            memberHasStaffRole(message.member, message.guild);
+            hasStaffAccess(message.member, message.guild);
 
         if (spamProt.enabled && !isStaff) {
             const punished = await handleSpam(message, spamProt);
@@ -5591,7 +5613,7 @@ client.on('messageCreate', async message => {
 
                 if (
                     auto.staffOnly &&
-                    !memberHasStaffRole(
+                    !hasStaffAccess(
                         message.member,
                         message.guild
                     )
@@ -5713,7 +5735,7 @@ async function executeShortcut(
     rawArgs
 ) {
 
-    if (!memberHasStaffRole(message.member, message.guild)) {
+    if (!hasStaffAccess(message.member, message.guild)) {
         return message.reply(
             `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام الاختصارات.`
         );
