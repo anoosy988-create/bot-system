@@ -258,6 +258,11 @@ const guildSchema = new mongoose.Schema({
         message: {
             type: String,
             default: null
+        },
+
+        protection: {
+            type: String,
+            default: null
         }
     },
 
@@ -303,19 +308,16 @@ const guildSchema = new mongoose.Schema({
         channels: {
             enabled: { type: Boolean, default: false },
             limit: { type: Number, default: 5 },
-            timeframe: { type: Number, default: 60000 },
             action: { type: String, default: 'ban' }
         },
         roles: {
             enabled: { type: Boolean, default: false },
             limit: { type: Number, default: 5 },
-            timeframe: { type: Number, default: 60000 },
             action: { type: String, default: 'ban' }
         },
         bans: {
             enabled: { type: Boolean, default: false },
             limit: { type: Number, default: 3 },
-            timeframe: { type: Number, default: 60000 },
             action: { type: String, default: 'kick' }
         },
         bots: {
@@ -332,7 +334,12 @@ const guildSchema = new mongoose.Schema({
         webhooks: {
             enabled: { type: Boolean, default: false },
             limit: { type: Number, default: 5 },
-            timeframe: { type: Number, default: 60000 },
+            action: { type: String, default: 'ban' }
+        },
+        invites: {
+            enabled: { type: Boolean, default: false },
+            code: { type: String, default: null },
+            channelId: { type: String, default: null },
             action: { type: String, default: 'ban' }
         }
     },
@@ -670,6 +677,19 @@ function isLimitExceeded(counter, key, now, limit, timeframe) {
     return list.length > limit;
 }
 
+// عدّاد تراكمي بدون فترة زمنية:
+// أي تجاوز للحد يتعاقب عليه حتى لو كان على مدى ساعات
+function countExceeded(counter, key, limit) {
+    const count = (counter.get(key) || 0) + 1;
+    counter.set(key, count);
+    return count > limit;
+}
+
+// تصفير عدّاد المخالف بعد تطبيق العقوبة (حتى لا يتراكم في الذاكرة)
+function clearCount(counter, key) {
+    counter.delete(key);
+}
+
 async function applyPunishment(member, action, reason) {
     if (!member) return;
 
@@ -775,21 +795,18 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
         if (check.allowed) return;
 
         // ==========================================
-        // إنشاء ويب هوك: نحدّ عدد المسموح خلال الفترة
+        // إنشاء ويب هوك: نحدّ العدد المسموح تراكمياً
+        // (أي تجاوز للحد حتى لو على مدى ساعات = عقوبة)
         // ==========================================
         if (auditType === AuditLogEvent.WebhookCreate) {
 
-            const now = Date.now();
             const key = `${guild.id}-${executorId}`;
-            const timeframe = prot.timeframe || 60000;
             const limit = prot.limit || 5;
 
-            const exceeded = isLimitExceeded(
+            const exceeded = countExceeded(
                 protectionCounts.webhooks,
                 key,
-                now,
-                limit,
-                timeframe
+                limit
             );
 
             // ضمن الحد المسموح: لا نتدخل
@@ -798,7 +815,7 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
                     guild,
                     'moderation',
                     '🛡️ Webhook Created (Within Limit)',
-                    `<@${executorId}> أنشأ ويب هوك — ضمن الحد المسموح (**${limit}** خلال ${Math.round(timeframe / 1000)} ث).`
+                    `<@${executorId}> أنشأ ويب هوك — ضمن الحد المسموح (**${limit}**).`
                 );
                 return;
             }
@@ -813,6 +830,8 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
                     `تجاوز حد إنشاء الويب هوك (${limit})`
                 );
             }
+
+            clearCount(protectionCounts.webhooks, key);
 
             await sendLog(
                 guild,
@@ -860,12 +879,13 @@ const PROTECTION_ACTIONS = [
 ];
 
 const DEFAULT_PROTECTIONS = {
-    channels: { enabled: false, limit: 5, timeframe: 60000, action: 'ban' },
-    roles: { enabled: false, limit: 5, timeframe: 60000, action: 'ban' },
-    bans: { enabled: false, limit: 3, timeframe: 60000, action: 'kick' },
+    channels: { enabled: false, limit: 5, action: 'ban' },
+    roles: { enabled: false, limit: 5, action: 'ban' },
+    bans: { enabled: false, limit: 3, action: 'kick' },
     bots: { enabled: false },
     spam: { enabled: false, limit: 5, timeframe: 5000, maxLength: 400, repeatedChar: 8, action: 'timeout' },
-    webhooks: { enabled: false, limit: 5, timeframe: 60000, action: 'ban' }
+    webhooks: { enabled: false, limit: 5, action: 'ban' },
+    invites: { enabled: false, code: null, channelId: null, action: 'ban' }
 };
 
 // سيرفرات تم تحويل عقوبة السبام القديمة (kick) إلى Timeout — مرة واحدة فقط
@@ -1569,15 +1589,9 @@ const slashCommands = [
                 )
                 .addIntegerOption(o =>
                     o.setName('limit')
-                        .setDescription('الحد الأقصى لإنشاء الرومات خلال الفترة')
+                        .setDescription('إجمالي عدد الرومات المسموح إنشاؤها (أي تجاوز = عقوبة)')
                         .setMinValue(1)
                         .setMaxValue(50)
-                )
-                .addIntegerOption(o =>
-                    o.setName('duration')
-                        .setDescription('الفترة الزمنية بالثواني')
-                        .setMinValue(5)
-                        .setMaxValue(3600)
                 )
                 .addStringOption(o =>
                     o.setName('action')
@@ -1595,15 +1609,9 @@ const slashCommands = [
                 )
                 .addIntegerOption(o =>
                     o.setName('limit')
-                        .setDescription('الحد الأقصى لإنشاء الرتب خلال الفترة')
+                        .setDescription('إجمالي عدد الرتب المسموح إنشاؤها (أي تجاوز = عقوبة)')
                         .setMinValue(1)
                         .setMaxValue(50)
-                )
-                .addIntegerOption(o =>
-                    o.setName('duration')
-                        .setDescription('الفترة الزمنية بالثواني')
-                        .setMinValue(5)
-                        .setMaxValue(3600)
                 )
                 .addStringOption(o =>
                     o.setName('action')
@@ -1621,15 +1629,9 @@ const slashCommands = [
                 )
                 .addIntegerOption(o =>
                     o.setName('limit')
-                        .setDescription('الحد الأقصى لعمليات الحظر خلال الفترة')
+                        .setDescription('إجمالي عدد عمليات الحظر المسموحة (أي تجاوز = عقوبة)')
                         .setMinValue(1)
                         .setMaxValue(50)
-                )
-                .addIntegerOption(o =>
-                    o.setName('duration')
-                        .setDescription('الفترة الزمنية بالثواني')
-                        .setMinValue(5)
-                        .setMaxValue(3600)
                 )
                 .addStringOption(o =>
                     o.setName('action')
@@ -1694,20 +1696,34 @@ const slashCommands = [
                 )
                 .addIntegerOption(o =>
                     o.setName('limit')
-                        .setDescription('عدد الويب هوك المسموح إنشاؤها خلال الفترة')
+                        .setDescription('إجمالي عدد الويب هوك المسموح إنشاؤها (أي تجاوز = عقوبة)')
                         .setMinValue(1)
                         .setMaxValue(50)
-                )
-                .addIntegerOption(o =>
-                    o.setName('duration')
-                        .setDescription('الفترة الزمنية بالثواني')
-                        .setMinValue(5)
-                        .setMaxValue(3600)
                 )
                 .addStringOption(o =>
                     o.setName('action')
                         .setDescription('العقوبة عند المخالف (تحت رتبة البوت)')
                         .addChoices(...PROTECTION_ACTIONS)
+                )
+        )
+        .addSubcommand(sub =>
+            sub.setName('invites')
+                .setDescription('حماية اختصار السيرفر (Invite) — أي أحد يشيله يتعاقب')
+                .addBooleanOption(o =>
+                    o.setName('enabled')
+                        .setDescription('تفعيل الحماية')
+                        .setRequired(true)
+                )
+                .addStringOption(o =>
+                    o.setName('code')
+                        .setDescription('الاختصار المراد حمايته (مثل timam)')
+                        .setRequired(false)
+                )
+                .addChannelOption(o =>
+                    o.setName('channel')
+                        .setDescription('قناة لإنشاء اختصار جديد وحمايته (إن لم يوجد اختصار بالسيرفر)')
+                        .addChannelTypes(ChannelType.GuildText)
+                        .setRequired(false)
                 )
         )
         .addSubcommand(sub =>
@@ -2787,6 +2803,13 @@ client.on('interactionCreate', async interaction => {
                                         emoji: '💬',
                                         description:
                                             'سجلات الرسائل'
+                                    },
+                                    {
+                                        label: 'Protection Logs',
+                                        value: 'protection',
+                                        emoji: '🛡️',
+                                        description:
+                                            'سجلات الحماية (أنتي-نوك... إلخ)'
                                     }
                                 ])
                         );
@@ -3181,7 +3204,7 @@ client.on('interactionCreate', async interaction => {
                                 .setDescription(
                                     `الحالة: **${enabled ? 'مفعلة ✅' : 'متوقفة ❌'}**\n` +
                                     `الحد المسموح: **${prot.limit}**\n` +
-                                    `الفترة: **${Math.round(prot.timeframe / 1000)} ثانية**\n` +
+                                    (sub === 'spam' ? `الفترة: **${Math.round(prot.timeframe / 1000)} ثانية**\n` : '') +
                                     `العقوبة عند التجاوز: **${prot.action}**${spamExtra}`
                                 )
                         ]
@@ -3204,11 +3227,110 @@ client.on('interactionCreate', async interaction => {
                     );
                 }
 
+                if (sub === 'invites') {
+
+                    const enabled =
+                        interaction.options.getBoolean('enabled');
+
+                    const prot =
+                        settings.protections.invites;
+
+                    // ==============================
+                    // إيقاف الحماية
+                    // ==============================
+                    if (!enabled) {
+                        prot.enabled = false;
+                        await settings.save();
+                        return interaction.reply(
+                            `⛔ تم إيقاف حماية الاختصار.`,
+                            { ephemeral: true }
+                        );
+                    }
+
+                    const code =
+                        interaction.options.getString('code');
+
+                    const channel =
+                        interaction.options.getChannel('channel');
+
+                    let protectedCode = null;
+                    let protectedChannelId = null;
+
+                    // 1) المستخدم حدد الكود
+                    if (code) {
+                        const invites =
+                            await interaction.guild.invites.fetch()
+                                .catch(() => new Map());
+
+                        const found = Array.from(invites.values())
+                            .find(i => i.code === code);
+
+                        if (!found) {
+                            return interaction.reply({
+                                content: `❌ ما لقيت اختصار **${code}** في السيرفر. تأكد من الكود أو مرره بدون code عشان آخذه تلقائياً.`,
+                                ephemeral: true
+                            });
+                        }
+
+                        protectedCode = found.code;
+                        protectedChannelId = found.channel?.id || null;
+                    }
+
+                    // 2) اختيار اختصار موجود تلقائياً
+                    if (!protectedCode) {
+                        const invites =
+                            await interaction.guild.invites.fetch()
+                                .catch(() => new Map());
+
+                        const existing = Array.from(invites.values())
+                            .filter(i => i.channel)
+                            .sort((a, b) => (b.uses || 0) - (a.uses || 0))[0];
+
+                        if (existing) {
+                            protectedCode = existing.code;
+                            protectedChannelId = existing.channel.id;
+                        }
+                    }
+
+                    // 3) إنشاء اختصار جديد من القناة المحددة
+                    if (!protectedCode && channel) {
+                        const created = await channel.createInvite({
+                            maxAge: 0,
+                            maxUses: 0,
+                            reason: '[Anti-Nuke] حماية اختصار السيرفر'
+                        }).catch(() => null);
+
+                        if (created) {
+                            protectedCode = created.code;
+                            protectedChannelId = created.channel?.id || channel.id;
+                        }
+                    }
+
+                    if (!protectedCode) {
+                        return interaction.reply({
+                            content: '❌ ما فيه اختصار بالسيرفر. حدد `code` أو `channel` عشان أسوي اختصار وأحميه.',
+                            ephemeral: true
+                        });
+                    }
+
+                    prot.enabled = true;
+                    prot.code = protectedCode;
+                    prot.channelId = protectedChannelId;
+
+                    await settings.save();
+
+                    return interaction.reply(
+                        `🛡️ تم تفعيل حماية الاختصار: **discord.gg/${protectedCode}**\n` +
+                        `أي شخص **تحت رتبة البوت** يشيله → عقوبة **${prot.action || 'ban'}**.\n` +
+                        `بنفس رتبة البوت → يُسجل باللوق فقط.`
+                    );
+                }
+
                 if (sub === 'status') {
 
                     const fmt = p =>
                         `**${p.enabled ? '✅ مفعلة' : '❌ متوقفة'}**\n` +
-                        `الحد: **${p.limit}** | الفترة: **${Math.round(p.timeframe / 1000)} ث**\n` +
+                        `الحد: **${p.limit}**\n` +
                         `العقوبة: **${p.action}**`;
 
 const botsDesc = settings.protections.bots.enabled
@@ -3218,7 +3340,7 @@ const botsDesc = settings.protections.bots.enabled
                     const webhooksProt = settings.protections.webhooks;
 
                     const webhooksDesc = `**${webhooksProt.enabled ? '✅ مفعّلة' : '❌ متوقفة'}**\n` +
-                        `الحد المسموح: **${webhooksProt.limit}** | الفترة: **${Math.round(webhooksProt.timeframe / 1000)} ث**\n` +
+                        `الحد المسموح: **${webhooksProt.limit}**\n` +
                         `العقوبة (تحت رتبة البوت): **${webhooksProt.action}**\n` +
                         `المرجع: رتبة البوت والفوايت ليست\n` +
                         `(فوقه/وايت ليست: مسموح | ضمن الحد: مسموح | بنفسه: حذف كل الويب هوك | تحته عند التجاوز: حظر + حذف الكل)`;
@@ -4473,6 +4595,137 @@ client.on('webhookUpdate', async channel => {
 
 
 // ======================================================
+// INVITE PROTECTION (حماية اختصار السيرفر)
+// ======================================================
+
+// إرسال إشعار خاص لمالك السيرفر
+async function notifyInviteOwner(guild, executorId, restoredCode, punished) {
+    try {
+        const owner = await guild.fetchOwner();
+
+        await owner.send(
+            `⚠️ **تنبيه حماية** — تغيّر اختصار سيرفرك **${guild.name}**!\n\n` +
+            `المسبب: <@${executorId}>\n` +
+            (restoredCode
+                ? `✅ تم إنشاء اختصار بديل: **discord.gg/${restoredCode}**`
+                : '⚠️ تعذر إعادة إنشاء اختصار بديل (تحقق من صلاحيات البوت).') +
+            '\n' +
+            (punished
+                ? '🔨 المسبب **تم تبنيده**.'
+                : '⚠️ **الصلاحيات لا تكفي** لمعاقبة المسبب (بنفس رتبة البوت أو أعلى).'
+            )
+        ).catch(() => {});
+    } catch (error) {
+        console.error('Invite owner DM error:', error);
+    }
+}
+
+client.on('inviteDelete', async invite => {
+
+    try {
+
+        if (!invite.guild) return;
+
+        const guild = invite.guild;
+        const settings = await getSettings(guild.id);
+        ensureProtections(settings);
+        const prot = settings.protections.invites;
+
+        if (!prot || !prot.enabled || !prot.code) return;
+        if (invite.code !== prot.code) return;
+
+        const executorId = await getAuditExecutor(
+            guild,
+            AuditLogEvent.InviteDelete,
+            invite.code
+        );
+
+        if (!executorId || executorId === client.user.id) return;
+
+        const member = await getMember(guild, executorId);
+        const check = protectionAllowed(guild, member, settings);
+
+        // مسموح (وايت ليست / فوق رتبة البوت / المالك): سجل فقط
+        if (check.allowed) {
+            await sendLog(
+                guild,
+                'protection',
+                '🛡️ Invite Deleted (Allowed)',
+                `<@${executorId}> حذف الاختصار **discord.gg/${invite.code}**.\n` +
+                `المستوى: **${check.level}** (مسموح — لا عقوبة)`
+            );
+            return;
+        }
+
+        // ==============================
+        // غير مسموح
+        // ==============================
+
+        const isBelow = check.level === 'below';
+        let punished = false;
+
+        if (isBelow) {
+            await applyPunishment(
+                member,
+                prot.action || 'ban',
+                `حذف اختصار السيرفر (${invite.code})`
+            );
+            punished = true;
+        }
+
+        // ==============================
+        // محاولة إعادة إنشاء اختصار بديل
+        // ==============================
+        let restoredCode = null;
+
+        const targetChannelId = prot.channelId || invite.channel?.id || null;
+
+        if (targetChannelId) {
+            const targetChannel = guild.channels.cache.get(targetChannelId);
+
+            if (targetChannel && targetChannel.isTextBased()) {
+                const restored = await targetChannel.createInvite({
+                    maxAge: 0,
+                    maxUses: 0,
+                    reason: '[Anti-Nuke] استرجاع اختصار السيرفر'
+                }).catch(() => null);
+
+                if (restored) {
+                    restoredCode = restored.code;
+                    // حماية الاختصار الجديد بدل المحذوف
+                    prot.code = restored.code;
+                    prot.channelId = restored.channel?.id || targetChannelId;
+                    await settings.save().catch(() => {});
+                }
+            }
+        }
+
+        // ==============================
+        // لوق الحماية + إشعار المالك
+        // ==============================
+        await sendLog(
+            guild,
+            'protection',
+            '🛡️ Invite Protection',
+            `<@${executorId}> حذف اختصار السيرفر **discord.gg/${invite.code}**.\n` +
+            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+            (restoredCode
+                ? `✅ تم إنشاء اختصار بديل: **discord.gg/${restoredCode}**`
+                : '⚠️ تعذر إعادة إنشاء اختصار بديل (صلاحيات البوت؟)') +
+            (punished
+                ? `\n🔨 العقوبة: **${prot.action}**`
+                : '\n⚠️ لا تكفي صلاحيات لمعاقبته (بنفس رتبة البوت).')
+        );
+
+        await notifyInviteOwner(guild, executorId, restoredCode, punished);
+
+    } catch (error) {
+        console.error('Invite protection error:', error);
+    }
+});
+
+
+// ======================================================
 // VOICE LOGS
 // ======================================================
 
@@ -4646,15 +4899,12 @@ client.on('roleCreate', async role => {
 
             if (executorId) {
 
-                const now = Date.now();
                 const key = `${role.guild.id}-${executorId}`;
 
-                if (isLimitExceeded(
+                if (countExceeded(
                     protectionCounts.roles,
                     key,
-                    now,
-                    prot.limit,
-                    prot.timeframe
+                    prot.limit
                 )) {
 
                     const member = await getMember(role.guild, executorId);
@@ -4664,6 +4914,8 @@ client.on('roleCreate', async role => {
                         prot.action,
                         `تجاوز حد إنشاء الرتب (${prot.limit})`
                     );
+
+                    clearCount(protectionCounts.roles, key);
 
                     await role.delete('[Anti-Nuke] تجاوز حد إنشاء الرتب').catch(() => {});
 
@@ -4769,15 +5021,12 @@ client.on('roleUpdate', async (oldRole, newRole) => {
                             '[Anti-Nuke] استرجاع اسم الرتبة'
                         ).catch(() => {});
 
-                        const now = Date.now();
                         const key = `${newRole.guild.id}-${executorId}`;
 
-                        if (isLimitExceeded(
+                        if (countExceeded(
                             protectionCounts.roles,
                             key,
-                            now,
-                            prot.limit,
-                            prot.timeframe
+                            prot.limit
                         )) {
 
                             if (check.level === 'below') {
@@ -4787,6 +5036,8 @@ client.on('roleUpdate', async (oldRole, newRole) => {
                                     `تعديل اسم رتبة (${prot.limit})`
                                 );
                             }
+
+                            clearCount(protectionCounts.roles, key);
 
                             await sendLog(
                                 newRole.guild,
@@ -4845,15 +5096,12 @@ client.on('channelCreate', async channel => {
 
             if (executorId) {
 
-                const now = Date.now();
                 const key = `${channel.guild.id}-${executorId}`;
 
-                if (isLimitExceeded(
+                if (countExceeded(
                     protectionCounts.channels,
                     key,
-                    now,
-                    prot.limit,
-                    prot.timeframe
+                    prot.limit
                 )) {
 
                     const member = await getMember(channel.guild, executorId);
@@ -4863,6 +5111,8 @@ client.on('channelCreate', async channel => {
                         prot.action,
                         `تجاوز حد إنشاء الرومات (${prot.limit})`
                     );
+
+                    clearCount(protectionCounts.channels, key);
 
                     await sendLog(
                         channel.guild,
@@ -4970,15 +5220,12 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
                             '[Anti-Nuke] استرجاع اسم الروم'
                         ).catch(() => {});
 
-                        const now = Date.now();
                         const key = `${newChannel.guild.id}-${executorId}`;
 
-                        if (isLimitExceeded(
+                        if (countExceeded(
                             protectionCounts.channels,
                             key,
-                            now,
-                            prot.limit,
-                            prot.timeframe
+                            prot.limit
                         )) {
 
                             if (check.level === 'below') {
@@ -5108,15 +5355,12 @@ client.on('guildBanAdd', async ban => {
 
             if (executorId) {
 
-                const now = Date.now();
                 const key = `${ban.guild.id}-${executorId}`;
 
-                if (isLimitExceeded(
+                if (countExceeded(
                     protectionCounts.bans,
                     key,
-                    now,
-                    prot.limit,
-                    prot.timeframe
+                    prot.limit
                 )) {
 
                     const member = await getMember(ban.guild, executorId);
@@ -5126,6 +5370,8 @@ client.on('guildBanAdd', async ban => {
                         prot.action,
                         `تجاوز حد الباند (${prot.limit})`
                     );
+
+                    clearCount(protectionCounts.bans, key);
 
                     await sendLog(
                         ban.guild,
