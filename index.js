@@ -721,6 +721,25 @@ const protectionCounts = {
 // { count, last }
 const spamWarnCounts = new Map();
 
+// عدّادات الفيضان (نوك) لكل سيرفر — تعمل حتى لو ما تحددنا الفاعل من سجل التدقيق
+const protectionFloods = {
+    channels: new Map(),
+    roles: new Map(),
+    webhooks: new Map()
+};
+
+// هل عدد الأحداث خلال فترة قصيرة تجاوز الحد (نوك سريع)؟
+function isNukeFlood(tracker, guildId, limit, windowMs = 8000) {
+    const now = Date.now();
+    const list = (tracker.get(guildId) || [])
+        .filter(t => now - t <= windowMs);
+
+    list.push(now);
+    tracker.set(guildId, list);
+
+    return list.length > limit;
+}
+
 // فترة صلاحية التحذيرين (لو ما كرر السبام خلالها يصفّر العدّاد)
 const SPAM_WARN_WINDOW = 10 * 60 * 1000;
 
@@ -812,7 +831,8 @@ async function getMember(guild, userId) {
 
 // فحص صلاحية التجاوز عن الحماية (وايت ليست / مالك البوت / فوق رتبة البوت)
 async function protectionAllowed(guild, member, settings) {
-    if (!member) return { allowed: true };
+    // عضو غير معروف = مش مخوّل (نحمي ولا نثق بالمجانين)
+    if (!member) return { allowed: false, level: 'unknown' };
 
     if (member.id === OWNER_ID) {
         return { allowed: true, level: 'owner' };
@@ -829,7 +849,7 @@ async function protectionAllowed(guild, member, settings) {
     const botHighest = guild?.members?.me?.roles?.highest;
 
     if (!botHighest) {
-        return { allowed: true, level: 'unknown' };
+        return { allowed: false, level: 'unknown' };
     }
 
     const pos = member.roles.highest?.position ?? -1;
@@ -876,7 +896,27 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
 
         const executorId = await getAuditExecutor(guild, auditType, webhookId);
 
-        if (!executorId || executorId === client.user.id) return;
+        // المسبب غير معروف: نعتمد على كشف فيضان الويب هوك
+        if (!executorId) {
+
+            if (auditType === AuditLogEvent.WebhookCreate &&
+                isNukeFlood(protectionFloods.webhooks, guild.id, prot.limit || 5)) {
+
+                const deletedCount = await deleteAllWebhooks(guild);
+
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Webhook Flood',
+                    `فيضان إنشاء ويب هوك.\n` +
+                    `تم حذف **${deletedCount}** ويب هوك.`
+                );
+            }
+
+            return;
+        }
+
+        if (executorId === client.user.id) return;
 
         const member = await getMember(guild, executorId);
         const check = protectionAllowed(guild, member, settings);
@@ -4967,7 +5007,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 client.on('roleCreate', async role => {
 
-    const executor = await executorMention(
+    const executorId = await getAuditExecutor(
         role.guild,
         AuditLogEvent.RoleCreate,
         role.id
@@ -4978,7 +5018,7 @@ client.on('roleCreate', async role => {
         'role',
         '🎭 Role Created',
         `تم إنشاء الرتبة ${role}.\n` +
-        `المسبب: ${executor}`
+        `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
     );
 
     // حماية الرتب
@@ -4990,16 +5030,14 @@ client.on('roleCreate', async role => {
 
         if (prot.enabled) {
 
-            const executorId = await getAuditExecutor(
-                role.guild,
-                AuditLogEvent.RoleCreate,
-                role.id
-            );
+            let actionTaken = null;
+            let member = null;
+            let check = null;
 
             if (executorId && executorId !== client.user.id) {
 
-                const member = await getMember(role.guild, executorId);
-                const check = protectionAllowed(role.guild, member, settings);
+                member = await getMember(role.guild, executorId);
+                check = protectionAllowed(role.guild, member, settings);
 
                 if (!check.allowed) {
 
@@ -5011,7 +5049,7 @@ client.on('roleCreate', async role => {
                         prot.limit
                     )) {
 
-                        await role.delete('[Anti-Nuke] تجاوز حد إنشاء الرتب').catch(() => {});
+                        actionTaken = 'punish';
 
                         if (check.level === 'below') {
                             await applyPunishment(
@@ -5022,17 +5060,45 @@ client.on('roleCreate', async role => {
                         }
 
                         clearCount(protectionCounts.roles, key);
-
-                        await sendLog(
-                            role.guild,
-                            'moderation',
-                            '🛡️ Role Protection',
-                            `<@${executorId}> تجاوز حد إنشاء الرتب (**${prot.limit}**).\n` +
-                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                            `تم حذف الرتبة المنشأة${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
-                        );
                     }
                 }
+            }
+
+            if (!actionTaken) {
+
+                const knownAllowed =
+                    executorId &&
+                    check &&
+                    check.allowed;
+
+                if (!knownAllowed && isNukeFlood(
+                    protectionFloods.roles,
+                    role.guild.id,
+                    prot.limit
+                )) {
+                    actionTaken = 'flood';
+                }
+            }
+
+            if (actionTaken) {
+
+                await role.delete('[Anti-Nuke] إنشاء رتب غير مصرّح').catch(() => {});
+
+                const who =
+                    executorId ? `<@${executorId}>` : 'شخص غير معروف';
+
+                await sendLog(
+                    role.guild,
+                    'moderation',
+                    '🛡️ Role Protection',
+                    `${who} ${actionTaken === 'flood' ?
+                        'يعمل فيضان إنشاء رتب' :
+                        `تجاوز حد إنشاء الرتب (**${prot.limit}**)`}.\n` +
+                    `تم حذف الرتبة المنشأة.` +
+                    (check && check.level === 'below'
+                        ? `\nالعقوبة: **${prot.action}**`
+                        : '')
+                );
             }
         }
     } catch (error) {
@@ -5216,43 +5282,44 @@ client.on('channelCreate', async channel => {
 
     if (!channel.guild) return;
 
-    const executor = await executorMention(
-        channel.guild,
+    const guild = channel.guild;
+
+    const executorId = await getAuditExecutor(
+        guild,
         AuditLogEvent.ChannelCreate,
         channel.id
     );
 
     await sendLog(
-        channel.guild,
+        guild,
         'channel',
         '📁 Channel Created',
         `تم إنشاء ${channel}.\n` +
-        `المسبب: ${executor}`
+        `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
     );
 
     // حماية الرومات
     try {
 
-        const settings = await getSettings(channel.guild.id);
+        const settings = await getSettings(guild.id);
         ensureProtections(settings);
         const prot = settings.protections.channels;
 
-        if (prot.enabled && channel.guild) {
+        if (prot.enabled) {
 
-            const executorId = await getAuditExecutor(
-                channel.guild,
-                AuditLogEvent.ChannelCreate,
-                channel.id
-            );
+            let actionTaken = null;
+            let member = null;
+            let check = null;
 
+            // 1) المعرفة من سجل التدقيق (لو توفر)
             if (executorId && executorId !== client.user.id) {
 
-                const member = await getMember(channel.guild, executorId);
-                const check = protectionAllowed(channel.guild, member, settings);
+                member = await getMember(guild, executorId);
+                check = protectionAllowed(guild, member, settings);
 
                 if (!check.allowed) {
 
-                    const key = `${channel.guild.id}-${executorId}`;
+                    const key = `${guild.id}-${executorId}`;
 
                     if (countExceeded(
                         protectionCounts.channels,
@@ -5260,10 +5327,7 @@ client.on('channelCreate', async channel => {
                         prot.limit
                     )) {
 
-                        // إزالة الروم المنشأ
-                        await channel.delete(
-                            '[Anti-Nuke] تجاوز حد إنشاء الرومات'
-                        ).catch(() => {});
+                        actionTaken = 'punish';
 
                         if (check.level === 'below') {
                             await applyPunishment(
@@ -5274,17 +5338,48 @@ client.on('channelCreate', async channel => {
                         }
 
                         clearCount(protectionCounts.channels, key);
-
-                        await sendLog(
-                            channel.guild,
-                            'moderation',
-                            '🛡️ Channel Protection',
-                            `<@${executorId}> تجاوز حد إنشاء الرومات (**${prot.limit}**).\n` +
-                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                            `تم حذف الروم المنشأ${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
-                        );
                     }
                 }
+            }
+
+            // 2) كشف الفيضان: المسبب غير معروف أو غير مخوّل
+            if (!actionTaken) {
+
+                const knownAllowed =
+                    executorId &&
+                    check &&
+                    check.allowed;
+
+                if (!knownAllowed && isNukeFlood(
+                    protectionFloods.channels,
+                    guild.id,
+                    prot.limit
+                )) {
+                    actionTaken = 'flood';
+                }
+            }
+
+            if (actionTaken) {
+
+                await channel.delete(
+                    '[Anti-Nuke] إنشاء رومات غير مصرّح'
+                ).catch(() => {});
+
+                const who =
+                    executorId ? `<@${executorId}>` : 'شخص غير معروف';
+
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Channel Protection',
+                    `${who} ${actionTaken === 'flood' ?
+                        'يعمل فيضان إنشاء رومات' :
+                        `تجاوز حد إنشاء الرومات (**${prot.limit}**)`}.\n` +
+                    `تم حذف الروم المنشأ.` +
+                    (check && check.level === 'below'
+                        ? `\nالعقوبة: **${prot.action}**`
+                        : '')
+                );
             }
         }
     } catch (error) {
