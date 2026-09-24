@@ -749,6 +749,37 @@ const protectionFloods = {
 // الغرض: فحص "هل الحماية مفعّلة" بدون قراءة من قاعدة البيانات في مسار الأحداث السريع
 const protectionsCache = new Map();
 
+// بوتات انضمت مؤخراً وتحت المراقبة (تُنظّف تلقائياً)
+// guildId -> [{ userId, joinedAt }]
+const suspectedBots = new Map();
+
+const SUSPECT_WINDOW = 15 * 60 * 1000;   // كم دقيقة نظل نراقب البوت الجديد
+const SUSPECT_BAN_WINDOW = 10 * 60 * 1000; // كم دقيقة نعيد فيها البند لو حصل فيضان
+
+function addSuspectedBot(guildId, userId) {
+    try {
+        const now = Date.now();
+        const list = (suspectedBots.get(guildId) || [])
+            .filter(b => now - b.joinedAt <= SUSPECT_WINDOW);
+
+        list.push({ userId, joinedAt: now });
+        suspectedBots.set(guildId, list);
+    } catch {}
+}
+
+function getSuspectedBots(guildId, withinMs = SUSPECT_BAN_WINDOW) {
+    try {
+        const now = Date.now();
+        const list = (suspectedBots.get(guildId) || [])
+            .filter(b => now - b.joinedAt <= withinMs);
+
+        suspectedBots.set(guildId, list);
+        return list.map(b => b.userId);
+    } catch {
+        return [];
+    }
+}
+
 // هل عدد الأحداث خلال فترة قصيرة تجاوز الحد (نوك سريع)؟
 function isNukeFlood(tracker, guildId, limit, windowMs = 8000) {
     const now = Date.now();
@@ -851,6 +882,35 @@ function countExceeded(counter, key, limit) {
 // تصفير عدّاد المخالف بعد تطبيق العقوبة (حتى لا يتراكم في الذاكرة)
 function clearCount(counter, key) {
     counter.delete(key);
+}
+
+// بند البوتات المشبوهة (الداخلة مؤخراً) عند حصول فيضان بدون مسبب مشخص
+// يرجّع مصفوفة بأيدي البوتات التي تم بنودها فعلاً
+async function banSuspectedBots(guild, prot, context) {
+    const suspects = getSuspectedBots(guild.id);
+    const banned = [];
+
+    for (const suspectId of suspects) {
+        try {
+            const member = await getMember(guild, suspectId);
+            if (!member || !member.bannable) continue;
+
+            await applyPunishment(
+                member,
+                prot?.action || 'ban',
+                `بوت نوك مشبوه (${context})`
+            );
+            banned.push(suspectId);
+
+            console.log(
+                `[PROTECT] بند البوت المشبوه ${suspectId} (${guild.id}) | ${context}`
+            );
+        } catch (error) {
+            console.error('Suspect bot ban error:', error);
+        }
+    }
+
+    return banned;
 }
 
 async function applyPunishment(member, action, reason) {
@@ -957,8 +1017,10 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
 
             const deletedCount = await deleteAllWebhooks(guild);
 
+            const banned = await banSuspectedBots(guild, prot, 'فيضان إنشاء ويب هوك');
+
             console.log(
-                `[PROTECT] webhook flood — حذف ${deletedCount} ويب هوك (${guild.id})`
+                `[PROTECT] webhook flood — حذف ${deletedCount} ويب هوك (${guild.id})${banned.length ? `، بند ${banned.length} بوت` : ''}`
             );
 
             await sendLog(
@@ -966,7 +1028,10 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
                 'moderation',
                 '🛡️ Webhook Flood',
                 `فيضان إنشاء ويب هوك.\n` +
-                `تم حذف **${deletedCount}** ويب هوك.`
+                `تم حذف **${deletedCount}** ويب هوك.` +
+                (banned.length
+                    ? `\n✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
+                    : '')
             );
 
             return;
@@ -4479,6 +4544,9 @@ client.on('guildMemberAdd', async member => {
 
         if (member.user.bot) {
 
+            // تسجيل البوت الجديد كمرشح مشبوه (يُبنّد لو سوى نوك)
+            addSuspectedBot(member.guild.id, member.id);
+
             ensureProtections(settings);
 
             const botProt = settings.protections.bots;
@@ -5335,12 +5403,17 @@ client.on('roleCreate', async role => {
                             : '')
                 );
             } else if (floodLocked) {
+                const banned = await banSuspectedBots(guild, prot, 'فيضان إنشاء رتب');
+
                 await sendLog(
                     guild,
                     'moderation',
                     '🛡️ Role Flood Detected',
-                    'فيضان إنشاء رتب — تم حذف الرتبة المنشأة فورياً.\n' +
-                    'المسبب غير مشخص (حاول التأكد من صلاحية **View Audit Log** للبوت).'
+                    banned.length
+                        ? 'فيضان إنشاء رتب — تم حذف الرتبة المنشأة فورياً.\n' +
+                          `✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
+                        : 'فيضان إنشاء رتب — تم حذف الرتبة المنشأة فورياً.\n' +
+                          'المسبب غير مشخص (تأكد من صلاحية **View Audit Log**/رتب البوتات).'
                 );
             }
         } catch (error) {
@@ -5465,16 +5538,21 @@ client.on('roleDelete', async role => {
                     }
                 }
             } else if (floodLocked) {
+                const banned = await banSuspectedBots(guild, prot, 'فيضان حذف رتب');
+
                 console.log(
-                    `[PROTECT] فيضان حذف رتب ${guild.id} — المسبب غير مشخص`
+                    `[PROTECT] فيضان حذف رتب ${guild.id} — المسبب غير مشخص${banned.length ? `، بند ${banned.length} بوت` : ''}`
                 );
 
                 await sendLog(
                     guild,
                     'moderation',
                     '🛡️ Role Deletion Flood',
-                    'فيضان حذف رتب — المسبب غير مشخص.\n' +
-                    'تأكد من صلاحية **View Audit Log** للبوت.'
+                    banned.length
+                        ? 'فيضان حذف رتب — لم يُعرف المسبب من السجل.\n' +
+                          `✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
+                        : 'فيضان حذف رتب — المسبب غير مشخص.\n' +
+                          'تأكد من صلاحية **View Audit Log**/رتب البوتات.'
                 );
             }
         }
@@ -5704,12 +5782,17 @@ client.on('channelCreate', async channel => {
                             : '')
                 );
             } else if (floodLocked) {
+                const banned = await banSuspectedBots(guild, prot, 'فيضان إنشاء رومات');
+
                 await sendLog(
                     guild,
                     'moderation',
                     '🛡️ Channel Flood Detected',
-                    'فيضان إنشاء رومات — تم حذف الروم المنشأ فورياً.\n' +
-                    'المسبب غير مشخص (حاول التأكد من صلاحية **View Audit Log** للبوت).'
+                    banned.length
+                        ? 'فيضان إنشاء رومات — تم حذف الروم المنشأ فورياً.\n' +
+                          `✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
+                        : 'فيضان إنشاء رومات — تم حذف الروم المنشأ فورياً.\n' +
+                          'المسبب غير مشخص (تأكد من صلاحية **View Audit Log**/رتب البوتات).'
                 );
             }
         } catch (error) {
@@ -5836,16 +5919,21 @@ client.on('channelDelete', async channel => {
                     }
                 }
             } else if (floodLocked) {
+                const banned = await banSuspectedBots(guild, prot, 'فيضان حذف رومات');
+
                 console.log(
-                    `[PROTECT] فيضان حذف رومات ${guild.id} — المسبب غير مشخص`
+                    `[PROTECT] فيضان حذف رومات ${guild.id} — المسبب غير مشخص${banned.length ? `، بند ${banned.length} بوت` : ''}`
                 );
 
                 await sendLog(
                     guild,
                     'moderation',
                     '🛡️ Channel Deletion Flood',
-                    'فيضان حذف رومات — المسبب غير مشخص.\n' +
-                    'تأكد من صلاحية **View Audit Log** للبوت.'
+                    banned.length
+                        ? 'فيضان حذف رومات — لم يُعرف المسبب من السجل.\n' +
+                          `✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
+                        : 'فيضان حذف رومات — المسبب غير مشخص.\n' +
+                          'تأكد من صلاحية **View Audit Log**/رتب البوتات.'
                 );
             }
         }
