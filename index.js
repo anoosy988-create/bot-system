@@ -632,6 +632,21 @@ async function getSettings(guildId) {
         console.error('Settings sanitize error:', error);
     }
 
+    // تحديث كاش الحماية السريع
+    try {
+        const protSnapshot = JSON.parse(JSON.stringify(
+            settings.protections || {}
+        ));
+        const wlSnapshot = Array.isArray(settings.whitelist)
+            ? settings.whitelist.slice()
+            : [];
+
+        protectionsCache.set(guildId, {
+            protections: protSnapshot,
+            whitelist: wlSnapshot
+        });
+    } catch {}
+
     return settings;
 }
 
@@ -724,9 +739,15 @@ const spamWarnCounts = new Map();
 // عدّادات الفيضان (نوك) لكل سيرفر — تعمل حتى لو ما تحددنا الفاعل من سجل التدقيق
 const protectionFloods = {
     channels: new Map(),
+    channelDeletes: new Map(),
     roles: new Map(),
+    roleDeletes: new Map(),
     webhooks: new Map()
 };
+
+// كاش فوري لإعدادات الحماية (يُحدَّث مع كل قراءة من القاعدة)
+// الغرض: فحص "هل الحماية مفعّلة" بدون قراءة من قاعدة البيانات في مسار الأحداث السريع
+const protectionsCache = new Map();
 
 // هل عدد الأحداث خلال فترة قصيرة تجاوز الحد (نوك سريع)؟
 function isNukeFlood(tracker, guildId, limit, windowMs = 8000) {
@@ -773,6 +794,40 @@ async function getAuditExecutor(guild, type, targetId = null) {
 async function executorMention(guild, type, targetId = null) {
     const id = await getAuditExecutor(guild, type, targetId);
     return id ? `<@${id}>` : 'غير معروف';
+}
+
+// اصطياد الفاعل في حالات الفيضان: بدل الاعتماد على "آخر إدخال يطابق التارجت"
+// (الذي يفشل وقت 100 روم دفعة واحدة)، نجيب أحدث الفاعلين غير البوت
+async function getFloodExecutor(guild, type, maxEntries = 25, windowMs = 120000) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const audit = await guild.fetchAuditLogs({ type, limit: maxEntries });
+            const now = Date.now();
+
+            const entry = audit.entries.find(
+                e => e.executor?.id &&
+                     e.executor.id !== client.user.id &&
+                     now - e.createdTimestamp <= windowMs
+            );
+
+            if (entry?.executor?.id) return entry.executor.id;
+
+            // السجل ما زال يتحدّث — ننتظر قليلاً ونعيد المحاولة
+            if (attempt < 3) {
+                await new Promise(r => setTimeout(r, 1500 * attempt));
+            }
+        } catch (error) {
+            console.error(
+                `Audit flood fetch error (${guild.id}, type ${type}): ${error.message}`
+            );
+
+            if (attempt < 3) {
+                await new Promise(r => setTimeout(r, 1500 * attempt));
+            }
+        }
+    }
+
+    return null;
 }
 
 function isLimitExceeded(counter, key, now, limit, timeframe) {
@@ -888,38 +943,45 @@ async function deleteAllWebhooks(guild) {
 //  - وايت ليست / فوق رتبة البوت / المالك: لا نتدخل
 async function runWebhookProtection(guild, auditType, webhookId, label) {
     try {
-        const settings = await getSettings(guild.id);
-        ensureProtections(settings);
-        const prot = settings.protections.webhooks;
+        const { prot, cached } = await getProtectionConfig(guild.id, 'webhooks');
 
         if (!prot || !prot.enabled) return;
 
-        const executorId = await getAuditExecutor(guild, auditType, webhookId);
+        console.log(
+            `[PROTECT] webhook (${label}) ${guild.id} | enabled=${prot.enabled}`
+        );
 
-        // المسبب غير معروف: نعتمد على كشف فيضان الويب هوك
-        if (!executorId) {
+        // كشف فيضان إنشاء الويب هوك فوراً — بدون انتظار سجل التدقيق
+        if (auditType === AuditLogEvent.WebhookCreate &&
+            isNukeFlood(protectionFloods.webhooks, guild.id, prot.limit || 5)) {
 
-            if (auditType === AuditLogEvent.WebhookCreate &&
-                isNukeFlood(protectionFloods.webhooks, guild.id, prot.limit || 5)) {
+            const deletedCount = await deleteAllWebhooks(guild);
 
-                const deletedCount = await deleteAllWebhooks(guild);
+            console.log(
+                `[PROTECT] webhook flood — حذف ${deletedCount} ويب هوك (${guild.id})`
+            );
 
-                await sendLog(
-                    guild,
-                    'moderation',
-                    '🛡️ Webhook Flood',
-                    `فيضان إنشاء ويب هوك.\n` +
-                    `تم حذف **${deletedCount}** ويب هوك.`
-                );
-            }
+            await sendLog(
+                guild,
+                'moderation',
+                '🛡️ Webhook Flood',
+                `فيضان إنشاء ويب هوك.\n` +
+                `تم حذف **${deletedCount}** ويب هوك.`
+            );
 
             return;
         }
 
+        const executorId = await getAuditExecutor(guild, auditType, webhookId);
+
+        if (!executorId) return;
+
         if (executorId === client.user.id) return;
 
         const member = await getMember(guild, executorId);
-        const check = protectionAllowed(guild, member, settings);
+        const check = protectionAllowed(guild, member, {
+            whitelist: cached?.whitelist || []
+        });
 
         if (check.allowed) return;
 
@@ -1007,13 +1069,15 @@ const PROTECTION_ACTIONS = [
     { name: '🎭 إزالة كل الرتب', value: 'removeroles' }
 ];
 
+// إعدادات الحماية الافتراضية: مفعّلة من أول إنشاء السيرفر
+// (المالك يقدر يوقفها أو يعدّل العقوبة من /protect)
 const DEFAULT_PROTECTIONS = {
-    channels: { enabled: false, limit: 5, action: 'ban' },
-    roles: { enabled: false, limit: 5, action: 'ban' },
-    bans: { enabled: false, limit: 3, action: 'kick' },
-    bots: { enabled: false },
-    spam: { enabled: false, limit: 5, timeframe: 5000, maxLength: 400, repeatedChar: 8, action: 'timeout' },
-    webhooks: { enabled: false, limit: 5, action: 'ban' },
+    channels: { enabled: true, limit: 5, action: 'ban' },
+    roles: { enabled: true, limit: 5, action: 'ban' },
+    bans: { enabled: true, limit: 3, action: 'kick' },
+    bots: { enabled: true },
+    spam: { enabled: true, limit: 5, timeframe: 5000, maxLength: 400, repeatedChar: 8, action: 'timeout' },
+    webhooks: { enabled: true, limit: 5, action: 'ban' },
     invites: { enabled: false, code: null, channelId: null, action: 'ban' }
 };
 
@@ -1023,6 +1087,14 @@ const migratedSpamActions = new Set();
 function ensureProtections(settings) {
     if (!settings.protections) {
         settings.protections = JSON.parse(JSON.stringify(DEFAULT_PROTECTIONS));
+
+        try {
+            protectionsCache.set(String(settings._id), {
+                protections: JSON.parse(JSON.stringify(settings.protections)),
+                whitelist: (settings.whitelist || []).slice()
+            });
+        } catch {}
+
         return settings.protections;
     }
 
@@ -1052,7 +1124,48 @@ function ensureProtections(settings) {
         }
     } catch {}
 
+    try {
+        protectionsCache.set(String(settings._id), {
+            protections: JSON.parse(JSON.stringify(settings.protections)),
+            whitelist: (settings.whitelist || []).slice()
+        });
+    } catch {}
+
     return settings.protections;
+}
+
+// قراءة إعدادات حماية سريعة وبلا فشل:
+// 1) كاش 2) قاعدة البيانات 3) افتراضي مفعّل — الحماية تشتغل دائماً
+async function getProtectionConfig(guildId, type) {
+    const cached = protectionsCache.get(guildId);
+
+    if (cached?.protections?.[type]) {
+        return { prot: cached.protections[type], cached };
+    }
+
+    let settings = null;
+
+    try {
+        settings = await getSettings(guildId);
+        ensureProtections(settings);
+    } catch (error) {
+        console.error(
+            `[PROTECT] DB read failed (${guildId}/${type}): ${error.message}`
+        );
+    }
+
+    const fresh = protectionsCache.get(guildId);
+
+    if (fresh?.protections?.[type]) {
+        return { prot: fresh.protections[type], cached: fresh };
+    }
+
+    return {
+        prot: JSON.parse(
+            JSON.stringify(DEFAULT_PROTECTIONS[type] || { enabled: true })
+        ),
+        cached: cached || { protections: {}, whitelist: [] }
+    };
 }
 
 // حساب أطول تكرار متتالي لنفس الحرف (الخطوط الكبيرة)
@@ -1958,6 +2071,10 @@ client.once('ready', async () => {
     // تسجيل عام يظهر في كل السيرفرات
     await registerGlobalCommands();
 
+    // عمليات القاعدة تفشل فوراً لو DB مقطوع بدل التجمد الصامت 30 ثانية
+    // (بتصير الحماية "تشتغل" حتى لو DB معطّلة — الإعدادات الافتراضية مفعّلة)
+    mongoose.set('bufferCommands', false);
+
     try {
         await mongoose.connect(MONGO_URI);
 
@@ -2010,7 +2127,67 @@ client.once('ready', async () => {
     console.log(
         '🔐 أوامر الحماية تتطلب رتبة ' + STAFF_ROLE_NAME + ' **فوق** رتبة البوت — باقي الأوامر تكفي رتبة ' + STAFF_ROLE_NAME + ' فقط'
     );
+
+    runProtectionDiagnostics();
 });
+
+// تشخيص حالة الحماية: هل المفعّلة، وهل البوت يملك الصلاحيات الفعلية؟
+async function runProtectionDiagnostics() {
+    try {
+        for (const guild of client.guilds.cache.values()) {
+            let settings = null;
+            try {
+                settings = await getSettings(guild.id);
+                ensureProtections(settings);
+            } catch {}
+
+            const me = guild.members.me;
+            const perms = me?.permissions || null;
+            const has = flag => (perms?.has(flag) ? '✅' : '❌');
+
+            const flagLines = [
+                `ViewAuditLog:${has(PermissionsBitField.Flags.ViewAuditLog)}`,
+                `ManageChannels:${has(PermissionsBitField.Flags.ManageChannels)}`,
+                `ManageRoles:${has(PermissionsBitField.Flags.ManageRoles)}`,
+                `ManageWebhooks:${has(PermissionsBitField.Flags.ManageWebhooks)}`,
+                `ManageMessages:${has(PermissionsBitField.Flags.ManageMessages)}`,
+                `KickMembers:${has(PermissionsBitField.Flags.KickMembers)}`,
+                `BanMembers:${has(PermissionsBitField.Flags.BanMembers)}`
+            ].join('  ');
+
+            const p = settings?.protections;
+
+            const protLine = p
+                ? [
+                    `Channels:${p.channels?.enabled ? 'ON' : 'off'}`,
+                    `Roles:${p.roles?.enabled ? 'ON' : 'off'}`,
+                    `Webhooks:${p.webhooks?.enabled ? 'ON' : 'off'}`,
+                    `Bots:${p.bots?.enabled ? 'ON' : 'off'}`,
+                    `Bans:${p.bans?.enabled ? 'ON' : 'off'}`,
+                    `Spam:${p.spam?.enabled ? 'ON' : 'off'}`
+                ].join('  ')
+                : 'غير محملة (اضغط /protect لتأكيد التفعيل)';
+
+            console.log(`🛡️ [${guild.name}] (${guild.id})`);
+            console.log(`   مفعّلة: ${protLine}`);
+            console.log(`   صلاحيات البوت: ${flagLines}`);
+            console.log(`   أعلى رتبة للبوت position=${me?.roles?.highest?.position ?? '?'}`);
+        }
+
+        const dbState = [
+            'مقطوع ❌',
+            'متصل ✅',
+            'يتصل...',
+            'يقطع...'
+        ][mongoose?.connection?.readyState] ?? 'مجهول';
+
+        console.log(`🗄️ MongoDB: ${dbState} (readyState=${mongoose?.connection?.readyState})`);
+
+        console.log('🛡️ Protection diagnostics done');
+    } catch (error) {
+        console.error('Protection diagnostics error:', error);
+    }
+}
 
 // لاحظ: الأوامر عامة الآن، أي سيرفر جديد يظهر به الأوامر تلقائياً
 client.on('guildCreate', guild => {
@@ -2019,6 +2196,8 @@ client.on('guildCreate', guild => {
         `📥 Bot added to new server: ${guild.name}`
     );
 
+    // تشخيص فوري عند دخول سيرفر جديد
+    setTimeout(() => runProtectionDiagnostics(), 5000).unref?.();
 });
 
 
@@ -4306,6 +4485,10 @@ client.on('guildMemberAdd', async member => {
 
             if (botProt.enabled) {
 
+                console.log(
+                    `[PROTECT] BotAdd ${member.guild.id} | bot=${member.user.tag} | enabled=true`
+                );
+
                 // المرجع: أعلى رتبة للبوت نفسه
                 const botSelf =
                     member.guild.members.me ||
@@ -4337,6 +4520,10 @@ client.on('guildMemberAdd', async member => {
 
                 if (!inviter) {
 
+                    console.log(
+                        `[PROTECT] BotAdd ${member.guild.id} | مضيف مجهول → طرد البوت ${member.user.tag}`
+                    );
+
                     await member.kick('[Anti-Nuke] تعذر التحقق من مسبب دخول البوت').catch(() => {});
                     await sendLog(
                         member.guild,
@@ -4354,6 +4541,10 @@ client.on('guildMemberAdd', async member => {
 
                     // رتبة المسبب تحت رتبة البوت: نطرد/نبند البوت المضافة والمسبب معاً
                     let botRemoved = false;
+
+                    console.log(
+                        `[PROTECT] BotAdd ${member.guild.id} | المضيف <@${inviter.id}> تحت البوت → حظر ${member.user.tag}`
+                    );
 
                     try {
                         await member.ban('[Anti-Nuke] دخول بوت غير مصرّح');
@@ -4396,14 +4587,45 @@ client.on('guildMemberAdd', async member => {
                     return;
                 }
 
-                // فوق رتبة البوت: مسموح
-                await sendLog(
-                    member.guild,
-                    'moderation',
-                    '🤖 Bot Allowed',
-                    `البوت **${member.user.tag}** دخل السيرفر.\n` +
-                    `المسبب: <@${inviter.id}> (أعلى من رتبة البوت ${refRole})`
-                );
+                // فوق رتبة البوت: يسمح فقط إذا كان المُضيف هو مالك السيرفر أو في القائمة البيضاء
+                    const botWhitelist = Array.isArray(settings.whitelist)
+                        ? settings.whitelist
+                        : [];
+
+                    if (
+                        inviter.id === member.guild.ownerId ||
+                        botWhitelist.includes(inviter.id)
+                    ) {
+                        await sendLog(
+                            member.guild,
+                            'moderation',
+                            '🤖 Bot Allowed',
+                            `البوت **${member.user.tag}** دخل السيرفر.\n` +
+                            `المسبب: <@${inviter.id}> (معتمد ${inviter.id === member.guild.ownerId ? 'المالك' : 'القائمة البيضاء'})`
+                        );
+                        return;
+                    }
+
+                    // مُضيف فوق البوت لكنه ليس المالك/الوايت ليست:
+                    // إضافة بوت من "إدارة غير موثوقة" → لا يمر
+                    const nokicked =
+                        await member.kick('[Anti-Nuke] إضافة بوت من غير المالك/الوايت ليست')
+                            .then(() => true)
+                            .catch(() => false);
+
+                    console.log(
+                        `[PROTECT] BotAdd kick(non-owner) ${member.guild.id} | البوت=${member.user.tag} | المضيف=<@${inviter.id}> | طرد=${nokicked}`
+                    );
+
+                    await sendLog(
+                        member.guild,
+                        'moderation',
+                        nokicked ? '🤖 Bot Kicked' : '🤖 Bot Removal Failed',
+                        `البوت **${member.user.tag}** ${nokicked ? 'طُرد لأنه' : 'تعذر طرده رغم أنه'} أُضيف من غير المالك/الوايت ليست.\n` +
+                        `المسبب: <@${inviter.id}> (فوق رتبة البوت لكنه غير موثوق)\n` +
+                        (nokicked ? '' : '⚠️ رتبة البوت المضافة تعادل/تعلو رتبة بوت الحماية.')
+                    );
+                    return;
             }
         }
 
@@ -5007,103 +5229,142 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 client.on('roleCreate', async role => {
 
-    const executorId = await getAuditExecutor(
-        role.guild,
+    const guild = role.guild;
+
+    // ==============================================
+    // 1) الحماية: كشف الفيضان والرد عليه فوراً
+    // ==============================================
+
+    const { prot, cached } = await getProtectionConfig(guild.id, 'roles');
+
+    console.log(
+        `[PROTECT] roleCreate ${guild.id} | enabled=${prot?.enabled} | floodCheck...`
+    );
+
+    if (prot && prot.enabled) {
+
+        const limit = prot.limit || 5;
+        let floodLocked = false;
+
+        try {
+            floodLocked = isNukeFlood(
+                protectionFloods.roles,
+                guild.id,
+                limit
+            );
+        } catch {}
+
+        console.log(
+            `[PROTECT] roleCreate ${guild.id} | flood=${floodLocked} | limit=${limit}`
+        );
+
+        // حذف فوري — بدون انتظار أي استعلام
+        if (floodLocked) {
+            await role.delete('[Anti-Nuke] فيضان إنشاء رتب')
+                .catch(err => console.error(
+                    `[PROTECT] فشل حذف الرتبة ${role.id}: ${err.message}`
+                ));
+            console.log(`[PROTECT] roleCreate تم حذف الرتبة ${role.id} (فيضان)`);
+        }
+
+        // تحديد الفاعل وتطبيق العقوبة (بعد الحذف الفوري)
+        try {
+            const executorId = floodLocked
+                ? await getFloodExecutor(guild, AuditLogEvent.RoleCreate)
+                : await getAuditExecutor(
+                    guild,
+                    AuditLogEvent.RoleCreate,
+                    role.id
+                );
+
+            if (executorId && executorId !== client.user.id) {
+
+                const member = await getMember(guild, executorId);
+                const check = protectionAllowed(guild, member, {
+                    whitelist: cached?.whitelist || []
+                });
+
+                let punished = false;
+
+                if (!check.allowed) {
+
+                    const key = `${guild.id}-${executorId}`;
+
+                    const exceeded =
+                        floodLocked ||
+                        countExceeded(
+                            protectionCounts.roles,
+                            key,
+                            limit
+                        );
+
+                    if (exceeded) {
+
+                        clearCount(protectionCounts.roles, key);
+
+                        if (check.level === 'below') {
+                            await applyPunishment(
+                                member,
+                                prot.action || 'ban',
+                                floodLocked
+                                    ? `فيضان إنشاء رتب (أكثر من ${limit})`
+                                    : `تجاوز حد إنشاء الرتب (${limit})`
+                            );
+                            punished = true;
+                            console.log(
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} (${guild.id})`
+                            );
+                        }
+                    }
+                }
+
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Role Protection',
+                    `<@${executorId}> ${floodLocked ?
+                        'يعمل فيضان إنشاء رتب' :
+                        `تجاوز حد إنشاء الرتب (**${limit}**)`}.\n` +
+                    (floodLocked
+                        ? 'تم حذف الرتبة المنشأة فورياً.'
+                        : `تم حذف الرتبة.${check.level === 'below' ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
+                    (punished
+                        ? `\n✅ تم تطبيق العقوبة على ${executorId}.`
+                        : check.level !== 'below' && !check.allowed
+                            ? `\n(مصدر الفعل فوق/بنفس رتبة البوت — لا يمكن العقوبة عليه)`
+                            : '')
+                );
+            } else if (floodLocked) {
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Role Flood Detected',
+                    'فيضان إنشاء رتب — تم حذف الرتبة المنشأة فورياً.\n' +
+                    'المسبب غير مشخص (حاول التأكد من صلاحية **View Audit Log** للبوت).'
+                );
+            }
+        } catch (error) {
+            console.error('Role protection punish error:', error);
+        }
+    }
+
+    // ==============================================
+    // 2) سجل الإنشاء
+    // ==============================================
+
+    const executor = await executorMention(
+        guild,
         AuditLogEvent.RoleCreate,
         role.id
     );
 
     await sendLog(
-        role.guild,
+        guild,
         'role',
         '🎭 Role Created',
         `تم إنشاء الرتبة ${role}.\n` +
-        `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
+        `المسبب: ${executor}`
     );
-
-    // حماية الرتب
-    try {
-
-        const settings = await getSettings(role.guild.id);
-        ensureProtections(settings);
-        const prot = settings.protections.roles;
-
-        if (prot.enabled) {
-
-            let actionTaken = null;
-            let member = null;
-            let check = null;
-
-            if (executorId && executorId !== client.user.id) {
-
-                member = await getMember(role.guild, executorId);
-                check = protectionAllowed(role.guild, member, settings);
-
-                if (!check.allowed) {
-
-                    const key = `${role.guild.id}-${executorId}`;
-
-                    if (countExceeded(
-                        protectionCounts.roles,
-                        key,
-                        prot.limit
-                    )) {
-
-                        actionTaken = 'punish';
-
-                        if (check.level === 'below') {
-                            await applyPunishment(
-                                member,
-                                prot.action,
-                                `تجاوز حد إنشاء الرتب (${prot.limit})`
-                            );
-                        }
-
-                        clearCount(protectionCounts.roles, key);
-                    }
-                }
-            }
-
-            if (!actionTaken) {
-
-                const knownAllowed =
-                    executorId &&
-                    check &&
-                    check.allowed;
-
-                if (!knownAllowed && isNukeFlood(
-                    protectionFloods.roles,
-                    role.guild.id,
-                    prot.limit
-                )) {
-                    actionTaken = 'flood';
-                }
-            }
-
-            if (actionTaken) {
-
-                await role.delete('[Anti-Nuke] إنشاء رتب غير مصرّح').catch(() => {});
-
-                const who =
-                    executorId ? `<@${executorId}>` : 'شخص غير معروف';
-
-                await sendLog(
-                    role.guild,
-                    'moderation',
-                    '🛡️ Role Protection',
-                    `${who} ${actionTaken === 'flood' ?
-                        'يعمل فيضان إنشاء رتب' :
-                        `تجاوز حد إنشاء الرتب (**${prot.limit}**)`}.\n` +
-                    `تم حذف الرتبة المنشأة.` +
-                    (check && check.level === 'below'
-                        ? `\nالعقوبة: **${prot.action}**`
-                        : '')
-                );
-            }
-        }
-    } catch (error) {
-        console.error('Role protection error:', error);
-    }
 });
 
 client.on('roleDelete', async role => {
@@ -5125,42 +5386,96 @@ client.on('roleDelete', async role => {
     // حماية حذف الرتب
     try {
 
-        const settings = await getSettings(role.guild.id);
-        ensureProtections(settings);
-        const prot = settings.protections.roles;
+        const guild = role.guild;
+        const { prot, cached } = await getProtectionConfig(guild.id, 'roles');
 
-        if (prot.enabled) {
+        if (prot && prot.enabled) {
 
-            const executorId = await getAuditExecutor(
-                role.guild,
-                AuditLogEvent.RoleDelete,
-                role.id
+            const limit = prot.limit || 5;
+            let floodLocked = false;
+
+            try {
+                floodLocked = isNukeFlood(
+                    protectionFloods.roleDeletes,
+                    guild.id,
+                    limit
+                );
+            } catch {}
+
+            console.log(
+                `[PROTECT] roleDelete ${guild.id} | flood=${floodLocked} | limit=${limit}`
             );
+
+            const executorId = floodLocked
+                ? await getFloodExecutor(guild, AuditLogEvent.RoleDelete)
+                : await getAuditExecutor(
+                    guild,
+                    AuditLogEvent.RoleDelete,
+                    role.id
+                );
 
             if (executorId && executorId !== client.user.id) {
 
-                const member = await getMember(role.guild, executorId);
-                const check = protectionAllowed(role.guild, member, settings);
+                const member = await getMember(guild, executorId);
+                const check = protectionAllowed(guild, member, {
+                    whitelist: cached?.whitelist || []
+                });
 
                 if (!check.allowed) {
 
-                    if (check.level === 'below') {
-                        await applyPunishment(
-                            member,
-                            prot.action,
-                            'حذف رتبة (نوك)'
+                    const key = `${guild.id}-${executorId}`;
+
+                    const exceeded =
+                        floodLocked ||
+                        countExceeded(
+                            protectionCounts.roles,
+                            key,
+                            Math.max(Math.round(limit / 2), 1)
+                        );
+
+                    if (exceeded) {
+
+                        clearCount(protectionCounts.roles, key);
+
+                        if (check.level === 'below') {
+                            await applyPunishment(
+                                member,
+                                prot.action || 'ban',
+                                floodLocked
+                                    ? `فيضان حذف رتب (أكثر من ${limit})`
+                                    : `حذف رتب غير مصرّح (نوك)`
+                            );
+                            console.log(
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} للفيضان/حذف رتب (${guild.id})`
+                            );
+                        }
+
+                        await sendLog(
+                            guild,
+                            'moderation',
+                            '🛡️ Role Deletion Protection',
+                            `<@${executorId}> ${floodLocked ?
+                                'يعمل فيضان حذف رتب' :
+                                'حذف رتب بدون إذن'}.\n` +
+                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                            (check.level === 'below'
+                                ? `العقوبة: **${prot.action || 'ban'}**`
+                                : 'نفس/أعلى رتبة البوت — تم التسجيل فقط')
                         );
                     }
-
-                    await sendLog(
-                        role.guild,
-                        'moderation',
-                        '🛡️ Role Deletion Protection',
-                        `<@${executorId}> حذف رتبة **${role.name}** بدون إذن.\n` +
-                        `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                        (check.level === 'below' ? `العقوبة: **${prot.action}**` : '')
-                    );
                 }
+            } else if (floodLocked) {
+                console.log(
+                    `[PROTECT] فيضان حذف رتب ${guild.id} — المسبب غير مشخص`
+                );
+
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Role Deletion Flood',
+                    'فيضان حذف رتب — المسبب غير مشخص.\n' +
+                    'تأكد من صلاحية **View Audit Log** للبوت.'
+                );
             }
         }
     } catch (error) {
@@ -5284,7 +5599,129 @@ client.on('channelCreate', async channel => {
 
     const guild = channel.guild;
 
-    const executorId = await getAuditExecutor(
+    // ==============================================
+    // 1) الحماية: كشف الفيضان والرد عليه فوراً
+    // (محددوا سجل التدقيق زيادة — الفيضان يُحذف لحظياً)
+    // ==============================================
+
+    const { prot, cached } = await getProtectionConfig(guild.id, 'channels');
+
+    console.log(
+        `[PROTECT] channelCreate ${guild.id} | enabled=${prot?.enabled} | floodCheck...`
+    );
+
+    if (prot && prot.enabled) {
+
+        const limit = prot.limit || 5;
+        let floodLocked = false;
+
+        try {
+            floodLocked = isNukeFlood(
+                protectionFloods.channels,
+                guild.id,
+                limit
+            );
+        } catch {}
+
+        console.log(
+            `[PROTECT] channelCreate ${guild.id} | flood=${floodLocked} | limit=${limit}`
+        );
+
+        // حذف فوري — بدون انتظار أي استعلام
+        if (floodLocked) {
+            await channel.delete('[Anti-Nuke] فيضان إنشاء رومات')
+                .catch(err => console.error(
+                    `[PROTECT] فشل حذف الروم ${channel.id}: ${err.message}`
+                ));
+            console.log(`[PROTECT] channelCreate تم حذف الروم ${channel.id} (فيضان)`);
+        }
+
+        // تحديد الفاعل وتطبيق العقوبة (بعد الحذف الفوري، بدون تعطيله)
+        try {
+            const executorId = floodLocked
+                ? await getFloodExecutor(guild, AuditLogEvent.ChannelCreate)
+                : await getAuditExecutor(
+                    guild,
+                    AuditLogEvent.ChannelCreate,
+                    channel.id
+                );
+
+            if (executorId && executorId !== client.user.id) {
+
+                const member = await getMember(guild, executorId);
+                const check = protectionAllowed(guild, member, {
+                    whitelist: cached?.whitelist || []
+                });
+
+                let punished = false;
+
+                if (!check.allowed) {
+
+                    const key = `${guild.id}-${executorId}`;
+
+                    const exceeded =
+                        floodLocked ||
+                        countExceeded(
+                            protectionCounts.channels,
+                            key,
+                            limit
+                        );
+
+                    if (exceeded) {
+
+                        clearCount(protectionCounts.channels, key);
+
+                        if (check.level === 'below') {
+                            await applyPunishment(
+                                member,
+                                prot.action || 'ban',
+                                floodLocked
+                                    ? `فيضان إنشاء رومات (أكثر من ${limit})`
+                                    : `تجاوز حد إنشاء الرومات (${limit})`
+                            );
+                            punished = true;
+                            console.log(
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} (${guild.id})`
+                            );
+                        }
+                    }
+                }
+
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Channel Protection',
+                    `<@${executorId}> ${floodLocked ?
+                        'يعمل فيضان إنشاء رومات' :
+                        `تجاوز حد إنشاء الرومات (**${limit}**)`}.\n` +
+                    (floodLocked
+                        ? 'تم حذف الروم المنشأ فورياً.'
+                        : `تم حذف الروم.${check.level === 'below' ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
+                    (punished
+                        ? `\n✅ تم تطبيق العقوبة على ${executorId}.`
+                        : check.level !== 'below' && !check.allowed
+                            ? `\n(مصدر النازح فوق/بنفس رتبة البوت — لا يمكن العقوبة عليه)`
+                            : '')
+                );
+            } else if (floodLocked) {
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Channel Flood Detected',
+                    'فيضان إنشاء رومات — تم حذف الروم المنشأ فورياً.\n' +
+                    'المسبب غير مشخص (حاول التأكد من صلاحية **View Audit Log** للبوت).'
+                );
+            }
+        } catch (error) {
+            console.error('Channel protection punish error:', error);
+        }
+    }
+
+    // ==============================================
+    // 2) سجل الإنشاء
+    // ==============================================
+
+    const executor = await executorMention(
         guild,
         AuditLogEvent.ChannelCreate,
         channel.id
@@ -5295,96 +5732,8 @@ client.on('channelCreate', async channel => {
         'channel',
         '📁 Channel Created',
         `تم إنشاء ${channel}.\n` +
-        `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
+        `المسبب: ${executor}`
     );
-
-    // حماية الرومات
-    try {
-
-        const settings = await getSettings(guild.id);
-        ensureProtections(settings);
-        const prot = settings.protections.channels;
-
-        if (prot.enabled) {
-
-            let actionTaken = null;
-            let member = null;
-            let check = null;
-
-            // 1) المعرفة من سجل التدقيق (لو توفر)
-            if (executorId && executorId !== client.user.id) {
-
-                member = await getMember(guild, executorId);
-                check = protectionAllowed(guild, member, settings);
-
-                if (!check.allowed) {
-
-                    const key = `${guild.id}-${executorId}`;
-
-                    if (countExceeded(
-                        protectionCounts.channels,
-                        key,
-                        prot.limit
-                    )) {
-
-                        actionTaken = 'punish';
-
-                        if (check.level === 'below') {
-                            await applyPunishment(
-                                member,
-                                prot.action,
-                                `تجاوز حد إنشاء الرومات (${prot.limit})`
-                            );
-                        }
-
-                        clearCount(protectionCounts.channels, key);
-                    }
-                }
-            }
-
-            // 2) كشف الفيضان: المسبب غير معروف أو غير مخوّل
-            if (!actionTaken) {
-
-                const knownAllowed =
-                    executorId &&
-                    check &&
-                    check.allowed;
-
-                if (!knownAllowed && isNukeFlood(
-                    protectionFloods.channels,
-                    guild.id,
-                    prot.limit
-                )) {
-                    actionTaken = 'flood';
-                }
-            }
-
-            if (actionTaken) {
-
-                await channel.delete(
-                    '[Anti-Nuke] إنشاء رومات غير مصرّح'
-                ).catch(() => {});
-
-                const who =
-                    executorId ? `<@${executorId}>` : 'شخص غير معروف';
-
-                await sendLog(
-                    guild,
-                    'moderation',
-                    '🛡️ Channel Protection',
-                    `${who} ${actionTaken === 'flood' ?
-                        'يعمل فيضان إنشاء رومات' :
-                        `تجاوز حد إنشاء الرومات (**${prot.limit}**)`}.\n` +
-                    `تم حذف الروم المنشأ.` +
-                    (check && check.level === 'below'
-                        ? `\nالعقوبة: **${prot.action}**`
-                        : '')
-                );
-            }
-        }
-    } catch (error) {
-        console.error('Channel protection error:', error);
-    }
 });
 
 client.on('channelDelete', async channel => {
@@ -5408,42 +5757,96 @@ client.on('channelDelete', async channel => {
     // حماية حذف الرومات
     try {
 
-        const settings = await getSettings(channel.guild.id);
-        ensureProtections(settings);
-        const prot = settings.protections.channels;
+        const guild = channel.guild;
+        const { prot, cached } = await getProtectionConfig(guild.id, 'channels');
 
-        if (prot.enabled) {
+        if (prot && prot.enabled) {
 
-            const executorId = await getAuditExecutor(
-                channel.guild,
-                AuditLogEvent.ChannelDelete,
-                channel.id
+            const limit = prot.limit || 5;
+            let floodLocked = false;
+
+            try {
+                floodLocked = isNukeFlood(
+                    protectionFloods.channelDeletes,
+                    guild.id,
+                    limit
+                );
+            } catch {}
+
+            console.log(
+                `[PROTECT] channelDelete ${guild.id} | flood=${floodLocked} | limit=${limit}`
             );
+
+            const executorId = floodLocked
+                ? await getFloodExecutor(guild, AuditLogEvent.ChannelDelete)
+                : await getAuditExecutor(
+                    guild,
+                    AuditLogEvent.ChannelDelete,
+                    channel.id
+                );
 
             if (executorId && executorId !== client.user.id) {
 
-                const member = await getMember(channel.guild, executorId);
-                const check = protectionAllowed(channel.guild, member, settings);
+                const member = await getMember(guild, executorId);
+                const check = protectionAllowed(guild, member, {
+                    whitelist: cached?.whitelist || []
+                });
 
                 if (!check.allowed) {
 
-                    if (check.level === 'below') {
-                        await applyPunishment(
-                            member,
-                            prot.action,
-                            'حذف روم (نوك)'
+                    const key = `${guild.id}-${executorId}`;
+
+                    const exceeded =
+                        floodLocked ||
+                        countExceeded(
+                            protectionCounts.channels,
+                            key,
+                            Math.max(Math.round(limit / 2), 1)
+                        );
+
+                    if (exceeded) {
+
+                        clearCount(protectionCounts.channels, key);
+
+                        if (check.level === 'below') {
+                            await applyPunishment(
+                                member,
+                                prot.action || 'ban',
+                                floodLocked
+                                    ? `فيضان حذف رومات (أكثر من ${limit})`
+                                    : `حذف رومات غير مصرّح (نوك)`
+                            );
+                            console.log(
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} للفيضان/حذف رومات (${guild.id})`
+                            );
+                        }
+
+                        await sendLog(
+                            guild,
+                            'moderation',
+                            '🛡️ Channel Deletion Protection',
+                            `<@${executorId}> ${floodLocked ?
+                                'يعمل فيضان حذف رومات' :
+                                'حذف رومات بدون إذن'}.\n` +
+                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                            (check.level === 'below'
+                                ? `العقوبة: **${prot.action || 'ban'}**`
+                                : 'نفس/أعلى رتبة البوت — تم التسجيل فقط')
                         );
                     }
-
-                    await sendLog(
-                        channel.guild,
-                        'moderation',
-                        '🛡️ Channel Deletion Protection',
-                        `<@${executorId}> حذف روم **${channel.name}** بدون إذن.\n` +
-                        `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                        (check.level === 'below' ? `العقوبة: **${prot.action}**` : '')
-                    );
                 }
+            } else if (floodLocked) {
+                console.log(
+                    `[PROTECT] فيضان حذف رومات ${guild.id} — المسبب غير مشخص`
+                );
+
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Channel Deletion Flood',
+                    'فيضان حذف رومات — المسبب غير مشخص.\n' +
+                    'تأكد من صلاحية **View Audit Log** للبوت.'
+                );
             }
         }
     } catch (error) {
