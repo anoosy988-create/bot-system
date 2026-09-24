@@ -759,6 +759,50 @@ const protectionCounts = {
     webhooks: new Map()
 };
 
+// تتبّع الأشياء (رومات/رتب) المنشأة على يد كل فاعل:
+// guildId-executorId -> [{ id, ts }] — لنحذف كل ما سواه عند تجاوز الحد
+const createdByActor = {
+    channels: new Map(),
+    roles: new Map()
+};
+
+// سجّل إبداع الفاعل (لحذفه لاحقاً عند العقوبة)
+function trackCreatedItem(tracker, guildId, executorId, itemId, windowMs = 20 * 60 * 1000) {
+    try {
+        const now = Date.now();
+        const key = `${guildId}-${executorId}`;
+        const list = (tracker.get(key) || [])
+            .filter(it => now - it.ts <= windowMs);
+        list.push({ id: itemId, ts: now });
+        tracker.set(key, list);
+    } catch {}
+}
+
+// احذف كل إبداعات الفاعل (أو مرّر قائمة أهداف للحذف)
+async function removeCreatedByActor(tracker, guild, executorId, currentlyCreated) {
+    const key = `${guild.id}-${executorId}`;
+    const list = tracker.get(key) || [];
+
+    const ids = new Set(list.map(it => it.id));
+    if (currentlyCreated) ids.add(currentlyCreated.id);
+
+    let removed = 0;
+
+    for (const itemId of ids) {
+        try {
+            const item = guild.channels.cache.get(itemId) ||
+                         guild.roles.cache.get(itemId);
+            if (item?.deletable) {
+                await item.delete('[Anti-Nuke] حذف إبداعات غير مصرّح بها');
+                removed++;
+            }
+        } catch {}
+    }
+
+    tracker.delete(key);
+    return removed;
+}
+
 // عدّاد تحذيرات السبام لكل عضو (قبل تطبيق Time-out)
 // { count, last }
 const spamWarnCounts = new Map();
@@ -886,6 +930,33 @@ async function getFloodExecutor(guild, type, maxEntries = 25, windowMs = 120000)
     }
 
     return null;
+}
+
+// تحديد موثوق للفاعل حتى في الحركة البطيئة:
+// سجل التدقيق أحياناً يتأخر عن الحدث → نعيد المحاولة، ثم نرجع لأي منفذ حديث
+async function resolveAbuseExecutor(guild, auditType, targetId) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const audit = await guild.fetchAuditLogs({ type: auditType, limit: 5 });
+            const now = Date.now();
+
+            const entry = audit.entries.find(
+                e => e.targetId === targetId &&
+                     e.executor?.id &&
+                     e.executor.id !== client.user.id &&
+                     now - e.createdTimestamp <= 30000
+            );
+
+            if (entry?.executor?.id) return entry.executor.id;
+        } catch {}
+
+        if (attempt < 3) {
+            await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+    }
+
+    // ما لقينا من ينطبق على التارجت — نرجع لأحدث منفذ نشط غير البوت
+    return getFloodExecutor(guild, auditType, 10, 120000);
 }
 
 function isLimitExceeded(counter, key, now, limit, timeframe) {
@@ -6065,15 +6136,21 @@ client.on('roleCreate', async role => {
 
         // تحديد الفاعل وتطبيق العقوبة (بعد الحذف الفوري)
         try {
-            const executorId = floodLocked
-                ? await getFloodExecutor(guild, AuditLogEvent.RoleCreate)
-                : await getAuditExecutor(
-                    guild,
-                    AuditLogEvent.RoleCreate,
-                    role.id
-                );
+            const executorId = await resolveAbuseExecutor(
+                guild,
+                AuditLogEvent.RoleCreate,
+                role.id
+            );
 
             if (executorId && executorId !== client.user.id) {
+
+                // سجّل الرتبة كإبداع لهذا الفاعل لكي نمسحها كلها عند العقوبة
+                trackCreatedItem(
+                    createdByActor.roles,
+                    guild.id,
+                    executorId,
+                    role.id
+                );
 
                 const member = await getMember(guild, executorId);
                 const check = protectionAllowed(guild, member, {
@@ -6098,7 +6175,18 @@ client.on('roleCreate', async role => {
 
                         clearCount(protectionCounts.roles, key);
 
-                        if (check.level === 'below') {
+                        // حذف كل الرتب اللي سواها الفاعل (حتى في الحركة البطيئة)
+                        const removed = await removeCreatedByActor(
+                            createdByActor.roles,
+                            guild,
+                            executorId,
+                            role
+                        );
+
+                        if (
+                            check.level === 'below' ||
+                            check.level === 'unknown'
+                        ) {
                             await punishFor(
                                 guild,
                                 member,
@@ -6110,7 +6198,7 @@ client.on('roleCreate', async role => {
                             );
                             punished = true;
                             console.log(
-                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} (${guild.id})`
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} | حذف ${removed} رتبة (${guild.id})`
                             );
                         }
                     }
@@ -6124,12 +6212,12 @@ client.on('roleCreate', async role => {
                         'يعمل فيضان إنشاء رتب' :
                         `تجاوز حد إنشاء الرتب (**${limit}**)`}.\n` +
                     (floodLocked
-                        ? 'تم حذف الرتبة المنشأة فورياً.'
-                        : `تم حذف الرتبة.${check.level === 'below' ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
+                        ? 'تم حذف الرتب المنشأة فورياً.'
+                        : `تم حذف الرتب.${check.level === 'below' || check.level === 'unknown' ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
                     (punished
                         ? `\n✅ تم تطبيق العقوبة على ${executorId}.`
                         : check.level !== 'below' && !check.allowed
-                            ? `\n(مصدر الفعل فوق/بنفس رتبة البوت — لا يمكن العقوبة عليه)`
+                            ? `\n(مصدر النازح فوق/بنفس رتبة البوت — لا يمكن العقوبة عليه)`
                             : '')
                 );
             } else if (floodLocked) {
@@ -6209,13 +6297,11 @@ client.on('roleDelete', async role => {
                 `[PROTECT] roleDelete ${guild.id} | flood=${floodLocked} | limit=${limit}`
             );
 
-            const executorId = floodLocked
-                ? await getFloodExecutor(guild, AuditLogEvent.RoleDelete)
-                : await getAuditExecutor(
-                    guild,
-                    AuditLogEvent.RoleDelete,
-                    role.id
-                );
+            const executorId = await resolveAbuseExecutor(
+                guild,
+                AuditLogEvent.RoleDelete,
+                role.id
+            );
 
             if (executorId && executorId !== client.user.id) {
 
@@ -6240,7 +6326,10 @@ client.on('roleDelete', async role => {
 
                         clearCount(protectionCounts.roles, key);
 
-                        if (check.level === 'below') {
+                        if (
+                            check.level === 'below' ||
+                            check.level === 'unknown'
+                        ) {
                             await punishFor(
                                 guild,
                                 member,
@@ -6263,7 +6352,7 @@ client.on('roleDelete', async role => {
                                 'يعمل فيضان حذف رتب' :
                                 'حذف رتب بدون إذن'}.\n` +
                             `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                            (check.level === 'below'
+                            (check.level === 'below' || check.level === 'unknown'
                                 ? `العقوبة: **${prot.action || 'ban'}**`
                                 : 'نفس/أعلى رتبة البوت — تم التسجيل فقط')
                         );
@@ -6451,15 +6540,21 @@ client.on('channelCreate', async channel => {
 
         // تحديد الفاعل وتطبيق العقوبة (بعد الحذف الفوري، بدون تعطيله)
         try {
-            const executorId = floodLocked
-                ? await getFloodExecutor(guild, AuditLogEvent.ChannelCreate)
-                : await getAuditExecutor(
-                    guild,
-                    AuditLogEvent.ChannelCreate,
-                    channel.id
-                );
+            const executorId = await resolveAbuseExecutor(
+                guild,
+                AuditLogEvent.ChannelCreate,
+                channel.id
+            );
 
             if (executorId && executorId !== client.user.id) {
+
+                // سجّل الروم كإبداع لهذا الفاعل لكي نمسحها كلها عند العقوبة
+                trackCreatedItem(
+                    createdByActor.channels,
+                    guild.id,
+                    executorId,
+                    channel.id
+                );
 
                 const member = await getMember(guild, executorId);
                 const check = protectionAllowed(guild, member, {
@@ -6484,7 +6579,18 @@ client.on('channelCreate', async channel => {
 
                         clearCount(protectionCounts.channels, key);
 
-                        if (check.level === 'below') {
+                        // حذف كل الرومات اللي سواها الفاعل (حتى في الحركة البطيئة)
+                        const removed = await removeCreatedByActor(
+                            createdByActor.channels,
+                            guild,
+                            executorId,
+                            channel
+                        );
+
+                        if (
+                            check.level === 'below' ||
+                            check.level === 'unknown'
+                        ) {
                             await punishFor(
                                 guild,
                                 member,
@@ -6496,7 +6602,7 @@ client.on('channelCreate', async channel => {
                             );
                             punished = true;
                             console.log(
-                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} (${guild.id})`
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} | حذف ${removed} روم (${guild.id})`
                             );
                         } else {
                             console.log(
@@ -6515,7 +6621,7 @@ client.on('channelCreate', async channel => {
                         `تجاوز حد إنشاء الرومات (**${limit}**)`}.\n` +
                     (floodLocked
                         ? 'تم حذف الروم المنشأ فورياً.'
-                        : `تم حذف الروم.${check.level === 'below' ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
+                        : `تم حذف الروم.${check.level === 'below' || check.level === 'unknown' ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
                     (punished
                         ? `\n✅ تم تطبيق العقوبة على ${executorId}.`
                         : check.level !== 'below' && !check.allowed
@@ -6608,13 +6714,11 @@ client.on('channelDelete', async channel => {
                 );
             }
 
-            const executorId = floodLocked
-                ? await getFloodExecutor(guild, AuditLogEvent.ChannelDelete)
-                : await getAuditExecutor(
-                    guild,
-                    AuditLogEvent.ChannelDelete,
-                    channel.id
-                );
+            const executorId = await resolveAbuseExecutor(
+                guild,
+                AuditLogEvent.ChannelDelete,
+                channel.id
+            );
 
             if (executorId && executorId !== client.user.id) {
 
@@ -6639,7 +6743,10 @@ client.on('channelDelete', async channel => {
 
                         clearCount(protectionCounts.channels, key);
 
-                        if (check.level === 'below') {
+                        if (
+                            check.level === 'below' ||
+                            check.level === 'unknown'
+                        ) {
                             await punishFor(
                                 guild,
                                 member,
@@ -6662,7 +6769,7 @@ client.on('channelDelete', async channel => {
                                 'يعمل فيضان حذف رومات' :
                                 'حذف رومات بدون إذن'}.\n` +
                             `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                            (check.level === 'below'
+                            (check.level === 'below' || check.level === 'unknown'
                                 ? `العقوبة: **${prot.action || 'ban'}**`
                                 : 'نفس/أعلى رتبة البوت — تم التسجيل فقط')
                         );
