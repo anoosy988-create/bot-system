@@ -7,6 +7,7 @@ const {
     SlashCommandBuilder,
     ActionRowBuilder,
     StringSelectMenuBuilder,
+    ChannelSelectMenuBuilder,
     ModalBuilder,
     TextInputBuilder,
     TextInputStyle,
@@ -3874,30 +3875,18 @@ const botsDesc = settings.protections.bots.enabled
                 const row =
                     new ActionRowBuilder()
                         .addComponents(
-                            new StringSelectMenuBuilder()
+                            new ChannelSelectMenuBuilder()
                                 .setCustomId(
                                     `logs_channel_${type}`
                                 )
                                 .setPlaceholder(
                                     'اختر الروم'
                                 )
-                                .addOptions(
-                                    interaction.guild.channels.cache
-                                        .filter(
-                                            c =>
-                                                c.type ===
-                                                ChannelType.GuildText
-                                        )
-                                        .first(25)
-                                        .map(channel => ({
-                                            label:
-                                                channel.name.slice(0, 100),
-                                            value:
-                                                channel.id,
-                                            description:
-                                                `تعيين ${channel.name} للسجل`
-                                        }))
+                                .setChannelTypes(
+                                    ChannelType.GuildText
                                 )
+                                .setMinValues(1)
+                                .setMaxValues(1)
                         );
 
                 return interaction.update({
@@ -3906,13 +3895,26 @@ const botsDesc = settings.protections.bots.enabled
                     components: [row]
                 });
             }
+        }
 
 
-            // ==============================================
-            // LOG CHANNEL
-            // ==============================================
+        // ==================================================
+        // CHANNEL SELECT (اختيار روم السجل)
+        // ==================================================
+
+        if (interaction.isChannelSelectMenu()) {
+
+            const id = interaction.customId;
 
             if (id.startsWith('logs_channel_')) {
+
+                if (!isAdmin(interaction)) {
+                    return interaction.reply({
+                        content:
+                            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`,
+                        ephemeral: true
+                    });
+                }
 
                 const type =
                     id.replace('logs_channel_', '');
