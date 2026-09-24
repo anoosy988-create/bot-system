@@ -270,7 +270,11 @@ const guildSchema = new mongoose.Schema({
         type: [
             {
                 trigger: String,
-                response: String
+                response: String,
+                staffOnly: {
+                    type: Boolean,
+                    default: false
+                }
             }
         ],
         default: []
@@ -1446,6 +1450,11 @@ const slashCommands = [
                         .setDescription('الرد')
                         .setRequired(true)
                 )
+                .addBooleanOption(o =>
+                    o.setName('staff_only')
+                        .setDescription('هل يلزم رتبة ستريتر ليستجيب؟ (الافتراضي: أي عضو)')
+                        .setRequired(false)
+                )
         )
         .addSubcommand(sub =>
             sub.setName('remove')
@@ -2555,9 +2564,13 @@ client.on('interactionCreate', async interaction => {
                         });
                     }
 
+                    const staffOnly =
+                        interaction.options.getBoolean('staff_only') || false;
+
                     settings.autoResponses.push({
                         trigger,
-                        response
+                        response,
+                        staffOnly
                     });
 
                     await settings.save();
@@ -2568,7 +2581,8 @@ client.on('interactionCreate', async interaction => {
                                 .setTitle('🤖 إضافة الرد التلقائي')
                                 .setDescription(
                                     `**الرد:** ${trigger}\n` +
-                                    `**الإجابة:** ${response}`
+                                    `**الإجابة:** ${response}\n` +
+                                    `**من يستجيب له:** ${staffOnly ? `🔒 رتبة ${STAFF_ROLE_NAME} فقط` : '🌐 أي عضو'}`
                                 )
                                 .setColor(0x57F287)
                                 .setFooter({
@@ -3768,11 +3782,27 @@ const botsDesc = settings.protections.bots.enabled
                             .setRequired(true)
                             .setValue(item.response);
 
+                    const permissionInput =
+                        new TextInputBuilder()
+                            .setCustomId('permission')
+                            .setLabel('الصلاحية — staff = الفريق فقط | غير ذلك = الجميع')
+                            .setStyle(
+                                TextInputStyle.Short
+                            )
+                            .setRequired(true)
+                            .setValue(
+                                item.staffOnly
+                                    ? 'staff'
+                                    : 'any'
+                            );
+
                     modal.addComponents(
                         new ActionRowBuilder()
                             .addComponents(triggerInput),
                         new ActionRowBuilder()
-                            .addComponents(responseInput)
+                            .addComponents(responseInput),
+                        new ActionRowBuilder()
+                            .addComponents(permissionInput)
                     );
 
                     return interaction.showModal(modal);
@@ -3922,6 +3952,15 @@ const botsDesc = settings.protections.bots.enabled
                     interaction.fields.getTextInputValue(
                         'response'
                     );
+
+                const permission =
+                    interaction.fields
+                        .getTextInputValue('permission')
+                        .trim()
+                        .toLowerCase();
+
+                item.staffOnly =
+                    permission === 'staff';
 
                 await settings.save();
 
@@ -4087,9 +4126,10 @@ async function sendAutoResponseList(
             settings.autoResponses
                 .map(
                     (item, index) =>
-                        `**${index + 1}.** \`${item.trigger}\` → ${item.response}`
+                        `**${index + 1}.** ${item.staffOnly ? '🔒' : '🌐'} \`${item.trigger}\` → ${item.response}`
                 )
-                .join('\n')
+                .join('\n') +
+            `\n\n🔒 رتبة ${STAFF_ROLE_NAME} فقط | 🌐 أي عضو يستجيب`
         );
     }
 
@@ -5504,6 +5544,16 @@ client.on('messageCreate', async message => {
                 normalizedMessage === trigger
             ) {
 
+                if (
+                    auto.staffOnly &&
+                    !memberHasStaffRole(
+                        message.member,
+                        message.guild
+                    )
+                ) {
+                    break;
+                }
+
                 await message.reply(
                     auto.response
                 );
@@ -5620,7 +5670,7 @@ async function executeShortcut(
 
     if (!memberHasStaffRole(message.member, message.guild)) {
         return message.reply(
-            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** (فوق رتبة البوت) لاستخدام الاختصارات.`
+            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام الاختصارات.`
         );
     }
 
