@@ -6359,11 +6359,13 @@ client.on('roleDelete', async role => {
 
                         clearCount(protectionCounts.roles, key);
 
+                        let punished = false;
+
                         if (
                             check.level === 'below' ||
                             check.level === 'unknown'
                         ) {
-                            const punished = await punishFor(
+                            punished = await punishFor(
                                 guild,
                                 member,
                                 executorId,
@@ -6392,7 +6394,12 @@ client.on('roleDelete', async role => {
                                 'حذف رتب بدون إذن'}.\n` +
                             `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
                             (check.level === 'below' || check.level === 'unknown'
-                                ? `العقوبة: **${prot.action || 'ban'}**`
+                                ? punished
+                                    ? `✅ العقوبة: **${prot.action || 'ban'}** تم تنفيذها`
+                                    : `❌ العقوبة: **${prot.action || 'ban'}** فشلت — ` +
+                                      (member?.id === guild.ownerId
+                                          ? 'الهدف هو مالك السيرفر (لا يمكن بنده)'
+                                          : 'تحقق من صلاحيات البوت/رتب الرتب')
                                 : 'نفس/أعلى رتبة البوت — تم التسجيل فقط')
                         );
                     }
@@ -6788,11 +6795,13 @@ client.on('channelDelete', async channel => {
 
                         clearCount(protectionCounts.channels, key);
 
+                        let punished = false;
+
                         if (
                             check.level === 'below' ||
                             check.level === 'unknown'
                         ) {
-                            const punished = await punishFor(
+                            punished = await punishFor(
                                 guild,
                                 member,
                                 executorId,
@@ -6805,6 +6814,13 @@ client.on('channelDelete', async channel => {
                                 `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} ` +
                                 `للفيضان/حذف رومات (${guild.id}) — نجحت=${punished}`
                             );
+
+                            if (!punished && member?.id === guild.ownerId) {
+                                console.warn(
+                                    `[PROTECT] ${executorId} هو مالك السيرفر — ` +
+                                    `الديسكورد يمنع بند المالك، لاحظ أن الحماية لا تشمل مالك السيرفر`
+                                );
+                            }
                         } else {
                             console.log(
                                 `[PROTECT] تم التخطي: المستوى ${check.level} ` +
@@ -6821,7 +6837,12 @@ client.on('channelDelete', async channel => {
                                 'حذف رومات بدون إذن'}.\n` +
                             `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
                             (check.level === 'below' || check.level === 'unknown'
-                                ? `العقوبة: **${prot.action || 'ban'}**`
+                                ? punished
+                                    ? `✅ العقوبة: **${prot.action || 'ban'}** تم تنفيذها`
+                                    : `❌ العقوبة: **${prot.action || 'ban'}** فشلت — ` +
+                                      (member?.id === guild.ownerId
+                                          ? 'الهدف هو مالك السيرفر (لا يمكن بنده)'
+                                          : 'تحقق من صلاحيات البوت/رتب الرتب')
                                 : 'نفس/أعلى رتبة البوت — تم التسجيل فقط')
                         );
                     }
