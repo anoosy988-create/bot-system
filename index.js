@@ -996,6 +996,175 @@ async function deleteAllWebhooks(guild) {
     }
 }
 
+// ======================================================
+// SNAPSHOT + RESTORE (استرجاع الرومات/الكاتوقريز)
+// ======================================================
+
+// لقطات الرومات والكاتوقريز وصلاحياتها:
+// guildId -> { capturedAt, items: [...] }
+const channelSnapshots = new Map();
+
+const CHANNEL_SNAPSHOT_INTERVAL = 60 * 1000; // نحدّث اللقطة كل دقيقة
+
+// هل فلوض حذف مفعّل حالياً لسيرفر؟ (حتى لا نلتقط صورة "بعد الخراب")
+function isDeleteFloodActive(guildId, windowMs = 8000) {
+    const deletes = protectionFloods.channelDeletes.get(guildId) || [];
+    const now = Date.now();
+    return deletes.some(t => now - t <= windowMs);
+}
+
+// لقطة روم واحد (يُستدعى عند الإنشاء/التعديل ليظل السنشوت طازجاً)
+function captureSingleChannel(channel) {
+    try {
+        if (!channel?.guild) return;
+
+        const now = Date.now();
+
+        // لا نلتقط أثناء نوك حذف أو إنشاء — لئلا نحفظ "حالة الخراب"
+        const delFlood = (protectionFloods.channelDeletes.get(channel.guild.id) || [])
+            .some(t => now - t <= 8000);
+        const createFlood = (protectionFloods.channels.get(channel.guild.id) || [])
+            .some(t => now - t <= 8000);
+
+        if (delFlood || createFlood) return;
+
+        const snap = channelSnapshots.get(channel.guild.id);
+
+        if (!snap) return;
+
+        const index = snap.items.findIndex(i => i.id === channel.id);
+
+        const item = {
+            id: channel.id,
+            name: channel.name,
+            type: channel.type,
+            position: channel.position,
+            parentId: channel.parentId,
+            topic: channel.topic || null,
+            nsfw: !!channel.nsfw,
+            rateLimitPerUser: channel.rateLimitPerUser || 0,
+            overwrites: channel.permissionOverwrites.cache.map(o => ({
+                id: o.id,
+                type: o.type,
+                allow: o.allow.bitfield,
+                deny: o.deny.bitfield
+            }))
+        };
+
+        if (index >= 0) {
+            snap.items[index] = item;
+        } else {
+            snap.items.push(item);
+        }
+
+        snap.capturedAt = Date.now();
+    } catch {}
+}
+
+// لقطة كاملة للسيرفر (تُستدعى دورياً)
+function captureChannels(guild) {
+    try {
+        if (!guild || isDeleteFloodActive(guild.id)) return;
+
+        const items = [];
+
+        for (const ch of guild.channels.cache.values()) {
+            items.push({
+                id: ch.id,
+                name: ch.name,
+                type: ch.type,
+                position: ch.position,
+                parentId: ch.parentId,
+                topic: ch.topic || null,
+                nsfw: !!ch.nsfw,
+                rateLimitPerUser: ch.rateLimitPerUser || 0,
+                overwrites: ch.permissionOverwrites.cache.map(o => ({
+                    id: o.id,
+                    type: o.type,
+                    allow: o.allow.bitfield,
+                    deny: o.deny.bitfield
+                }))
+            });
+        }
+
+        channelSnapshots.set(guild.id, {
+            capturedAt: Date.now(),
+            items
+        });
+    } catch (error) {
+        console.error('Channel snapshot error:', error);
+    }
+}
+
+// استرجاع الرومات والكاتوقريز المفقودة من آخر لقطة (بصلاحياتها)
+async function restoreChannels(guild) {
+    const snap = channelSnapshots.get(guild.id);
+
+    if (!snap || !snap.items?.length) {
+        return { restored: 0, total: 0, categories: 0 };
+    }
+
+    const existing = new Set(guild.channels.cache.keys());
+    const missing = snap.items.filter(i => !existing.has(i.id));
+
+    if (!missing.length) return { restored: 0, total: 0, categories: 0 };
+
+    // الكاتوقريز أولاً ثم الرومات عشان ما نعلق قالب مع الوالد
+    const parents = missing.filter(
+        i => i.type === ChannelType.GuildCategory
+    );
+    const children = missing.filter(
+        i => i.type !== ChannelType.GuildCategory
+    );
+
+    let restored = 0;
+    const restoredIds = new Set();
+
+    const createOne = async item => {
+        try {
+            const created = await guild.channels.create({
+                name: item.name,
+                type: item.type,
+                topic: item.topic,
+                nsfw: item.nsfw,
+                rateLimitPerUser: item.rateLimitPerUser,
+                parent: item.parentId,
+                permissionOverwrites: item.overwrites.map(o => ({
+                    id: o.id,
+                    type: o.type,
+                    allow: o.allow,
+                    deny: o.deny
+                }))
+            });
+
+            if (created) {
+                restored++;
+                restoredIds.add(item.id);
+                captureSingleChannel(created); // حتّى لا نعيد استرجاعه ثانيةً
+                console.log(
+                    `[PROTECT] استرجاع ${item.type === ChannelType.GuildCategory ? 'كاتوقري' : 'روم'} "${item.name}" (${item.id})`
+                );
+            }
+        } catch (error) {
+            console.error(
+                `[PROTECT] فشل استرجاع "${item.name}": ${error.message}`
+            );
+        }
+    };
+
+    for (const item of parents) await createOne(item);
+
+    // مررنا بعد الكاتوقريز: أي ولد والده غير موجود → نعيد محاولة تشغيله بعد الكاتوقريز
+    for (const item of children) {
+        if (item.parentId && !existing.has(item.parentId) && !restoredIds.has(item.parentId)) {
+            item.parentId = null; // بدون والد، أفضل من الفشل
+        }
+        await createOne(item);
+    }
+
+    return { restored, total: missing.length, categories: parents.length };
+}
+
 // حماية الويب هوك:
 //  - الإنشاء: مسموح حتى "الحد" المحدد، وعند التجاوز → عقوبة + حذف كل الويب هوك
 //  - الحذف/التعديل من غير مخوّل → حذف كل الويب هوك فوراً
@@ -2194,6 +2363,13 @@ client.once('ready', async () => {
     );
 
     runProtectionDiagnostics();
+
+    // لقطات دورية لرومات كل سيرفر (لاسترجاعها فوراً إذا انحذفت بنوك)
+    setInterval(() => {
+        for (const guild of client.guilds.cache.values()) {
+            captureChannels(guild);
+        }
+    }, CHANNEL_SNAPSHOT_INTERVAL).unref?.();
 });
 
 // تشخيص حالة الحماية: هل المفعّلة، وهل البوت يملك الصلاحيات الفعلية؟
@@ -2261,8 +2437,11 @@ client.on('guildCreate', guild => {
         `📥 Bot added to new server: ${guild.name}`
     );
 
-    // تشخيص فوري عند دخول سيرفر جديد
-    setTimeout(() => runProtectionDiagnostics(), 5000).unref?.();
+    // تشخيص فوري عند دخول سيرفر جديد + لقطة أولية للرومات
+    setTimeout(() => {
+        runProtectionDiagnostics();
+        captureChannels(guild);
+    }, 5000).unref?.();
 });
 
 
@@ -5677,6 +5856,9 @@ client.on('channelCreate', async channel => {
 
     const guild = channel.guild;
 
+    // تحديث اللقطة بالروم الجديد (قبل الفيضان) — حتى يظهر في الاسترجاع
+    captureSingleChannel(channel);
+
     // ==============================================
     // 1) الحماية: كشف الفيضان والرد عليه فوراً
     // (محددوا سجل التدقيق زيادة — الفيضان يُحذف لحظياً)
@@ -5860,6 +6042,23 @@ client.on('channelDelete', async channel => {
                 `[PROTECT] channelDelete ${guild.id} | flood=${floodLocked} | limit=${limit}`
             );
 
+            // نوك حذف: استرجاع الرومات/الكاتوقريز المفقودة بصلاحياتها
+            if (floodLocked) {
+                const restore = await restoreChannels(guild);
+
+                console.log(
+                    `[PROTECT] استرجاع ${guild.id}: ${restore.restored}/${restore.total} روم/كاتوقري`
+                );
+
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Channel Restore',
+                    `فيضان حذف رومات — تمت محاولة الاسترجاع.\n` +
+                    `استُرجع **${restore.restored}** من أصل **${restore.total}** روم/كاتوقري بصلاحياتها.`
+                );
+            }
+
             const executorId = floodLocked
                 ? await getFloodExecutor(guild, AuditLogEvent.ChannelDelete)
                 : await getAuditExecutor(
@@ -5946,6 +6145,9 @@ client.on('channelDelete', async channel => {
 client.on('channelUpdate', async (oldChannel, newChannel) => {
 
     if (!newChannel.guild) return;
+
+    // تحديث اللقطة بأي تغيير (اسم/صلاحيات/والد) — للاسترجاع لاحقاً
+    captureSingleChannel(newChannel);
 
     const changes = [];
 
