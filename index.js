@@ -479,6 +479,33 @@ const UserLevel = mongoose.model(
     levelSchema
 );
 
+// نسخة احتياطية كاملة للسيرفر (قنوات + رتب) للاسترجاع اليدوي بعد التهكير
+const backupSchema = new mongoose.Schema({
+    guildId: {
+        type: String,
+        required: true
+    },
+    capturedAt: {
+        type: Date,
+        default: Date.now
+    },
+    channels: {
+        type: mongoose.Schema.Types.Mixed,
+        default: []
+    },
+    roles: {
+        type: mongoose.Schema.Types.Mixed,
+        default: []
+    }
+});
+
+backupSchema.index({ guildId: 1 }, { unique: true });
+
+const GuildBackup = mongoose.model(
+    'GuildBackup',
+    backupSchema
+);
+
 
 // ======================================================
 // DEFAULT SETTINGS
@@ -749,11 +776,11 @@ const protectionFloods = {
 // الغرض: فحص "هل الحماية مفعّلة" بدون قراءة من قاعدة البيانات في مسار الأحداث السريع
 const protectionsCache = new Map();
 
-// بوتات انضمت مؤخراً وتحت المراقبة (تُنظّف تلقائياً)
+// بوتات ومستخدمون انضموا مؤخراً وتحت المراقبة (تُنظّف تلقائياً)
 // guildId -> [{ userId, joinedAt }]
 const suspectedBots = new Map();
 
-const SUSPECT_WINDOW = 15 * 60 * 1000;   // كم دقيقة نظل نراقب البوت الجديد
+const SUSPECT_WINDOW = 15 * 60 * 1000;   // كم دقيقة نظل نراقب العضو الجديد
 const SUSPECT_BAN_WINDOW = 10 * 60 * 1000; // كم دقيقة نعيد فيها البند لو حصل فيضان
 
 function addSuspectedBot(guildId, userId) {
@@ -884,29 +911,39 @@ function clearCount(counter, key) {
     counter.delete(key);
 }
 
-// بند البوتات المشبوهة (الداخلة مؤخراً) عند حصول فيضان بدون مسبب مشخص
-// يرجّع مصفوفة بأيدي البوتات التي تم بنودها فعلاً
+// بند المتهمين (البشر والبوتات اللي دخلوا مؤخراً) عند حصول فيضان بدون مسبب مشخص
+// يرجّع مصفوفة بأيدي الذين تم بنودهم فعلاً
 async function banSuspectedBots(guild, prot, context) {
     const suspects = getSuspectedBots(guild.id);
     const banned = [];
 
+    const botHighest = guild.members.me?.roles?.highest;
+
     for (const suspectId of suspects) {
         try {
             const member = await getMember(guild, suspectId);
-            if (!member || !member.bannable) continue;
 
-            await applyPunishment(
-                member,
-                prot?.action || 'ban',
-                `بوت نوك مشبوه (${context})`
-            );
+            // بنفس/فوق رتبة البوت: الديسكورد ما يسمح — نخطيه
+            if (member?.roles?.highest && botHighest) {
+                const pos = member.roles.highest.position;
+                if (pos >= botHighest.position) continue;
+            }
+
+            const reason = `[Anti-Nuke] نوك مشبوه (${context})`;
+
+            if (member?.bannable) {
+                await member.ban({ reason });
+            } else {
+                // البيت غادر/غير موجود: البند بالقوة عبر الأيدي
+                await guild.bans.create(suspectId, { reason });
+            }
+
             banned.push(suspectId);
-
             console.log(
-                `[PROTECT] بند البوت المشبوه ${suspectId} (${guild.id}) | ${context}`
+                `[PROTECT] بند المشبوه ${suspectId} (${guild.id}) | ${context}`
             );
         } catch (error) {
-            console.error('Suspect bot ban error:', error);
+            console.error('Suspect ban error:', error);
         }
     }
 
@@ -942,6 +979,48 @@ async function applyPunishment(member, action, reason) {
 
 async function getMember(guild, userId) {
     return guild.members.fetch(userId).catch(() => null);
+}
+
+// عقوبة قوية للمسبب المحدد: الباند يتم حتى لو غادر السيرفر (بالأيدي)
+async function punishFor(guild, member, executorId, action, reason) {
+    const fullReason = `[Anti-Nuke] ${reason}`;
+
+    try {
+        if (action === 'ban' && executorId) {
+            if (member?.bannable) {
+                await member.ban({ reason: fullReason });
+                return true;
+            }
+
+            // العضو غادر أو الموجودة ما تقدر تشد — نبنّد بالـ ID
+            await guild.bans.create(executorId, { reason: fullReason });
+            return true;
+        }
+
+        if (action === 'kick' && member?.kickable) {
+            await member.kick(fullReason);
+            return true;
+        }
+
+        if (action === 'timeout' && member?.moderatable) {
+            await member.timeout(SPAM_TIMEOUT_MS, fullReason);
+            return true;
+        }
+
+        if (action === 'removeroles' && member) {
+            const removable = member.roles.cache.filter(
+                role => role.id !== member.guild.id && role.editable
+            );
+            if (removable.size) {
+                await member.roles.remove(removable, fullReason);
+            }
+            return true;
+        }
+    } catch (error) {
+        console.error('PunishFor error:', error);
+    }
+
+    return false;
 }
 
 // فحص صلاحية التجاوز عن الحماية (وايت ليست / مالك البوت / فوق رتبة البوت)
@@ -1163,6 +1242,312 @@ async function restoreChannels(guild) {
     }
 
     return { restored, total: missing.length, categories: parents.length };
+}
+
+// ======================================================
+// BACKUP / RESTORE
+// ======================================================
+
+// حفظ نسخة كاملة من السيرفر (قنوات + رتب) في قاعدة البيانات
+async function captureGuildBackup(guild) {
+    try {
+        if (!guild) return { saved: false, error: 'no-guild' };
+
+        const channels = [];
+        for (const ch of guild.channels.cache.values()) {
+            channels.push({
+                id: ch.id,
+                name: ch.name,
+                type: ch.type,
+                position: ch.position,
+                parentId: ch.parentId,
+                topic: ch.topic || null,
+                nsfw: !!ch.nsfw,
+                rateLimitPerUser: ch.rateLimitPerUser || 0,
+                bitrate: ch.bitrate || null,
+                userLimit: ch.userLimit || 0,
+                rtcRegion: ch.rtcRegion || null,
+                overwrites: ch.permissionOverwrites.cache.map(o => ({
+                    id: o.id,
+                    type: o.type,
+                    allow: o.allow.bitfield,
+                    deny: o.deny.bitfield
+                }))
+            });
+        }
+
+        const roles = [];
+        for (const r of guild.roles.cache.values()) {
+            roles.push({
+                id: r.id,
+                name: r.name,
+                color: r.color,
+                hoist: r.hoist,
+                mentionable: r.mentionable,
+                position: r.position,
+                permissions: r.permissions.bitfield,
+                managed: r.managed,
+                isEveryone: r.id === guild.id,
+                icon: r.icon,
+                unicodeEmoji: r.unicodeEmoji
+            });
+        }
+
+        const doc = {
+            guildId: guild.id,
+            capturedAt: new Date(),
+            channels,
+            roles
+        };
+
+        // updateOne + upsert حتى لا يدمج mongoose الـ Mixed بعمق (يختفي المصفوفات)
+        await GuildBackup.collection.updateOne(
+            { guildId: guild.id },
+            { $set: doc },
+            { upsert: true }
+        );
+
+        return {
+            saved: true,
+            channels: channels.length,
+            roles: roles.length,
+            capturedAt: doc.capturedAt
+        };
+    } catch (error) {
+        console.error('[BACKUP] فشل الحفظ:', error);
+        return { saved: false, error: error.message };
+    }
+}
+
+// استرجاع السيرفر من آخر نسخة:
+//  - يعيد إنشاء الرتب المفقودة
+//  - يحذف الرتب والقنوات الزائدة (التي أنشأها المخترق)
+//  - يعيد إنشاء القنوات المفقودة بصلاحياتها
+async function restoreGuildFromBackup(guild) {
+    try {
+        if (!guild) return { error: 'no-guild' };
+
+        const backup = await GuildBackup.findOne({ guildId: guild.id });
+
+        if (!backup) return { error: 'no-backup' };
+
+        const backedChannels = Array.isArray(backup.channels) ? backup.channels : [];
+        const backedRoles = Array.isArray(backup.roles) ? backup.roles : [];
+
+        if (!backedChannels.length && !backedRoles.length) {
+            return { error: 'empty-backup' };
+        }
+
+        const botMember = guild.members.me;
+        const botPos = botMember ? botMember.roles.highest.position : 0;
+        const managedRoleIds = new Set();
+
+        for (const r of guild.roles.cache.values()) {
+            if (r.managed || r.id === guild.id) managedRoleIds.add(r.id);
+        }
+
+        // ---------- الرتب ----------
+        const backedRoleIds = new Set(backedRoles.map(r => r.id));
+        const restoredRoles = [];
+        const roleIdMap = new Map();
+
+        // 1) حذف الرتب الزائدة (غير الموجودة بالنسخة) — تحت رتبة البوت فقط
+        const rolesToDelete = guild.roles.cache
+            .filter(r =>
+                !backedRoleIds.has(r.id) &&
+                !r.managed &&
+                r.id !== guild.id &&
+                r.editable &&
+                r.position < botPos
+            )
+            .sort((a, b) => b.position - a.position);
+
+        let deletedRoles = 0;
+        for (const r of rolesToDelete.values()) {
+            try {
+                await r.delete('[Anti-Nuke] استرجاع النسخة — رتبة زائدة');
+                deletedRoles++;
+            } catch {}
+        }
+
+        // 2) إعادة إنشاء الرتب المفقودة (تنازلياً بالموقع حتى تترتب صح)
+        const sortedBackedRoles = backedRoles
+            .filter(r => !managedRoleIds.has(r.id))
+            .sort((a, b) => b.position - a.position);
+
+        for (const r of sortedBackedRoles) {
+
+            const existing = guild.roles.cache.get(r.id);
+
+            if (existing) {
+                roleIdMap.set(r.id, existing.id);
+                continue;
+            }
+
+            if (r.isEveryone || r.managed) {
+                roleIdMap.set(r.id, r.id);
+                continue;
+            }
+
+            try {
+                const perms = typeof r.permissions === 'bigint'
+                    ? r.permissions
+                    : BigInt(r.permissions || 0);
+
+                const created = await guild.roles.create({
+                    name: r.name,
+                    color: r.color || 0,
+                    hoist: !!r.hoist,
+                    mentionable: !!r.mentionable,
+                    permissions: perms,
+                    reason: '[Anti-Nuke] استرجاع النسخة الاحتياطية'
+                });
+
+                if (created) {
+                    restoredRoles.push({
+                        id: r.id,
+                        name: r.name
+                    });
+                    roleIdMap.set(r.id, created.id);
+
+                    if (r.icon) {
+                        created.setIcon(r.icon).catch(() => {});
+                    }
+                    if (r.unicodeEmoji) {
+                        created.setUnicodeEmoji(r.unicodeEmoji).catch(() => {});
+                    }
+                }
+            } catch (error) {
+                console.error(`[BACKUP] فشل استرجاع رتبة "${r.name}": ${error.message}`);
+            }
+        }
+
+        // ---------- القنوات ----------
+        const backedChannelIds = new Set(backedChannels.map(c => c.id));
+        const restoredChannels = [];
+
+        // 3) حذف القنوات الزائدة (أنشأها المخترق بعد النسخة)
+        let deletedChannels = 0;
+        const channelsToDelete = guild.channels.cache
+            .filter(ch => !backedChannelIds.has(ch.id) && ch.deletable)
+            .sort((a, b) => a.position - b.position);
+
+        for (const ch of channelsToDelete.values()) {
+            try {
+                await ch.delete('[Anti-Nuke] استرجاع النسخة — قناة زائدة');
+                deletedChannels++;
+            } catch {}
+        }
+
+        const existingChannels = new Set(guild.channels.cache.keys());
+        const missing = backedChannels.filter(c => !existingChannels.has(c.id));
+
+        // تحويل overwrites: ربط ID الرتبة القديمة مع الجديدة
+        const mapOverwrites = overwrites =>
+            (overwrites || [])
+                .map(o => {
+                    const mappedId = o.type === 0 && roleIdMap.has(o.id)
+                        ? roleIdMap.get(o.id)
+                        : o.id;
+                    return {
+                        id: mappedId,
+                        type: o.type,
+                        allow: BigInt(o.allow || 0),
+                        deny: BigInt(o.deny || 0)
+                    };
+                })
+                .filter(o => o.type === 1 || guild.roles.cache.has(o.id));
+
+        // الكاتوقريز أولاً ثم باقي القنوات (عشان ما نعلق ولد بوالد مفقود)
+        const parents = missing.filter(
+            c => c.type === ChannelType.GuildCategory
+        );
+        const children = missing.filter(
+            c => c.type !== ChannelType.GuildCategory
+        );
+
+        const existingNow = new Set(guild.channels.cache.keys());
+        const restoredIds = new Set();
+
+        const createOne = async item => {
+            try {
+                let parentId = item.parentId || null;
+                if (parentId && !existingNow.has(parentId) && !restoredIds.has(parentId)) {
+                    parentId = null;
+                }
+
+                const created = await guild.channels.create({
+                    name: item.name,
+                    type: item.type,
+                    topic: item.topic || null,
+                    nsfw: !!item.nsfw,
+                    rateLimitPerUser: item.rateLimitPerUser || 0,
+                    parent: parentId,
+                    bitrate: item.bitrate || undefined,
+                    userLimit: item.userLimit || 0,
+                    rtcRegion: item.rtcRegion || null,
+                    permissionOverwrites: mapOverwrites(item.overwrites),
+                    reason: '[Anti-Nuke] استرجاع النسخة الاحتياطية'
+                });
+
+                if (created) {
+                    restoredChannels.push({
+                        id: item.id,
+                        name: item.name
+                    });
+                    restoredIds.add(item.id);
+                    existingNow.add(item.id);
+                }
+            } catch (error) {
+                console.error(`[BACKUP] فشل استرجاع قناة "${item.name}": ${error.message}`);
+            }
+        };
+
+        for (const item of parents) await createOne(item);
+        for (const item of children) await createOne(item);
+
+        // ---------- ترتيب المواقع (أفضل محاولة) ----------
+        try {
+            const mapping = [];
+            for (const c of guild.channels.cache.values()) {
+                const backed = backedChannels.find(b => b.id === c.id);
+                if (backed) {
+                    mapping.push({
+                        channel: c,
+                        position: backed.position
+                    });
+                }
+            }
+            for (const backupRole of sortedBackedRoles) {
+                const actual = roleIdMap.get(backupRole.id);
+                const role = actual && guild.roles.cache.get(actual);
+                if (role && role.position < botPos) {
+                    try { await role.setPosition(backupRole.position); } catch {}
+                }
+            }
+            // setChannelPositions دفعة واحدة أفضل أداءً
+            if (mapping.length) {
+                await guild.setChannelPositions(
+                    mapping.map(m => ({ channel: m.channel, position: m.position }))
+                ).catch(() => {});
+            }
+        } catch {}
+
+        console.log(
+            `[BACKUP] استرجاع ${guild.id} | رومات🔄=${restoredChannels.length} رتب🔄=${restoredRoles.length} رومات deleted=${deletedChannels} رتب deleted=${deletedRoles}`
+        );
+
+        return {
+            restoredChannels,
+            restoredRoles,
+            deletedChannels,
+            deletedRoles,
+            failed: 0
+        };
+    } catch (error) {
+        console.error('[BACKUP] فشل الاسترجاع:', error);
+        return { error: error.message };
+    }
 }
 
 // حماية الويب هوك:
@@ -2237,6 +2622,12 @@ const slashCommands = [
             sub.setName('list')
                 .setDescription('عرض أعضاء الوايت ليست')
         ),
+    new SlashCommandBuilder()
+        .setName('backup')
+        .setDescription('Save everything in this server (channels, roles, permissions). Use /restore to bring it all back after a hack.'),
+    new SlashCommandBuilder()
+        .setName('restore')
+        .setDescription('Restore everything from the last backup. OWNER ONLY — recreates deleted channels/roles and removes sabotage.'),
 ].map(command => command.toJSON());
 
 
@@ -4055,12 +4446,163 @@ const botsDesc = settings.protections.bots.enabled
                     });
                 }
             }
+
+            // ==========================================
+            // BACKUP (حفظ نسخة كاملة من السيرفر)
+            // ==========================================
+
+            if (command === 'backup') {
+
+                if (!isAdmin(interaction)) {
+                    return interaction.reply({
+                        content:
+                            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`,
+                        ephemeral: true
+                    });
+                }
+
+                await interaction.deferReply({ ephemeral: true });
+
+                const result = await captureGuildBackup(
+                    interaction.guild
+                );
+
+                if (!result.saved) {
+                    return interaction.editReply({
+                        content:
+                            `❌ فشل الحفظ: ${result.error || 'خطأ غير معروف'}`
+                    });
+                }
+
+                console.log(
+                    `[BACKUP] تم الحفظ ${interaction.guild.id} | رومات=${result.channels} رتب=${result.roles}`
+                );
+
+                await sendLog(
+                    interaction.guild,
+                    'moderation',
+                    '📦 Backup Saved',
+                    `تم حفظ نسخة كاملة من السيرفر بواسطة <@${interaction.user.id}>.\n` +
+                    `القنوات: **${result.channels}**\n` +
+                    `الرتب: **${result.roles}**\n` +
+                    `الوقت: <t:${Math.floor(result.capturedAt.getTime() / 1000)}:f>`
+                );
+
+                return interaction.editReply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setTitle('📦 Backup Saved')
+                            .setDescription(
+                                'تم حفظ نسخة كاملة من السيرفر.\n' +
+                                'إذا تم تهكير السيرفر لاحقاً استخدم **/restore** لاسترجاع كل شيء.'
+                            )
+                            .setColor(0x57F287)
+                            .addFields(
+                                {
+                                    name: '📁 القنوات',
+                                    value: String(result.channels),
+                                    inline: true
+                                },
+                                {
+                                    name: '🎭 الرتب',
+                                    value: String(result.roles),
+                                    inline: true
+                                }
+                            )
+                            .setFooter({
+                                text: 'النسخ الاحتياطية محفوظة في قاعدة البيانات'
+                            })
+                    ]
+                });
+            }
+
+            // ==========================================
+            // RESTORE (استرجاع كل شيء — للمالك فقط)
+            // ==========================================
+
+            if (command === 'restore') {
+
+                const isOwner =
+                    interaction.user.id === interaction.guild.ownerId ||
+                    interaction.user.id === OWNER_ID;
+
+                if (!isOwner) {
+                    return interaction.reply({
+                        content:
+                            `❌ هذا الأمر للمالك فقط.\n` +
+                            `لا يمكن لأي شخص آخر استرجاع النسخة.`,
+                        ephemeral: true
+                    });
+                }
+
+                await interaction.deferReply({ ephemeral: true });
+
+                const result = await restoreGuildFromBackup(
+                    interaction.guild
+                );
+
+                if (result.error) {
+                    const messages = {
+                        'no-backup': 'لا توجد نسخة احتياطية لهذا السيرفر.\nاستخدم **/backup** أولاً.',
+                        'no-guild': 'تعذر الوصول للسيرفر.',
+                        'empty-backup': 'النسخة الاحتياطية فارغة.\nاستخدم **/backup** أولاً.'
+                    };
+                    return interaction.editReply({
+                        content:
+                            `❌ ${messages[result.error] || result.error}`
+                    });
+                }
+
+                console.log(
+                    `[BACKUP] استرجاع ${interaction.guild.id} بواسطة <@${interaction.user.id}> | رومات↺=${result.restoredChannels.length} رتب↺=${result.restoredRoles.length} deleted=${result.deletedChannels}/${result.deletedRoles}`
+                );
+
+                await sendLog(
+                    interaction.guild,
+                    'moderation',
+                    '♻️ Restore Completed',
+                    `تم استرجاع السيرفر من النسخة بواسطة المالك <@${interaction.user.id}>.\n` +
+                    `🔄 قنوات معاد إنشاؤها: **${result.restoredChannels.length}**\n` +
+                    `🔄 رتب معاد إنشاؤها: **${result.restoredRoles.length}**\n` +
+                    `🗑️ قنوات زائدة حُذفت: **${result.deletedChannels}**\n` +
+                    `🗑️ رتب زائدة حُذفت: **${result.deletedRoles}**`
+                );
+
+                return interaction.editReply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setTitle('♻️ Restore Completed')
+                            .setDescription(
+                                'تم استرجاع السيرفر من النسخة الاحتياطية.\n' +
+                                'تم إعادة إنشاء المفقود وحذف كل ما أضافه المخترق.'
+                            )
+                            .setColor(0x57F287)
+                            .addFields(
+                                {
+                                    name: '🔄 قنوات معاد إنشاؤها',
+                                    value: String(result.restoredChannels.length),
+                                    inline: true
+                                },
+                                {
+                                    name: '🔄 رتب معاد إنشاؤها',
+                                    value: String(result.restoredRoles.length),
+                                    inline: true
+                                },
+                                {
+                                    name: '🗑️ قنوات زائدة حُذفت',
+                                    value: String(result.deletedChannels),
+                                    inline: true
+                                },
+                                {
+                                    name: '🗑️ رتب زائدة حُذفت',
+                                    value: String(result.deletedRoles),
+                                    inline: true
+                                }
+                            )
+                    ]
+                });
+            }
         }
-
-
-        // ==================================================
-        // SELECT MENUS
-        // ==================================================
 
         if (interaction.isStringSelectMenu()) {
 
@@ -4717,14 +5259,15 @@ client.on('guildMemberAdd', async member => {
         const settings =
             await getSettings(member.guild.id);
 
+        // تسجيل كل دخول حديث (بشر + بوتات) كمرشح مراقبة —
+        // عند الفيضان بدون مسبب مشخص نقفل عليهم/نبندهم
+        addSuspectedBot(member.guild.id, member.id);
+
         // ==============================================
         // حماية دخول البوتات
         // ==============================================
 
         if (member.user.bot) {
-
-            // تسجيل البوت الجديد كمرشح مشبوه (يُبنّد لو سوى نوك)
-            addSuspectedBot(member.guild.id, member.id);
 
             ensureProtections(settings);
 
@@ -4781,6 +5324,26 @@ client.on('guildMemberAdd', async member => {
                     return;
                 }
 
+                // ✅ المالك / الوايت ليست / مالك البوت: أي بوت يضيفونه يدخل بدون طرد مهما كانت رتبتهم
+                const botWhitelist = Array.isArray(settings.whitelist)
+                    ? settings.whitelist
+                    : [];
+
+                if (
+                    inviter.id === member.guild.ownerId ||
+                    inviter.id === OWNER_ID ||
+                    botWhitelist.includes(inviter.id)
+                ) {
+                    await sendLog(
+                        member.guild,
+                        'moderation',
+                        '🤖 Bot Allowed',
+                        `البوت **${member.user.tag}** دخل السيرفر.\n` +
+                        `المسبب: <@${inviter.id}> (معتمد ${inviter.id === member.guild.ownerId ? 'المالك' : inviter.id === OWNER_ID ? 'مالك البوت' : 'القائمة البيضاء'})`
+                    );
+                    return;
+                }
+
                 const inviterPos = inviter.roles.highest.position;
                 const refPos = refRole.position;
 
@@ -4802,7 +5365,13 @@ client.on('guildMemberAdd', async member => {
                         ).then(() => true).catch(() => false);
                     }
 
-                    await applyPunishment(inviter, 'ban', 'مسبب دخول بوت غير مصرّح');
+                    await punishFor(
+                        member.guild,
+                        inviter,
+                        inviter.id,
+                        'ban',
+                        'مسبب دخول بوت غير مصرّح'
+                    );
 
                     await sendLog(
                         member.guild,
@@ -4834,27 +5403,7 @@ client.on('guildMemberAdd', async member => {
                     return;
                 }
 
-                // فوق رتبة البوت: يسمح فقط إذا كان المُضيف هو مالك السيرفر أو في القائمة البيضاء
-                    const botWhitelist = Array.isArray(settings.whitelist)
-                        ? settings.whitelist
-                        : [];
-
-                    if (
-                        inviter.id === member.guild.ownerId ||
-                        botWhitelist.includes(inviter.id)
-                    ) {
-                        await sendLog(
-                            member.guild,
-                            'moderation',
-                            '🤖 Bot Allowed',
-                            `البوت **${member.user.tag}** دخل السيرفر.\n` +
-                            `المسبب: <@${inviter.id}> (معتمد ${inviter.id === member.guild.ownerId ? 'المالك' : 'القائمة البيضاء'})`
-                        );
-                        return;
-                    }
-
-                    // مُضيف فوق البوت لكنه ليس المالك/الوايت ليست:
-                    // إضافة بوت من "إدارة غير موثوقة" → لا يمر
+                // فوق رتبة البوت لكنه ليس المالك/الوايت ليست → لا يمر
                     const nokicked =
                         await member.kick('[Anti-Nuke] إضافة بوت من غير المالك/الوايت ليست')
                             .then(() => true)
@@ -5550,8 +6099,10 @@ client.on('roleCreate', async role => {
                         clearCount(protectionCounts.roles, key);
 
                         if (check.level === 'below') {
-                            await applyPunishment(
+                            await punishFor(
+                                guild,
                                 member,
+                                executorId,
                                 prot.action || 'ban',
                                 floodLocked
                                     ? `فيضان إنشاء رتب (أكثر من ${limit})`
@@ -5690,8 +6241,10 @@ client.on('roleDelete', async role => {
                         clearCount(protectionCounts.roles, key);
 
                         if (check.level === 'below') {
-                            await applyPunishment(
+                            await punishFor(
+                                guild,
                                 member,
+                                executorId,
                                 prot.action || 'ban',
                                 floodLocked
                                     ? `فيضان حذف رتب (أكثر من ${limit})`
@@ -5932,8 +6485,10 @@ client.on('channelCreate', async channel => {
                         clearCount(protectionCounts.channels, key);
 
                         if (check.level === 'below') {
-                            await applyPunishment(
+                            await punishFor(
+                                guild,
                                 member,
+                                executorId,
                                 prot.action || 'ban',
                                 floodLocked
                                     ? `فيضان إنشاء رومات (أكثر من ${limit})`
@@ -5942,6 +6497,10 @@ client.on('channelCreate', async channel => {
                             punished = true;
                             console.log(
                                 `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} (${guild.id})`
+                            );
+                        } else {
+                            console.log(
+                                `[PROTECT] المسبب ${executorId} منع العقوبة: المستوى=${check.level} (فوق/بنفس رتبة البوت — الديسكورد يمنع الباند على الأصاغر)`
                             );
                         }
                     }
@@ -6042,20 +6601,10 @@ client.on('channelDelete', async channel => {
                 `[PROTECT] channelDelete ${guild.id} | flood=${floodLocked} | limit=${limit}`
             );
 
-            // نوك حذف: استرجاع الرومات/الكاتوقريز المفقودة بصلاحياتها
+            // بدون استرجاع تلقائي — الاسترجاع يدوياً عبر سلاش /restore
             if (floodLocked) {
-                const restore = await restoreChannels(guild);
-
                 console.log(
-                    `[PROTECT] استرجاع ${guild.id}: ${restore.restored}/${restore.total} روم/كاتوقري`
-                );
-
-                await sendLog(
-                    guild,
-                    'moderation',
-                    '🛡️ Channel Restore',
-                    `فيضان حذف رومات — تمت محاولة الاسترجاع.\n` +
-                    `استُرجع **${restore.restored}** من أصل **${restore.total}** روم/كاتوقري بصلاحياتها.`
+                    `[PROTECT] فيضان حذف رومات ${guild.id} — سيتم عقاب المسبب فوراً`
                 );
             }
 
@@ -6091,8 +6640,10 @@ client.on('channelDelete', async channel => {
                         clearCount(protectionCounts.channels, key);
 
                         if (check.level === 'below') {
-                            await applyPunishment(
+                            await punishFor(
+                                guild,
                                 member,
+                                executorId,
                                 prot.action || 'ban',
                                 floodLocked
                                     ? `فيضان حذف رومات (أكثر من ${limit})`
