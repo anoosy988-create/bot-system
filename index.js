@@ -7,7 +7,6 @@ const {
     SlashCommandBuilder,
     ActionRowBuilder,
     StringSelectMenuBuilder,
-    ChannelSelectMenuBuilder,
     ModalBuilder,
     TextInputBuilder,
     TextInputStyle,
@@ -515,6 +514,10 @@ function sanitizeSettings(settings) {
 
 // سيرفرات تم إصلاح حقولها في القاعدة (حتى لا يتكرر الإصلاح مع كل رسالة)
 const repairedSettingGuilds = new Set();
+
+// حالات تعيين روم السجل بواسطة المنشن:
+// userId -> { type, guildId, expires }
+const pendingLogChannelSet = new Map();
 
 async function getSettings(guildId) {
     let settings;
@@ -3872,72 +3875,21 @@ const botsDesc = settings.protections.bots.enabled
                 const type =
                     interaction.values[0];
 
-                const row =
-                    new ActionRowBuilder()
-                        .addComponents(
-                            new ChannelSelectMenuBuilder()
-                                .setCustomId(
-                                    `logs_channel_${type}`
-                                )
-                                .setPlaceholder(
-                                    'اختر الروم'
-                                )
-                                .setChannelTypes(
-                                    ChannelType.GuildText
-                                )
-                                .setMinValues(1)
-                                .setMaxValues(1)
-                        );
+                pendingLogChannelSet.set(
+                    interaction.user.id,
+                    {
+                        type,
+                        guildId: interaction.guild.id,
+                        expires:
+                            Date.now() + 60000
+                    }
+                );
 
                 return interaction.update({
                     content:
-                        `📝 اختر الروم لسجل **${type}**`,
-                    components: [row]
-                });
-            }
-        }
-
-
-        // ==================================================
-        // CHANNEL SELECT (اختيار روم السجل)
-        // ==================================================
-
-        if (interaction.isChannelSelectMenu()) {
-
-            const id = interaction.customId;
-
-            if (id.startsWith('logs_channel_')) {
-
-                if (!isAdmin(interaction)) {
-                    return interaction.reply({
-                        content:
-                            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام هذا الأمر.`,
-                        ephemeral: true
-                    });
-                }
-
-                const type =
-                    id.replace('logs_channel_', '');
-
-                const channelId =
-                    interaction.values[0];
-
-                const settings =
-                    await getSettings(interaction.guild.id);
-
-                settings.logs[type] =
-                    channelId;
-
-                await settings.save();
-
-                const channel =
-                    interaction.guild.channels.cache.get(
-                        channelId
-                    );
-
-                return interaction.update({
-                    content:
-                        `✅ تم تعيين ${channel} لسجل **${type}**.`,
+                        `✏️ اكتب الآن منشن الروم لسجل **${type}**.\n` +
+                        `مثال: <#CHANNEL_ID> أو #اسم-الروم\n` +
+                        `(انتظر خلال **60 ثانية**)`,
                     components: []
                 });
             }
@@ -5485,6 +5437,53 @@ client.on('messageCreate', async message => {
 
         if (!message.guild) return;
         if (message.author.bot) return;
+
+        // ==============================================
+        // تعيين روم السجل بواسطة منشن المستخدم
+        // ==============================================
+
+        const pendingLog =
+            pendingLogChannelSet.get(message.author.id);
+
+        if (pendingLog) {
+
+            if (
+                Date.now() > pendingLog.expires ||
+                message.guild.id !== pendingLog.guildId
+            ) {
+                pendingLogChannelSet.delete(message.author.id);
+            } else {
+
+                const mentionedChannel =
+                    message.mentions.channels.first();
+
+                if (
+                    !mentionedChannel ||
+                    !mentionedChannel.isTextBased()
+                ) {
+                    await message.reply(
+                        '❌ منشن روم كتابي صحيح، مثال: #logs'
+                    ).catch(() => {});
+                    return;
+                }
+
+                const logSettings =
+                    await getSettings(message.guild.id);
+
+                logSettings.logs[pendingLog.type] =
+                    mentionedChannel.id;
+
+                await logSettings.save();
+
+                pendingLogChannelSet.delete(message.author.id);
+
+                await message.reply(
+                    `✅ تم تعيين ${mentionedChannel} لسجل **${pendingLog.type}**.`
+                ).catch(() => {});
+
+                return;
+            }
+        }
 
         const settings =
             await getSettings(message.guild.id);
