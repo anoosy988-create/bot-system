@@ -154,129 +154,6 @@ async function requireAdmin(interaction) {
     return (await requireStaffPermission(interaction)) === true;
 }
 
-// أوامر الإعدادات والحماية: تتطلب أن تكون الرتبة **فوق** رتبة البوت
-const CONFIG_COMMANDS = [
-    'permission', 'protect', 'welcome', 'logs', 'setlog',
-    'level-settings', 'autorole', 'autoresponse', 'shortcut', 'embed'
-];
-
-function isConfigCommand(commandKey) {
-    return CONFIG_COMMANDS.includes(normalizeText(commandKey));
-}
-
-// فحص صلاحية استخدام أمر/اختصار:
-// لو فيه رتبة مخصصة للأمر = تشترطها، وإلا تشترط الرتبة الافتراضية.
-// أوامر الإعدادات والحماية فقط: تتطلب أن تكون الرتبة فوق رتبة البوت.
-async function requireCommandPermission(interaction, commandKey) {
-    if (isOwner(interaction.user.id)) return true;
-
-    const member = interaction.member;
-    const guild = interaction.guild;
-    const key = normalizeText(commandKey);
-    const config = isConfigCommand(key);
-
-    const replyContent = async content => {
-        const options = { content, ephemeral: true };
-
-        if (interaction.replied || interaction.deferred) {
-            return interaction.followUp(options);
-        }
-
-        return interaction.reply(options);
-    };
-
-    // رتبة مخصصة لهذا الأمر/الاختصار
-    let roleId = null;
-    let settings = null;
-
-    try {
-        settings = await getSettings(guild.id);
-        roleId = settings?.commandPermissions?.get(key) || null;
-    } catch {}
-
-    let requiredRole = null;
-
-    if (roleId) {
-        requiredRole = guild.roles.cache.get(roleId);
-
-        if (!requiredRole) {
-            return replyContent(
-                `❌ الرتبة المخصصة لـ **${commandKey}** غير موجودة في السيرفر.\n` +
-                'حدد رتبة جديدة من أمر `/permission`.'
-            );
-        }
-    } else {
-        requiredRole = getStaffRole(guild);
-
-        if (!requiredRole) {
-            return replyContent(
-                config
-                    ? `❌ ما فيه رتبة **${STAFF_ROLE_NAME}** في السيرفر.\n` +
-                      `أنشئها واجعلها **فوق** رتبة البوت حتى تشتغل أوامر الإعدادات والحماية.`
-                    : `❌ ما فيه رتبة **${STAFF_ROLE_NAME}** في السيرفر لتشغيل الأوامر.`
-            );
-        }
-    }
-
-    if (!member.roles.cache.has(requiredRole.id)) {
-        return replyContent(
-            config
-                ? `❌ تحتاج رتبة **${requiredRole.name}** (فوق رتبة البوت) لاستخدام هذا الأمر.`
-                : `❌ تحتاج رتبة **${requiredRole.name}** لاستخدام هذا الأمر.`
-        );
-    }
-
-    // أوامر الإعدادات والحماية فقط: الرتبة لازم تكون فوق رتبة البوت
-    if (config) {
-        const botHighest = guild?.members?.me?.roles?.highest;
-
-        if (botHighest && requiredRole.position <= botHighest.position) {
-            return replyContent(
-                `❌ رتبة **${requiredRole.name}** لازم تكون **فوق** رتبة البوت لأوامر الإعدادات والحماية.\n` +
-                `من إعدادات السيرفر: Roles = ارفع رتبة **${requiredRole.name}** فوق رتبة البوت ثم أعد المحاولة.`
-            );
-        }
-    }
-
-    return true;
-}
-
-// فحص صلاحية استخدام اختصار من رسالة عادية
-// (رتبة مخصصة للاختصار إن وُجدت، وإلا الرتبة الافتراضية، والـ warnings مفتوح للجميع)
-async function shortcutPermission(member, guild, shortcut, command) {
-    if (isOwner(member.id)) return { ok: true };
-
-    let settings = null;
-
-    try {
-        settings = await getSettings(guild.id);
-    } catch {}
-
-    const key = shortcut?.name ? normalizeText(shortcut.name) : null;
-    const roleId = key
-        ? settings?.commandPermissions?.get(key) || null
-        : null;
-
-    if (roleId) {
-        const role = guild.roles.cache.get(roleId);
-
-        if (!role) {
-            return { ok: false, roleMissing: true };
-        }
-
-        if (member.roles.cache.has(role.id)) return { ok: true };
-
-        return { ok: false, role };
-    }
-
-    // عرض تحذيراتك مفتوح للجميع، باقي الاختصارات تتطلب رتبة الصلاحيات
-    if (command === 'warnings') return { ok: true };
-
-    if (memberHasStaffRole(member, guild)) return { ok: true };
-
-    return { ok: false };
-}
-
 function normalizeText(text) {
     return String(text || '')
         .trim()
@@ -451,6 +328,12 @@ const guildSchema = new mongoose.Schema({
             maxLength: { type: Number, default: 400 },
             repeatedChar: { type: Number, default: 8 },
             action: { type: String, default: 'timeout' }
+        },
+        webhooks: {
+            enabled: { type: Boolean, default: false },
+            limit: { type: Number, default: 5 },
+            timeframe: { type: Number, default: 60000 },
+            action: { type: String, default: 'ban' }
         }
     },
 
@@ -465,25 +348,9 @@ const guildSchema = new mongoose.Schema({
         }
     },
 
-    // الرتبة المسموح لها استخدام كل أمر/اختصار
-    // (المفتاح = اسم الأمر أو الاختصار | القيمة = آيدي الرتبة)
-    // لو ما فيه رتبة مخصصة = استخدام الرتبة الافتراضية STAFF_ROLE_NAME
-    commandPermissions: {
-        type: Map,
-        of: String,
-        default: new Map()
-    },
-
-    // روم الذكاء الاصطناعي (أي رسالة فيه يرد عليها البوت عن البوت فقط)
-    aiChannel: {
-        type: String,
-        default: null
-    },
-
-    // عدّاد رقم التحذير لكل سيرفر (يبدأ من 1 ولا يتكرر أبداً)
-    warnCounter: {
-        type: Number,
-        default: 0
+    whitelist: {
+        type: [String],
+        default: []
     }
 });
 
@@ -521,37 +388,6 @@ const levelSchema = new mongoose.Schema({
 const UserLevel = mongoose.model(
     'UserLevel',
     levelSchema
-);
-
-
-const warningSchema = new mongoose.Schema({
-    guildId: String,
-    // رقم التحذير داخل السيرفر (يبدأ من 1 ولا يتكرر)
-    number: Number,
-    userId: String,
-    moderatorId: String,
-    reason: {
-        type: String,
-        required: true
-    },
-    expiresAt: {
-        type: Date,
-        default: null
-    },
-    createdAt: {
-        type: Date,
-        default: Date.now
-    }
-});
-
-warningSchema.index(
-    { guildId: 1, number: 1 },
-    { unique: true }
-);
-
-const Warning = mongoose.model(
-    'Warning',
-    warningSchema
 );
 
 
@@ -609,27 +445,6 @@ function sanitizeSettings(settings) {
                 settings.markModified('levelSettings.rewards');
                 changed = true;
             }
-        }
-    } catch {}
-
-    // commandPermissions يجب أن يكون Map وليس كائناً أو مفقوداً
-    try {
-        const cp = settings.commandPermissions;
-
-        if (!cp || !(cp instanceof mongoose.Types.Map)) {
-            const entries = cp && typeof cp.toObject === 'function'
-                ? cp.toObject()
-                : cp;
-
-            if (entries && typeof entries === 'object' && !Array.isArray(entries)) {
-                settings.commandPermissions =
-                    new Map(Object.entries(entries));
-            } else {
-                settings.commandPermissions = new Map();
-            }
-
-            settings.markModified('commandPermissions');
-            changed = true;
         }
     } catch {}
 
@@ -823,27 +638,18 @@ function recordEvent(counterKey, guildId, userId) {
     return key;
 }
 
-async function getAuditExecutor(guild, type, targetId = null, retries = 0) {
-    let attempt = 0;
+async function getAuditExecutor(guild, type, targetId = null) {
+    try {
+        const audit = await guild.fetchAuditLogs({ type, limit: 1 });
+        const entry = audit.entries.first();
 
-    while (true) {
-        try {
-            const audit = await guild.fetchAuditLogs({ type, limit: 1 });
-            const entry = audit.entries.first();
+        if (!entry) return null;
+        if (Date.now() - entry.createdTimestamp > 15000) return null;
+        if (targetId && entry.targetId !== targetId) return null;
 
-            if (
-                entry &&
-                Date.now() - entry.createdTimestamp <= 15000 &&
-                (!targetId || entry.targetId === targetId)
-            ) {
-                return entry.executor?.id || null;
-            }
-        } catch {}
-
-        if (attempt >= retries) return null;
-
-        attempt++;
-        await new Promise(r => setTimeout(r, 250));
+        return entry.executor?.id || null;
+    } catch {
+        return null;
     }
 }
 
@@ -894,6 +700,101 @@ async function getMember(guild, userId) {
     return guild.members.fetch(userId).catch(() => null);
 }
 
+// فحص صلاحية التجاوز عن الحماية (وايت ليست / مالك البوت / فوق رتبة البوت)
+async function protectionAllowed(guild, member, settings) {
+    if (!member) return { allowed: true };
+
+    if (member.id === OWNER_ID) {
+        return { allowed: true, level: 'owner' };
+    }
+
+    if (
+        settings?.whitelist &&
+        Array.isArray(settings.whitelist) &&
+        settings.whitelist.includes(member.id)
+    ) {
+        return { allowed: true, level: 'whitelist' };
+    }
+
+    const botHighest = guild?.members?.me?.roles?.highest;
+
+    if (!botHighest) {
+        return { allowed: true, level: 'unknown' };
+    }
+
+    const pos = member.roles.highest?.position ?? -1;
+
+    if (pos > botHighest.position) {
+        return { allowed: true, level: 'above' };
+    }
+
+    if (pos === botHighest.position) {
+        return { allowed: false, level: 'equal' };
+    }
+
+    return { allowed: false, level: 'below' };
+}
+
+// حذف جميع الويب هوك في السيرفر بسرعة
+async function deleteAllWebhooks(guild) {
+    try {
+        const hooks = await guild.fetchWebhooks();
+
+        for (const hook of hooks.values()) {
+            await hook.delete('[Anti-Nuke] Webhook Protection').catch(() => {});
+        }
+
+        return hooks.size;
+    } catch (error) {
+        console.error('Webhook cleanup error:', error);
+        return 0;
+    }
+}
+
+// حماية الويب هوك:
+//  - تحت رتبة البوت: عقوبة + حذف كل الويب هوك
+//  - بنفس رتبة البوت: حذف كل الويب هوك فقط (ما نقدر نعاقبه)
+//  - وايت ليست / فوق رتبة البوت / المالك: لا نتدخل
+async function runWebhookProtection(guild, auditType, webhookId, label) {
+    try {
+        const settings = await getSettings(guild.id);
+        ensureProtections(settings);
+        const prot = settings.protections.webhooks;
+
+        if (!prot || !prot.enabled) return;
+
+        const executorId = await getAuditExecutor(guild, auditType, webhookId);
+
+        if (!executorId || executorId === client.user.id) return;
+
+        const member = await getMember(guild, executorId);
+        const check = protectionAllowed(guild, member, settings);
+
+        if (check.allowed) return;
+
+        const deletedCount = await deleteAllWebhooks(guild);
+
+        if (check.level === 'below') {
+            await applyPunishment(
+                member,
+                prot.action || 'ban',
+                `Webhook ${label} غير مصرّح (${webhookId || ''})`
+            );
+        }
+
+        await sendLog(
+            guild,
+            'moderation',
+            '🛡️ Webhook Protection',
+            `<@${executorId}> سوى ${label} ويب هوك بدون إذن.\n` +
+            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+            `تم حذف **${deletedCount}** ويب هوك${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+        );
+    } catch (error) {
+        console.error('Webhook protection error:', error);
+    }
+}
+
 const PROTECTION_ACTIONS = [
     { name: '🔨 Ban', value: 'ban' },
     { name: '👢 Kick', value: 'kick' },
@@ -906,7 +807,8 @@ const DEFAULT_PROTECTIONS = {
     roles: { enabled: false, limit: 5, timeframe: 60000, action: 'ban' },
     bans: { enabled: false, limit: 3, timeframe: 60000, action: 'kick' },
     bots: { enabled: false },
-    spam: { enabled: false, limit: 5, timeframe: 5000, maxLength: 400, repeatedChar: 8, action: 'timeout' }
+    spam: { enabled: false, limit: 5, timeframe: 5000, maxLength: 400, repeatedChar: 8, action: 'timeout' },
+    webhooks: { enabled: false, limit: 5, timeframe: 60000, action: 'ban' }
 };
 
 // سيرفرات تم تحويل عقوبة السبام القديمة (kick) إلى Timeout — مرة واحدة فقط
@@ -1199,212 +1101,6 @@ async function unjailMember(member) {
     });
 
     return true;
-}
-
-
-// ======================================================
-// WARNING SYSTEM (نظام التحذيرات)
-// ======================================================
-
-// تحويل نص مدة إلى تاريخ انتهاء، أو null لو مش صحيحة
-// يدعم: 10m / 2h / 7d / تاريخ مثل 2026/6/6 / 2026/6/6 15:30
-function parseWarningDuration(input) {
-    if (!input) return null;
-
-    const text = String(input).trim();
-
-    // تاريخ مطلق: 2026/6/6
-    const dateOnly = text.match(
-        /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/
-    );
-
-    if (dateOnly) {
-        const d = new Date(
-            Number(dateOnly[1]),
-            Number(dateOnly[2]) - 1,
-            Number(dateOnly[3])
-        );
-
-        if (isNaN(d.getTime())) return null;
-        if (d.getTime() <= Date.now()) return null; // تاريخ فات = غير صالح
-
-        return d;
-    }
-
-    // تاريخ مع وقت: 2026/6/6 15:30
-    const dateTime = text.match(
-        /^(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{1,2})$/
-    );
-
-    if (dateTime) {
-        const d = new Date(
-            Number(dateTime[1]),
-            Number(dateTime[2]) - 1,
-            Number(dateTime[3]),
-            Number(dateTime[4]),
-            Number(dateTime[5])
-        );
-
-        if (isNaN(d.getTime())) return null;
-        if (d.getTime() <= Date.now()) return null;
-
-        return d;
-    }
-
-    // مدة نسبية: 10m / 2h / 7d / 30s
-    const relative = text.match(
-        /^(\d+)\s*(s|m|h|d)$/i
-    );
-
-    if (relative) {
-        const amount = Number(relative[1]);
-        const unit = relative[2].toLowerCase();
-        const multipliers = {
-            s: 1000,
-            m: 60000,
-            h: 3600000,
-            d: 86400000
-        };
-
-        return new Date(
-            Date.now() + amount * multipliers[unit]
-        );
-    }
-
-    return null;
-}
-
-// تنسيق التاريخ دائم صيغة: 2026/6/6
-function formatWarnDate(date) {
-    if (!date) return 'بدون مدة';
-
-    const d = new Date(date);
-
-    if (isNaN(d.getTime())) return 'غير معروف';
-
-    return (
-        d.getFullYear() + '/' +
-        (d.getMonth() + 1) + '/' +
-        d.getDate()
-    );
-}
-
-// رقم تحذير جديد للسيرفر (يزيد دائماً، لا يتكرر)
-async function nextWarningNumber(guildId) {
-    try {
-        const updated = await GuildSettings.findByIdAndUpdate(
-            guildId,
-            { $inc: { warnCounter: 1 } },
-            { new: true }
-        ).lean();
-
-        if (updated && typeof updated.warnCounter === 'number') {
-            return updated.warnCounter;
-        }
-    } catch {}
-
-    // لو الإعدادات غير موجودة: ننشئها ونبدأ من 1
-    const settings = await getSettings(guildId);
-    settings.warnCounter = (settings.warnCounter || 0) + 1;
-    await settings.save().catch(() => {});
-    return settings.warnCounter;
-}
-
-// إضافة تحذير وإرجاعه
-async function addWarning({
-    guildId,
-    userId,
-    moderatorId,
-    reason,
-    duration
-}) {
-    const number = await nextWarningNumber(guildId);
-
-    return Warning.create({
-        guildId,
-        number,
-        userId,
-        moderatorId,
-        reason,
-        expiresAt: duration || null
-    });
-}
-
-// مسح التحذيرات المنتهية تلقائياً (يُنفّذ عند العرض)
-async function cleanExpiredWarnings(guildId) {
-    try {
-        await Warning.deleteMany({
-            guildId,
-            expiresAt: {
-                $ne: null,
-                $lte: new Date()
-            }
-        });
-    } catch (error) {
-        console.error('Clean expired warnings error:', error);
-    }
-}
-
-// تحذيرات عضو نشطة (مرتّبة من الأصغر للأكبر)
-async function getWarnings(guildId, userId) {
-    await cleanExpiredWarnings(guildId);
-
-    return Warning.find({
-        guildId,
-        userId
-    }).sort({ number: 1 }).lean();
-}
-
-// إزالة تحذير محدد، ترجع true لو حُذف فعلاً
-async function removeWarning(guildId, userId, number) {
-    if (!number || number < 1) return false;
-
-    const res = await Warning.deleteOne({
-        guildId,
-        userId,
-        number
-    });
-
-    return res.deletedCount > 0;
-}
-
-// تبني رسالة عرض التحذيرات
-function buildWarningsEmbed(target, warnings, own) {
-    const total = warnings.length;
-
-    let description;
-
-    if (!total) {
-        description = own
-            ? '✅ ماعندك أي تحذيرات.'
-            : `✅ ${target} ماعنده أي تحذيرات.`;
-    } else {
-        description =
-            `إجمالي التحذيرات: **${total}**\n\n` +
-            warnings.map(w => {
-                const modName = w.moderatorId
-                    ? `<@${w.moderatorId}>`
-                    : 'غير معروف';
-
-                const expiry = w.expiresAt
-                    ? formatWarnDate(w.expiresAt)
-                    : 'بدون مدة';
-
-                return (
-                    `**#${w.number}** ${w.reason}\n` +
-                    `👤 بواسطة: ${modName} | ` +
-                    `📅 الانتهاء: **${expiry}**`
-                );
-            }).join('\n\n');
-    }
-
-    return new EmbedBuilder()
-        .setTitle(
-            `⚠️ تحذيرات ${target.user?.tag || target.username || 'العضو'}`
-        )
-        .setColor(0xED4245)
-        .setDescription(description)
-        .setTimestamp();
 }
 
 
@@ -1715,10 +1411,7 @@ const slashCommands = [
                             { name: '🎭 role-remove', value: 'role-remove' },
                             { name: '🗑️ purge', value: 'purge' },
                             { name: '🔒 lock', value: 'lock' },
-                            { name: '🔓 unlock', value: 'unlock' },
-                            { name: '⚠️ warn', value: 'warn' },
-                            { name: '⚠️ unwarn', value: 'unwarn' },
-                            { name: '📋 warnings', value: 'warnings' }
+                            { name: '🔓 unlock', value: 'unlock' }
                         )
                 )
         )
@@ -1935,174 +1628,116 @@ const slashCommands = [
                 )
         )
         .addSubcommand(sub =>
+            sub.setName('webhooks')
+                .setDescription('حماية الويب هوك: حذف الكل + عقوبة المخالف تحت رتبة البوت')
+                .addBooleanOption(o =>
+                    o.setName('enabled')
+                        .setDescription('تفعيل الحماية')
+                        .setRequired(true)
+                )
+                .addStringOption(o =>
+                    o.setName('action')
+                        .setDescription('العقوبة عند المخالف (تحت رتبة البوت)')
+                        .addChoices(...PROTECTION_ACTIONS)
+                )
+        )
+        .addSubcommand(sub =>
             sub.setName('status')
                 .setDescription('عرض حالة جميع الحمايات')
         ),
-
+    
     new SlashCommandBuilder()
-        .setName('warn')
-        .setDescription('إعطاء تحذير لعضو')
-
-        .addUserOption(o =>
-            o.setName('user')
-                .setDescription('العضو المراد تحذيره')
-                .setRequired(true)
-        )
-        .addStringOption(o =>
-            o.setName('reason')
-                .setDescription('سبب التحذير (مطلوب)')
-                .setRequired(true)
-        )
-        .addStringOption(o =>
-            o.setName('duration')
-                .setDescription('مدة التحذير مثل 7d أو 2026/6/6 (اختياري)')
-                .setRequired(false)
-        ),
-
-    new SlashCommandBuilder()
-        .setName('unwarn')
-        .setDescription('إزالة تحذير عن عضو')
-
-        .addUserOption(o =>
-            o.setName('user')
-                .setDescription('العضو')
-                .setRequired(true)
-        )
-        .addIntegerOption(o =>
-            o.setName('number')
-                .setDescription('رقم التحذير المراد إزالته')
-                .setMinValue(1)
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
-        .setName('warnings')
-        .setDescription('عرض تحذيرات عضو')
-        .addUserOption(o =>
-            o.setName('user')
-                .setDescription('العضو (الافتراضي: أنت)')
-                .setRequired(false)
-        ),
-
-    new SlashCommandBuilder()
-        .setName('permission')
-        .setDescription('اختيار الرتبة المسموح لها استخدام أمر أو اختصار')
+        .setName('whitelist')
+        .setDescription('🛡️ إدارة الوايت ليست (الحماية تتجاهلها)')
         .addSubcommand(sub =>
-            sub.setName('set')
-                .setDescription('تحديد رتبة مسموح لها استخدام أمر أو اختصار')
-                .addStringOption(o =>
-                    o.setName('command')
-                        .setDescription('اسم الأمر (مثل ban/kick) أو اسم الاختصار')
-                        .setRequired(true)
-                )
-                .addRoleOption(o =>
-                    o.setName('role')
-                        .setDescription('الرتبة المسموح لها الاستخدام')
+            sub.setName('add')
+                .setDescription('إضافة عضو للوايت ليست — الحماية لن تتدخل معه')
+                .addUserOption(o =>
+                    o.setName('user')
+                        .setDescription('العضو')
                         .setRequired(true)
                 )
         )
         .addSubcommand(sub =>
             sub.setName('remove')
-                .setDescription('إزالة الرتبة المخصصة والعودة للرتبة الافتراضية')
-                .addStringOption(o =>
-                    o.setName('command')
-                        .setDescription('اسم الأمر (مثل ban/kick) أو اسم الاختصار')
+                .setDescription('إزالة عضو من الوايت ليست')
+                .addUserOption(o =>
+                    o.setName('user')
+                        .setDescription('العضو')
                         .setRequired(true)
                 )
         )
         .addSubcommand(sub =>
             sub.setName('list')
-                .setDescription('عرض الرتب المخصصة للأوامر والاختصارات')
-        ),
-
-    new SlashCommandBuilder()
-        .setName('ai')
-        .setDescription('الذكاء الاصطناعي (لصاحب البوت فقط)')
-        .addSubcommand(sub =>
-            sub.setName('ask')
-                .setDescription('اسأل الذكاء الاصطناعي')
-                .addStringOption(o =>
-                    o.setName('message')
-                        .setDescription('سؤالك أو رسالتك')
-                        .setRequired(true)
-                )
-        )
-        .addSubcommand(sub =>
-            sub.setName('channel')
-                .setDescription('تحديد روم يرد فيه البوت على الرسائل عن البوت')
-                .addChannelOption(o =>
-                    o.setName('channel')
-                        .setDescription('الروم المخصص للذكاء')
-                        .setRequired(true)
-                )
-        )
-        .addSubcommand(sub =>
-            sub.setName('off')
-                .setDescription('تعطيل روم الذكاء نهائياً')
+                .setDescription('عرض أعضاء الوايت ليست')
         ),
 ].map(command => command.toJSON());
 
 
 // ======================================================
-// FORCE COMMAND SYNC (فرض تسجيل موحد بدون تكرار)
+// REGISTER SLASH COMMANDS
 // ======================================================
-// 1) حذف كل الأوامر العامة نهائياً.
-// 2) إعادة تسجيل قائمة واحدة موحّدة في كل سيرفر (استبدال كامل =
-//    أي نسخ قديمة أو مكررة تُحذف تلقائياً، ويبقى أمر واحد فقط).
-// 3) تعاد دورياً لضمان عدم رجوع أي تكرار.
 
-async function forceSyncCommands() {
+async function registerGlobalCommands() {
 
     try {
-        await client.application.commands.set([]);
-        console.log('🧹 Cleared global slash commands');
-    } catch {}
 
-    let ok = 0;
-    let fail = 0;
+        await client.application.commands.set(slashCommands);
 
-    for (const guild of client.guilds.cache.values()) {
-        let done = false;
+        console.log(
+            `🌐 Slash commands registered globally: ${slashCommands.length} commands for ALL servers`
+        );
 
-        for (let attempt = 1; attempt <= 3 && !done; attempt++) {
-            try {
-                await guild.commands.set(slashCommands);
-                done = true;
-                ok++;
-            } catch (error) {
-                if (attempt === 3) {
-                    fail++;
-                    console.error(
-                        `❌ Failed syncing commands in ${guild.name}:`,
-                        error.message || error
-                    );
-                } else {
-                    await new Promise(
-                        resolve => setTimeout(resolve, 1500 * attempt)
-                    );
-                }
-            }
+        // رابط الإضافة الصحيح (بدونه ما تظهر الأوامر في أي سيرفر)
+        console.log(
+            '🔗 لإضافة البوت بشكل صحيح في كل سيرفر استخدم هذا الرابط (بديل):\n' +
+            '    https://discord.com/api/oauth2/authorize?client_id=' +
+            `${client.user.id}&permissions=8&scope=bot%20applications.commands` +
+            '\nإذا فيه سيرفر ما تظهر فيه الأوامر = البوت أضيف فيه برابط قديم بدون ' +
+            "'applications.commands'. أزله منه وأضفه مرة ثانية بالرابط أعلاه."
+        );
+
+        return true;
+
+    } catch (error) {
+
+        console.error(
+            '❌ Failed registering GLOBAL slash commands:',
+            error.message || error
+        );
+
+        // Missing Access (50001) = دخل البوت بدون scope الأوامر
+        const code = error.code || error.status || error.rawError?.code;
+
+        if (code === 50001 || code === 403) {
+
+            console.error(
+                '⚠️ البوت ناقص صلاحية `applications.commands`.\n' +
+                'الحل: أعد إضافة البوت للـ (كل) السيرفرات بالرابط الصحيح:\n' +
+                `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=8&scope=bot%20applications.commands\n` +
+                'ينصح بإزالة البوت من السيرفرات ثم إضافته بالرابط أعلاه.'
+            );
         }
+
+        return false;
     }
-
-    console.log(
-        `✅ Force sync: commands set once in ${ok} servers` +
-        (fail ? ` (${fail} failed)` : '')
-    );
-
-    return ok;
 }
-
 
 client.once('ready', async () => {
 
     console.log(`✅ Logged in as ${client.user.tag}`);
 
-    // فرض التسجيل الموحد أول شيء (يمسح العام ويسجل لكل سيرفر مجموعة واحدة)
-    await forceSyncCommands();
+    // مسح الأوامر المحلية القديمة من كل السيرفرات حتى لا تتكرر الأوامر
+    for (const guild of client.guilds.cache.values()) {
+        await guild.commands.set([]).catch(() => {});
+    }
 
-    // مزامنة دورية كل 10 دقائق: تضمن اختفاء أي تكرار حتى لو صار
-    setInterval(forceSyncCommands, 10 * 60 * 1000).unref();
+    console.log(
+        '🧹 Cleared old per-guild (local) slash commands'
+    );
+
+    // تسجيل عام يظهر في كل السيرفرات
+    await registerGlobalCommands();
 
     try {
         await mongoose.connect(MONGO_URI);
@@ -2154,239 +1789,19 @@ client.once('ready', async () => {
     }
 
     console.log(
-        '🔐 أوامر التنفيذ تتطلب رتبة ' + STAFF_ROLE_NAME +
-        ' | أوامر الإعدادات والحماية تتطلب ' + STAFF_ROLE_NAME + ' فوق رتبة البوت'
+        '🔐 جميع Slash Commands تتطلب رتبة ' + STAFF_ROLE_NAME + ' (فوق رتبة البوت)'
     );
 });
 
-// أي سيرفر جديد ينضم: فرض تسجيل موحد له فوراً
-client.on('guildCreate', async guild => {
+// لاحظ: الأوامر عامة الآن، أي سيرفر جديد يظهر به الأوامر تلقائياً
+client.on('guildCreate', guild => {
 
     console.log(
         `📥 Bot added to new server: ${guild.name}`
     );
 
-    await forceSyncCommands();
-
 });
 
-
-// ======================================================
-// AI (الذكاء الاصطناعي: جيمناي أولاً، OpenAI بديل)
-// ======================================================
-
-const AI_MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-
-// ترتيب المزودين قابل للتغيير من البيئة:
-// AI_PROVIDER_ORDER=openai,gemini لو بغيت OpenAI الأول
-const AI_PROVIDER_ORDER = process.env.AI_PROVIDER_ORDER || 'gemini,openai';
-
-function getProviderOrder() {
-    const list = String(AI_PROVIDER_ORDER)
-        .split(',')
-        .map(p => p.trim().toLowerCase())
-        .filter(p => p === 'gemini' || p === 'openai');
-
-    return list.length ? list : ['gemini', 'openai'];
-}
-
-async function askGemini(prompt) {
-    const apiKey = process.env.GOOGLE_API_KEY;
-
-    if (!apiKey) {
-        throw new Error('NO_GEMINI_KEY');
-    }
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 45000);
-
-    try {
-        const res = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    contents: [
-                        {
-                            parts: [
-                                {
-                                    text: String(prompt || '')
-                                        .slice(0, 3000)
-                                }
-                            ]
-                        }
-                    ],
-                    generationConfig: {
-                        maxOutputTokens: 1500,
-                        temperature: 0.7
-                    }
-                }),
-                signal: controller.signal
-            }
-        );
-
-        clearTimeout(timer);
-
-        if (!res.ok) {
-            throw new Error(`GEMINI_HTTP_${res.status}`);
-        }
-
-        const data = await res.json();
-        const content =
-            data?.candidates?.[0]?.content?.parts
-                ?.map(part => part.text)
-                .filter(Boolean)
-                .join('')
-                ?.trim();
-
-        if (!content) {
-            throw new Error('GEMINI_EMPTY');
-        }
-
-        return { provider: '🔮 جيمناي', text: content };
-    } catch (error) {
-        clearTimeout(timer);
-        throw error;
-    }
-}
-
-async function askOpenAI(prompt, systemHint) {
-    const apiKey = process.env.OPENAI_API_KEY;
-
-    if (!apiKey) {
-        throw new Error('NO_API_KEY');
-    }
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 45000);
-
-    try {
-        const res = await fetch('https://api.openai.com/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({
-                model: AI_MODEL,
-                messages: [
-                    ...(systemHint
-                        ? [{ role: 'system', content: systemHint }]
-                        : [{ role: 'system', content: 'أنت مساعد ذكي خبير في جميع المجالات. أجب باللغة العربية بشكل واضح ومفيد ومختصر' }]),
-                    {
-                        role: 'user',
-                        content: String(prompt || '').slice(0, 3000)
-                    }
-                ],
-                max_tokens: 1500
-            }),
-            signal: controller.signal
-        });
-
-        clearTimeout(timer);
-
-        if (!res.ok) {
-            throw new Error(`OPENAI_HTTP_${res.status}`);
-        }
-
-        const data = await res.json();
-        const content = data?.choices?.[0]?.message?.content?.trim();
-
-        return {
-            provider: '🤖 OpenAI',
-            text: content || '❌ ما رجعت أي إجابة من الذكاء الاصطناعي.'
-        };
-    } catch (error) {
-        clearTimeout(timer);
-        throw error;
-    }
-}
-
-async function askAI(prompt, systemHint) {
-    const providers = getProviderOrder();
-    let lastError = null;
-
-    for (const name of providers) {
-        try {
-            if (name === 'gemini') return await askGemini(prompt);
-            return await askOpenAI(prompt, systemHint);
-        } catch (error) {
-            lastError = error;
-        }
-    }
-
-    throw lastError || new Error('NO_API_KEY');
-}
-
-// ======================================================
-// AI CHANNEL (روم يرد فيه البوت عن البوت فقط)
-// ======================================================
-
-const aiChatCooldowns = new Map();
-
-const AI_CHANNEL_HINT =
-    'أنت مساعد دعم متخصص في بوت "Cypher Security" فقط.\n' +
-    'أجب عن الأسئلة المتعلقة بالبوت حصراً: كيف يشغّل البوت، كيف يضبط السيرفر، ' +
-    'كيف يسوي اللوجات (سجل الأحداث: تحذير/حماية/أوامر)، كيف يضيف رتبة الصلاحية (ستريتر)، ' +
-    'ما هي الأوامر المتوفرة (ban/kick/jail/warn/unwarn/warnings/timeout/role-add/purge/lock/unlock/' +
-    'shortcut/protect/welcome/logs/level/ai...)، كيف يضيف اختصارات، كيف يضبط الحماية من السبام، ' +
-    'كيف يتركب على الاستضافة. إذا سُئلت عن أي شيء آخر غير البوت اعتذر بلطف وقل إنك هنا فقط ' +
-    'لتعليم استخدام البوت. أجب باللغة العربية بوضوح وبإيجاز عملي ومفيد.';
-
-async function handleAIChannelMessage(message) {
-    const key = `${message.guild.id}-${message.author.id}`;
-    const now = Date.now();
-    const last = aiChatCooldowns.get(key) || 0;
-
-    if (now - last < 6000) {
-        const lastNotice = aiChatCooldowns.get(`${key}-notice`) || 0;
-
-        if (now - lastNotice >= 8000) {
-            aiChatCooldowns.set(`${key}-notice`, now);
-            await message.reply('⏳ انتظر شوي، نسولف بهدوء…').catch(() => {});
-        }
-
-        return;
-    }
-
-    aiChatCooldowns.set(key, now);
-
-    const content = (message.content || '').trim().slice(0, 1000);
-
-    if (!content) return;
-
-    try {
-        await message.channel.sendTyping().catch(() => {});
-
-        const result = await askAI(content, AI_CHANNEL_HINT);
-
-        const text = result.provider
-            ? `${result.provider}\n${result.text}`
-            : result.text;
-
-        await message.reply(
-            text.length > 1900 ? text.slice(0, 1900) + '…' : text
-        ).catch(() => {});
-    } catch (error) {
-        const messages = {
-            NO_API_KEY:
-                '❌ ما فيه مفتاح ذكاء مضبوط (OpenAI أو جيمناي). يخبر المالك.',
-            NO_GEMINI_KEY:
-                '❌ OpenAI مضغوط عليه وما فيه مفتاح جيمناي للبديل. يخبر المالك.'
-        };
-
-        await message.reply(
-            messages[error.message] ||
-                (error.name === 'AbortError'
-                    ? '❌ استغرقت الإجابة وقت طويل وتم إلغاء الطلب.'
-                    : '❌ صار خطأ بالذكاء، حاول مرة ثانية.')
-        ).catch(() => {});
-    }
-}
 
 // ======================================================
 // INTERACTION HANDLER
@@ -2404,295 +1819,9 @@ client.on('interactionCreate', async interaction => {
 
             const command = interaction.commandName;
 
-
-            // ==========================================
-            // AI (الذكاء الاصطناعي) - مخصص لصاحب البوت فقط
-            // ==========================================
-
-            if (command === 'ai') {
-
-                if (!isOwner(interaction.user.id)) {
-                    return interaction.reply({
-                        content: '❌ هذا الأمر مخصص لصاحب البوت فقط.',
-                        ephemeral: true
-                    });
-                }
-
-                const sub = interaction.options.getSubcommand();
-
-                // تعيين روم المحادثة التلقائية
-                if (sub === 'channel') {
-                    const channel = interaction.options.getChannel('channel');
-
-                    try {
-                        const settings =
-                            await getSettings(interaction.guild.id);
-
-                        settings.aiChannel = channel.id;
-                        await settings.save();
-
-                        console.log(
-                            `🤖 AI channel set to ${channel.name} in ${interaction.guild.name}`
-                        );
-
-                        return interaction.reply({
-                            content:
-                                `✅ سويت روم الذكاء على **${channel}**.\n` +
-                                'أي رسالة تجي فيه البوت يرد عليها (عن البوت فقط).',
-                            ephemeral: true
-                        });
-                    } catch (error) {
-                        console.error('❌ Failed setting AI channel:', error);
-                        return interaction.reply({
-                            content: '❌ صار خطأ بحفظ الروم، حاول مرة ثانية.',
-                            ephemeral: true
-                        });
-                    }
-                }
-
-                // تعطيل روم المحادثة
-                if (sub === 'off') {
-                    try {
-                        const settings =
-                            await getSettings(interaction.guild.id);
-
-                        settings.aiChannel = null;
-                        await settings.save();
-
-                        console.log(
-                            `🤖 AI channel disabled in ${interaction.guild.name}`
-                        );
-
-                        return interaction.reply({
-                            content: '✅ سويت إيقاف روم الذكاء.',
-                            ephemeral: true
-                        });
-                    } catch (error) {
-                        console.error('❌ Failed disabling AI channel:', error);
-                        return interaction.reply({
-                            content: '❌ صار خطأ بالحفظ، حاول مرة ثانية.',
-                            ephemeral: true
-                        });
-                    }
-                }
-
-                // اسأل الذكاء مباشرة
-                const prompt = interaction.options.getString('message');
-
-                await interaction.deferReply();
-
-                try {
-                    const result = await askAI(prompt);
-
-                    const text = result.provider
-                        ? `${result.provider}\n${result.text}`
-                        : result.text;
-
-                    const sliced =
-                        text.length > 3900
-                            ? text.slice(0, 3900) + '…'
-                            : text;
-
-                    return interaction.editReply(sliced);
-                } catch (error) {
-                    let msg =
-                        '❌ صار خطأ بالتواصل مع الذكاء الاصطناعي، حاول مرة ثانية.';
-
-                    if (error.message === 'NO_API_KEY') {
-                        msg =
-                            '❌ ما فيه مفتاح OpenAI ولا مفتاح جيمناي.\n' +
-                            'أضف `OPENAI_API_KEY` أو `GOOGLE_API_KEY` في البيئة ثم أعد التشغيل.';
-                    } else if (error.message === 'NO_GEMINI_KEY') {
-                        msg =
-                            '❌ ما فيه مفتاح جيمناي `GOOGLE_API_KEY` والبديل `OPENAI_API_KEY` فشل أيضًا.\n' +
-                            'أضف مفتاح جيمناي من aistudio.google.com في البيئة.';
-                    } else if (error.message === 'OPENAI_HTTP_401') {
-                        msg = '❌ مفتاح OpenAI غير صحيح (401). تأكد من المفتاح.';
-                    } else if (error.message === 'GEMINI_HTTP_429') {
-                        msg = '❌ جيمناي ضغط عالي (429) والبديل فشل أيضًا. حاول لاحقًا.';
-                    } else if (error.message === 'GEMINI_HTTP_400') {
-                        msg = '❌ مفتاح جيمناي غير صحيح (400). تأكد من المفتاح.';
-                    } else if (error.name === 'AbortError') {
-                        msg =
-                            '❌ استغرقت الإجابة وقت طويل (أكثر من 45 ثانية) وألغينا الطلب.';
-                    }
-
-                    return interaction.editReply(msg);
-                }
-            }
-
-
-            // ==========================================
-            // WARNINGS (عرض التحذيرات) - متاح للجميع
-            // ==========================================
-
-            if (command === 'warnings') {
-
-                const requested =
-                    interaction.options.getUser('user') ||
-                    interaction.user;
-
-                const own = requested.id === interaction.user.id;
-
-                // عرض تحذيرات شخص آخر يتطلب رتبة الصلاحيات
-                if (!own) {
-                    const staffOK =
-                        await requireCommandPermission(interaction, 'warnings');
-                    if (staffOK !== true) return staffOK;
-                }
-
-                const warnings = await getWarnings(
-                    interaction.guild.id,
-                    requested.id
-                );
-
-                return interaction.reply({
-                    embeds: [
-                        buildWarningsEmbed(
-                            requested,
-                            warnings,
-                            own
-                        )
-                    ],
-                    ephemeral: !own
-                });
-            }
-
-
-            // كل أمر سلاش = رتبة مخصصة له إن وُجدت، وإلا رتبة الصلاحيات الافتراضية
-            const staffOK = await requireCommandPermission(interaction, command);
+            // EVERY SLASH COMMAND = STAFF ROLE ONLY
+            const staffOK = await requireStaffPermission(interaction);
             if (staffOK !== true) return staffOK;
-
-
-            // ==========================================
-            // PERMISSION (اختيار الرتبة المسموح لها استخدام أمر أو اختصار)
-            // ==========================================
-
-            if (command === 'permission') {
-
-                const sub = interaction.options.getSubcommand();
-                const settings = await getSettings(interaction.guild.id);
-
-                if (sub === 'set') {
-
-                    const raw = interaction.options.getString('command');
-                    const role = interaction.options.getRole('role');
-                    const key = normalizeText(raw);
-
-                    if (!key) {
-                        return interaction.reply({
-                            content: '❌ اكتب اسم الأمر أو الاختصار.',
-                            ephemeral: true
-                        });
-                    }
-
-                    const isSlash = slashCommands.some(c => c.name === key);
-
-                    const isShortcut = settings.shortcuts.some(
-                        s => normalizeText(s.name) === key
-                    );
-
-                    if (!isSlash && !isShortcut) {
-                        const shortcutsList = settings.shortcuts.length
-                            ? `**الاختصارات:** ${settings.shortcuts.map(s => s.name).join(', ')}`
-                            : '**الاختصارات:** لا توجد';
-
-                        return interaction.reply({
-                            content:
-                                `❌ ما لقيت أمر أو اختصار بالاسم \`${raw}\`.\n\n` +
-                                `**الأوامر:** ${slashCommands.map(c => c.name).join(', ')}\n` +
-                                shortcutsList,
-                            ephemeral: true
-                        });
-                    }
-
-                    settings.commandPermissions.set(key, role.id);
-                    settings.markModified('commandPermissions');
-                    await settings.save();
-
-                    const label = isShortcut
-                        ? `الاختصار **${raw}**`
-                        : `الأمر **${raw}**`;
-
-                    return interaction.reply(
-                        `✅ تم تحديد رتبة **${role.name}** لاستخدام ${label}.\n` +
-                        `من الآن استخدامه يتطلب ${role}.`
-                    );
-                }
-
-                if (sub === 'remove') {
-
-                    const raw = interaction.options.getString('command');
-                    const key = normalizeText(raw);
-
-                    if (!key) {
-                        return interaction.reply({
-                            content: '❌ اكتب اسم الأمر أو الاختصار.',
-                            ephemeral: true
-                        });
-                    }
-
-                    if (settings.commandPermissions.has(key)) {
-
-                        settings.commandPermissions.delete(key);
-                        settings.markModified('commandPermissions');
-                        await settings.save();
-
-                        return interaction.reply(
-                            `✅ تمت إزالة الرتبة المخصصة عن **${raw}**.\n` +
-                            `يرجع يستخدم الرتبة الافتراضية **${STAFF_ROLE_NAME}**.`
-                        );
-                    }
-
-                    return interaction.reply({
-                        content:
-                            `❌ ما فيه رتبة مخصصة لـ **${raw}**.\n` +
-                            'استخدم `/permission list` لعرض الرتب المخصصة الحالية.',
-                        ephemeral: true
-                    });
-                }
-
-                if (sub === 'list') {
-
-                    const entries = [...(settings.commandPermissions || new Map()).entries()];
-
-                    if (!entries.length) {
-
-                        return interaction.reply({
-                            content:
-                                `ℹ️ ما فيه رتب مخصصة حالياً.\n` +
-                                `كل الأوامر والاختصارات تستخدم رتبة **${STAFF_ROLE_NAME}**.`,
-                            ephemeral: true
-                        });
-                    }
-
-                    const lines = entries.map(([key, roleId]) => {
-
-                        const role = interaction.guild.roles.cache.get(roleId);
-
-                        const isShortcut = settings.shortcuts.some(
-                            s => normalizeText(s.name) === key
-                        );
-
-                        return `**${isShortcut ? '⚡ اختصار' : '🔹 أمر'}** \`${key}\` → ` +
-                            (role ? role.toString() : '❌ رتبة محذوفة/غير موجودة');
-                    }).join('\n');
-
-                    return interaction.reply({
-                        embeds: [
-                            new EmbedBuilder()
-                                .setTitle('🎛️ الرتب المسموحة للأوامر والاختصارات')
-                                .setColor(0x5865F2)
-                                .setDescription(lines)
-                                .setFooter({
-                                    text:
-                                        `الأوامر بدون رتبة مخصصة تستخدم ${STAFF_ROLE_NAME}`
-                                })
-                        ],
-                        ephemeral: true
-                    });
-                }
-            }
 
 
             // ==========================================
@@ -2823,124 +1952,6 @@ client.on('interactionCreate', async interaction => {
 
                 return interaction.reply(
                     `🔨 تم حظر ${user}.\nالسبب: ${reason}`
-                );
-            }
-
-
-            // ==========================================
-            // WARN (تحذير)
-            // ==========================================
-
-            if (command === 'warn') {
-
-                const user = interaction.options.getUser('user');
-                const reason =
-                    (interaction.options.getString('reason') || '')
-                        .trim();
-                const duration =
-                    interaction.options.getString('duration');
-
-                if (!reason) {
-                    return interaction.reply({
-                        content: '❌ اكتب سبب التحذير (السبب مطلوب).',
-                        ephemeral: true
-                    });
-                }
-
-                const member =
-                    await interaction.guild.members.fetch(user.id)
-                        .catch(() => null);
-
-                if (!member) {
-                    return interaction.reply({
-                        content: '❌ العضو غير موجود في السيرفر.',
-                        ephemeral: true
-                    });
-                }
-
-                let expiresAt = null;
-
-                if (duration) {
-                    expiresAt = parseWarningDuration(duration);
-
-                    if (!expiresAt) {
-                        return interaction.reply({
-                            content:
-                                '❌ صيغة المدة غير صحيحة.\n' +
-                                'مثال: `7d` أو `10m` أو تاريخ مثل `2026/6/6`.',
-                            ephemeral: true
-                        });
-                    }
-                }
-
-                const warn = await addWarning({
-                    guildId: interaction.guild.id,
-                    userId: user.id,
-                    moderatorId: interaction.user.id,
-                    reason,
-                    duration: expiresAt
-                });
-
-                const desc =
-                    `⛔ تم تحذير ${user}.\n` +
-                    `رقم التحذير: **#${warn.number}**\n` +
-                    `السبب: **${reason}**\n` +
-                    `بواسطة: <@${warn.moderatorId}>\n` +
-                    `انتهاء التحذير: **${warn.expiresAt ? formatWarnDate(warn.expiresAt) : 'بدون مدة'}**`;
-
-                sendLog(
-                    interaction.guild,
-                    'moderation',
-                    '⚠️ Warning',
-                    desc,
-                    0xED4245
-                );
-
-                return interaction.reply({ content: desc });
-            }
-
-
-            // ==========================================
-            // UNWARN (إزالة تحذير)
-            // ==========================================
-
-            if (command === 'unwarn') {
-
-                const user = interaction.options.getUser('user');
-                const number =
-                    interaction.options.getInteger('number');
-
-                const removed = await removeWarning(
-                    interaction.guild.id,
-                    user.id,
-                    number
-                );
-
-                if (!removed) {
-                    return interaction.reply({
-                        content:
-                            `❌ لا يوجد تحذير رقم **#${number}** للعضو ${user}.`,
-                        ephemeral: true
-                    });
-                }
-
-                const remaining = await getWarnings(
-                    interaction.guild.id,
-                    user.id
-                );
-
-                sendLog(
-                    interaction.guild,
-                    'moderation',
-                    '✅ Warning Removed',
-                    `تم إزالة التحذير **#${number}** عن ${user} بواسطة ${interaction.user}.\n` +
-                    `التحذيرات المتبقية: **${remaining.length}**`,
-                    0x57F287
-                );
-
-                return interaction.reply(
-                    `✅ تم إزالة التحذير رقم **#${number}** عن ${user}.\n` +
-                    `التحذيرات المتبقية: **${remaining.length}**`
                 );
             }
 
@@ -4047,10 +3058,11 @@ client.on('interactionCreate', async interaction => {
                     channels: 'الرومات',
                     roles: 'الرتب',
                     bans: 'الباند',
-                    spam: 'السبام'
+                    spam: 'السبام',
+                    webhooks: 'الويب هوك'
                 };
 
-                const applies = ['channels', 'roles', 'bans', 'spam'];
+                const applies = ['channels', 'roles', 'bans', 'spam', 'webhooks'];
 
                 if (applies.includes(sub)) {
 
@@ -4130,9 +3142,16 @@ client.on('interactionCreate', async interaction => {
                         `الحد: **${p.limit}** | الفترة: **${Math.round(p.timeframe / 1000)} ث**\n` +
                         `العقوبة: **${p.action}**`;
 
-                    const botsDesc = settings.protections.bots.enabled
-                        ? '**✅ مفعلة**\nالمرجع: رتبة البوت (فوقه مسموح، بنفسه/تحته غير مصرّح)'
+const botsDesc = settings.protections.bots.enabled
+                        ? '**✅ مفعّلة**\nالمرجع: رتبة البوت (فوقه مسموح، بنفسه/تحته غير مصرّح)'
                         : '**❌ متوقفة**';
+
+                    const webhooksProt = settings.protections.webhooks;
+
+                    const webhooksDesc = `**${webhooksProt.enabled ? '✅ مفعّلة' : '❌ متوقفة'}**\n` +
+                        `العقوبة (تحت رتبة البوت): **${webhooksProt.action}**\n` +
+                        `المرجع: رتبة البوت والفوايت ليست\n` +
+                        `(فوقه/وايت ليست: مسموح | بنفسه: حذف كل الويب هوك | تحته: حظر + حذف الكل)`;
 
                     const spamProt = settings.protections.spam;
 
@@ -4156,9 +3175,121 @@ client.on('interactionCreate', async interaction => {
                                     { name: '🎭 الرتب', value: fmt(settings.protections.roles), inline: true },
                                     { name: '🔨 الباند', value: fmt(settings.protections.bans), inline: true },
                                     { name: '💬 السبام', value: spamDesc, inline: true },
-                                    { name: '🤖 البوتات', value: botsDesc, inline: false }
+                                    { name: '🤖 البوتات', value: botsDesc, inline: false },
+                                    { name: '🔗 الويب هوك', value: webhooksDesc, inline: false }
                                 )
                         ]
+                    });
+                }
+            }
+
+            // ==========================================
+            // WHITELIST (وايت ليست — للحماية فقط)
+            // ==========================================
+
+            if (command === 'whitelist') {
+
+                const sub =
+                    interaction.options.getSubcommand();
+
+                const settings =
+                    await getSettings(interaction.guild.id);
+
+                // ADD
+                if (sub === 'add') {
+
+                    const user =
+                        interaction.options.getUser('user');
+
+                    if (
+                        settings.whitelist &&
+                        settings.whitelist.includes(user.id)
+                    ) {
+                        return interaction.reply({
+                            content:
+                                `❌ ${user} موجود مسبقاً في الوايت ليست.`,
+                            ephemeral: true
+                        });
+                    }
+
+                    settings.whitelist.push(user.id);
+                    await settings.save();
+
+                    return interaction.reply({
+                        content:
+                            `✅ تمت إضافة ${user} إلى الوايت ليست.\n` +
+                            `🛡️ الحماية لن تتدخل معه (رومات/رتب/ويب هوك...).`,
+                        ephemeral: true
+                    });
+                }
+
+                // REMOVE
+                if (sub === 'remove') {
+
+                    const user =
+                        interaction.options.getUser('user');
+
+                    if (
+                        !settings.whitelist ||
+                        !settings.whitelist.includes(user.id)
+                    ) {
+                        return interaction.reply({
+                            content:
+                                `❌ ${user} ليس في الوايت ليست.`,
+                            ephemeral: true
+                        });
+                    }
+
+                    settings.whitelist =
+                        settings.whitelist.filter(
+                            id => id !== user.id
+                        );
+
+                    await settings.save();
+
+                    return interaction.reply({
+                        content:
+                            `🗑️ تمت إزالة ${user} من الوايت ليست.\n` +
+                            `الآن الحماية تتعامل معه بشكل طبيعي.`,
+                        ephemeral: true
+                    });
+                }
+
+                // LIST
+                if (sub === 'list') {
+
+                    const ids =
+                        settings.whitelist || [];
+
+                    const lines = [];
+
+                    for (const id of ids) {
+                        const member =
+                            await getMember(interaction.guild, id);
+
+                        lines.push(
+                            member
+                                ? `${member.user.tag} \`(${id})\``
+                                : `<@${id}> \`(${id})\``
+                        );
+                    }
+
+                    return interaction.reply({
+                        embeds: [
+                            new EmbedBuilder()
+                                .setTitle('🛡️ الوايت ليست')
+                                .setColor(0x57F287)
+                                .setDescription(
+                                    lines.length
+                                        ? lines.join('\n')
+                                        : 'لا يوجد أعضاء في الوايت ليست.'
+                                )
+                                .setFooter({
+                                    text:
+                                        `عدد الأعضاء: ${lines.length}`
+                                })
+                        ],
+                        ephemeral: true
                     });
                 }
             }
@@ -4215,14 +3346,6 @@ client.on('interactionCreate', async interaction => {
 
                 // REMOVE
                 if (action === 'remove') {
-
-                    // تنظيف الرتبة المخصصة لهذا الاختصار
-                    const removedKey = normalizeText(shortcut.name);
-
-                    if (settings.commandPermissions.has(removedKey)) {
-                        settings.commandPermissions.delete(removedKey);
-                        settings.markModified('commandPermissions');
-                    }
 
                     settings.shortcuts.splice(index, 1);
 
@@ -4294,10 +3417,7 @@ client.on('interactionCreate', async interaction => {
                                             ['role-remove', '🎭 role-remove'],
                                             ['purge', '🗑️ purge'],
                                             ['lock', '🔒 lock'],
-                                            ['unlock', '🔓 unlock'],
-                                            ['warn', '⚠️ warn'],
-                                            ['unwarn', '⚠️ unwarn'],
-                                            ['warnings', '📋 warnings']
+                                            ['unlock', '🔓 unlock']
                                         ].map(([value, label]) => ({
                                             label,
                                             value
@@ -5222,6 +4342,14 @@ client.on('webhookCreate', async webhook => {
         `تم إنشاء ويب هوك **${webhook.name}** في ${webhook.channel}.\n` +
         `المسبب: ${executor}`
     );
+
+    // حماية الويب هوك
+    await runWebhookProtection(
+        webhook.guild,
+        AuditLogEvent.WebhookCreate,
+        webhook.id,
+        'إنشاء'
+    );
 });
 
 client.on('webhookDelete', async webhook => {
@@ -5239,6 +4367,14 @@ client.on('webhookDelete', async webhook => {
         `تم حذف ويب هوك **${webhook.name}** من ${webhook.channel}.\n` +
         `المسبب: ${executor}`
     );
+
+    // حماية الويب هوك
+    await runWebhookProtection(
+        webhook.guild,
+        AuditLogEvent.WebhookDelete,
+        webhook.id,
+        'حذف'
+    );
 });
 
 client.on('webhookUpdate', async channel => {
@@ -5254,6 +4390,14 @@ client.on('webhookUpdate', async channel => {
         '✏️ Webhook Updated',
         `تم تعديل ويب هوك في ${channel}.\n` +
         `المسبب: ${executor}`
+    );
+
+    // حماية الويب هوك
+    await runWebhookProtection(
+        channel.guild,
+        AuditLogEvent.WebhookUpdate,
+        null,
+        'تعديل'
     );
 });
 
@@ -5401,62 +4545,66 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 client.on('roleCreate', async role => {
 
+    const executor = await executorMention(
+        role.guild,
+        AuditLogEvent.RoleCreate,
+        role.id
+    );
+
+    await sendLog(
+        role.guild,
+        'role',
+        '🎭 Role Created',
+        `تم إنشاء الرتبة ${role}.\n` +
+        `المسبب: ${executor}`
+    );
+
+    // حماية الرتب
     try {
 
-        // جلب الإعدادات والمسبب بالتوازي (بدل انتظار السجل أولاً)
-        const [settings, executorId] = await Promise.all([
-            getSettings(role.guild.id),
-            getAuditExecutor(
-                role.guild,
-                AuditLogEvent.RoleCreate,
-                role.id,
-                3
-            )
-        ]);
-
-        // السجل يرسل بالخلفية ولا يحجب الحماية
-        sendLog(
-            role.guild,
-            'role',
-            '🎭 Role Created',
-            `تم إنشاء الرتبة ${role}.\n` +
-            `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
-        );
-
-        // حماية الرتب
+        const settings = await getSettings(role.guild.id);
         ensureProtections(settings);
         const prot = settings.protections.roles;
 
-        if (prot.enabled && executorId) {
+        if (prot.enabled) {
 
-            const now = Date.now();
-            const key = `${role.guild.id}-${executorId}`;
+            const executorId = await getAuditExecutor(
+                role.guild,
+                AuditLogEvent.RoleCreate,
+                role.id
+            );
 
-            if (isLimitExceeded(
-                protectionCounts.roles,
-                key,
-                now,
-                prot.limit,
-                prot.timeframe
-            )) {
+            if (executorId) {
 
-                const member = await getMember(role.guild, executorId);
+                const now = Date.now();
+                const key = `${role.guild.id}-${executorId}`;
 
-                await applyPunishment(
-                    member,
-                    prot.action,
-                    `تجاوز حد إنشاء الرتب (${prot.limit})`
-                );
+                if (isLimitExceeded(
+                    protectionCounts.roles,
+                    key,
+                    now,
+                    prot.limit,
+                    prot.timeframe
+                )) {
 
-                await role.delete('[Anti-Nuke] تجاوز حد إنشاء الرتب').catch(() => {});
+                    const member = await getMember(role.guild, executorId);
 
-                sendLog(
-                    role.guild,
-                    'moderation',
-                    '🛡️ Role Protection',
-                    `<@${executorId}> تجاوز حد إنشاء الرتب (**${prot.limit}**).\n` +
-                    `طبقت العقوبة: **${prot.action}**`
-                );
+                    await applyPunishment(
+                        member,
+                        prot.action,
+                        `تجاوز حد إنشاء الرتب (${prot.limit})`
+                    );
+
+                    await role.delete('[Anti-Nuke] تجاوز حد إنشاء الرتب').catch(() => {});
+
+                    await sendLog(
+                        role.guild,
+                        'moderation',
+                        '🛡️ Role Protection',
+                        `<@${executorId}> تجاوز حد إنشاء الرتب (**${prot.limit}**).\n` +
+                        `طبقت العقوبة: **${prot.action}**`
+                    );
+                }
             }
         }
     } catch (error) {
@@ -5518,6 +4666,73 @@ client.on('roleUpdate', async (oldRole, newRole) => {
         changes.join('\n') +
         `\nالمسبب: ${executor}`
     );
+
+    // حماية تعديل اسم الرتبة
+    if (oldRole.name !== newRole.name) {
+        try {
+
+            const settings = await getSettings(newRole.guild.id);
+            ensureProtections(settings);
+            const prot = settings.protections.roles;
+
+            if (prot.enabled) {
+
+                const executorId = await getAuditExecutor(
+                    newRole.guild,
+                    AuditLogEvent.RoleUpdate,
+                    newRole.id
+                );
+
+                if (executorId && executorId !== client.user.id) {
+
+                    const member =
+                        await getMember(newRole.guild, executorId);
+
+                    const check =
+                        protectionAllowed(newRole.guild, member, settings);
+
+                    if (!check.allowed) {
+
+                        // إرجاع الاسم الأصلي
+                        await newRole.setName(
+                            oldRole.name,
+                            '[Anti-Nuke] استرجاع اسم الرتبة'
+                        ).catch(() => {});
+
+                        const now = Date.now();
+                        const key = `${newRole.guild.id}-${executorId}`;
+
+                        if (isLimitExceeded(
+                            protectionCounts.roles,
+                            key,
+                            now,
+                            prot.limit,
+                            prot.timeframe
+                        )) {
+
+                            if (check.level === 'below') {
+                                await applyPunishment(
+                                    member,
+                                    prot.action,
+                                    `تعديل اسم رتبة (${prot.limit})`
+                                );
+                            }
+
+                            await sendLog(
+                                newRole.guild,
+                                'moderation',
+                                '🛡️ Role Name Protection',
+                                `<@${executorId}> حاول تعديل اسم الرتبة **${oldRole.name}**.\n` +
+                                `تم إرجاع الاسم${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+                            );
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('Role name protection error:', error);
+        }
+    }
 });
 
 
@@ -5529,64 +4744,64 @@ client.on('channelCreate', async channel => {
 
     if (!channel.guild) return;
 
+    const executor = await executorMention(
+        channel.guild,
+        AuditLogEvent.ChannelCreate,
+        channel.id
+    );
+
+    await sendLog(
+        channel.guild,
+        'channel',
+        '📁 Channel Created',
+        `تم إنشاء ${channel}.\n` +
+        `المسبب: ${executor}`
+    );
+
+    // حماية الرومات
     try {
 
-        // جلب الإعدادات والمسبب بالتوازي (بدل انتظار السجل أولاً)
-        const [settings, executorId] = await Promise.all([
-            getSettings(channel.guild.id),
-            getAuditExecutor(
-                channel.guild,
-                AuditLogEvent.ChannelCreate,
-                channel.id,
-                3
-            )
-        ]);
-
-        // السجل يرسل بالخلفية ولا يحجب الحماية
-        sendLog(
-            channel.guild,
-            'channel',
-            '📁 Channel Created',
-            `تم إنشاء ${channel}.\n` +
-            `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
-        );
-
-        // حماية الرومات
+        const settings = await getSettings(channel.guild.id);
         ensureProtections(settings);
         const prot = settings.protections.channels;
 
-        if (prot.enabled && executorId) {
+        if (prot.enabled && channel.guild) {
 
-            const now = Date.now();
-            const key = `${channel.guild.id}-${executorId}`;
+            const executorId = await getAuditExecutor(
+                channel.guild,
+                AuditLogEvent.ChannelCreate,
+                channel.id
+            );
 
-            if (isLimitExceeded(
-                protectionCounts.channels,
-                key,
-                now,
-                prot.limit,
-                prot.timeframe
-            )) {
+            if (executorId) {
 
-                const member = await getMember(channel.guild, executorId);
+                const now = Date.now();
+                const key = `${channel.guild.id}-${executorId}`;
 
-                await applyPunishment(
-                    member,
-                    prot.action,
-                    `تجاوز حد إنشاء الرومات (${prot.limit})`
-                );
+                if (isLimitExceeded(
+                    protectionCounts.channels,
+                    key,
+                    now,
+                    prot.limit,
+                    prot.timeframe
+                )) {
 
-                await channel.delete(
-                    '[Anti-Nuke] تجاوز حد إنشاء الرومات'
-                ).catch(() => {});
+                    const member = await getMember(channel.guild, executorId);
 
-                sendLog(
-                    channel.guild,
-                    'moderation',
-                    '🛡️ Channel Protection',
-                    `<@${executorId}> تجاوز حد إنشاء الرومات (**${prot.limit}**).\n` +
-                    `طبقت العقوبة: **${prot.action}**`
-                );
+                    await applyPunishment(
+                        member,
+                        prot.action,
+                        `تجاوز حد إنشاء الرومات (${prot.limit})`
+                    );
+
+                    await sendLog(
+                        channel.guild,
+                        'moderation',
+                        '🛡️ Channel Protection',
+                        `<@${executorId}> تجاوز حد إنشاء الرومات (**${prot.limit}**).\n` +
+                        `طبقت العقوبة: **${prot.action}**`
+                    );
+                }
             }
         }
     } catch (error) {
@@ -5652,6 +4867,73 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
         changes.join('\n') +
         `\nالمسبب: ${executor}`
     );
+
+    // حماية تعديل اسم الروم
+    if (oldChannel.name !== newChannel.name) {
+        try {
+
+            const settings = await getSettings(newChannel.guild.id);
+            ensureProtections(settings);
+            const prot = settings.protections.channels;
+
+            if (prot.enabled) {
+
+                const executorId = await getAuditExecutor(
+                    newChannel.guild,
+                    AuditLogEvent.ChannelUpdate,
+                    newChannel.id
+                );
+
+                if (executorId && executorId !== client.user.id) {
+
+                    const member =
+                        await getMember(newChannel.guild, executorId);
+
+                    const check =
+                        protectionAllowed(newChannel.guild, member, settings);
+
+                    if (!check.allowed) {
+
+                        // إرجاع الاسم الأصلي
+                        await newChannel.setName(
+                            oldChannel.name,
+                            '[Anti-Nuke] استرجاع اسم الروم'
+                        ).catch(() => {});
+
+                        const now = Date.now();
+                        const key = `${newChannel.guild.id}-${executorId}`;
+
+                        if (isLimitExceeded(
+                            protectionCounts.channels,
+                            key,
+                            now,
+                            prot.limit,
+                            prot.timeframe
+                        )) {
+
+                            if (check.level === 'below') {
+                                await applyPunishment(
+                                    member,
+                                    prot.action,
+                                    `تعديل اسم روم (${prot.limit})`
+                                );
+                            }
+
+                            await sendLog(
+                                newChannel.guild,
+                                'moderation',
+                                '🛡️ Channel Name Protection',
+                                `<@${executorId}> حاول تعديل اسم الروم **${oldChannel.name}**.\n` +
+                                `تم إرجاع الاسم${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+                            );
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('Channel name protection error:', error);
+        }
+    }
 });
 
 
@@ -5725,70 +5007,64 @@ client.on(
 
 client.on('guildBanAdd', async ban => {
 
+    const executor = await executorMention(
+        ban.guild,
+        AuditLogEvent.MemberBanAdd,
+        ban.user?.id
+    );
+
+    await sendLog(
+        ban.guild,
+        'moderation',
+        '🔨 Member Banned',
+        `العضو **${ban.user?.tag || 'غير معروف'}** حُظر.\n` +
+        `السبب: ${ban.reason || 'بدون سبب'}\n` +
+        `المسبب: ${executor}`
+    );
+
     try {
 
-        // جلب الإعدادات والمسبب بالتوازي (بدل انتظار السجل أولاً)
-        const [settings, executorId] = await Promise.all([
-            getSettings(ban.guild.id),
-            getAuditExecutor(
-                ban.guild,
-                AuditLogEvent.MemberBanAdd,
-                ban.user?.id,
-                3
-            )
-        ]);
-
-        // السجل يرسل بالخلفية ولا يحجب الحماية
-        sendLog(
-            ban.guild,
-            'moderation',
-            '🔨 Member Banned',
-            `العضو **${ban.user?.tag || 'غير معروف'}** حُظر.\n` +
-            `السبب: ${ban.reason || 'بدون سبب'}\n` +
-            `المسبب: ${executorId ? `<@${executorId}>` : 'غير معروف'}`
-        );
-
+        const settings = await getSettings(ban.guild.id);
         ensureProtections(settings);
         const prot = settings.protections.bans;
 
-        if (prot.enabled && executorId) {
+        if (prot.enabled) {
 
-            const now = Date.now();
-            const key = `${ban.guild.id}-${executorId}`;
+            const executorId = await getAuditExecutor(
+                ban.guild,
+                AuditLogEvent.MemberBanAdd,
+                ban.user?.id
+            );
 
-            if (isLimitExceeded(
-                protectionCounts.bans,
-                key,
-                now,
-                prot.limit,
-                prot.timeframe
-            )) {
+            if (executorId) {
 
-                const member = await getMember(ban.guild, executorId);
+                const now = Date.now();
+                const key = `${ban.guild.id}-${executorId}`;
 
-                await applyPunishment(
-                    member,
-                    prot.action,
-                    `تجاوز حد الباند (${prot.limit})`
-                );
-
-                // إلغاء الحظر الذي تم قبل العقوبة مباشرة
-                if (ban.guild.members.me?.permissions.has(
-                    'BanMembers'
+                if (isLimitExceeded(
+                    protectionCounts.bans,
+                    key,
+                    now,
+                    prot.limit,
+                    prot.timeframe
                 )) {
-                    await ban.guild.members.unban(
-                        ban.user?.id,
-                        '[Anti-Nuke] تجاوز حد عمليات الحظر'
-                    ).catch(() => {});
-                }
 
-                sendLog(
-                    ban.guild,
-                    'moderation',
-                    '🛡️ Ban Protection',
-                    `<@${executorId}> تجاوز حد عمليات الحظر (**${prot.limit}**).\n` +
-                    `طبقت العقوبة: **${prot.action}**`
-                );
+                    const member = await getMember(ban.guild, executorId);
+
+                    await applyPunishment(
+                        member,
+                        prot.action,
+                        `تجاوز حد الباند (${prot.limit})`
+                    );
+
+                    await sendLog(
+                        ban.guild,
+                        'moderation',
+                        '🛡️ Ban Protection',
+                        `<@${executorId}> تجاوز حد عمليات الحظر (**${prot.limit}**).\n` +
+                        `طبقت العقوبة: **${prot.action}**`
+                    );
+                }
             }
         }
     } catch (error) {
@@ -5810,18 +5086,6 @@ client.on('messageCreate', async message => {
 
         const settings =
             await getSettings(message.guild.id);
-
-        // ==============================================
-        // AI CHANNEL (روم الذكاء: يرد عن البوت فقط)
-        // ==============================================
-
-        if (
-            settings.aiChannel &&
-            message.channel.id === settings.aiChannel
-        ) {
-            await handleAIChannelMessage(message);
-            return;
-        }
 
         // ==============================================
         // SPAM PROTECTION (رسائل سريعة / خطوط كبيرة)
@@ -5901,8 +5165,7 @@ client.on('messageCreate', async message => {
                     .slice(
                         usedShortcut.shortcut.name.length
                     )
-                    .trim(),
-                usedShortcut.shortcut
+                    .trim()
             );
 
             return;
@@ -6036,36 +5299,13 @@ client.on('messageCreate', async message => {
 async function executeShortcut(
     message,
     command,
-    rawArgs,
-    shortcut
+    rawArgs
 ) {
 
-    // فحص الصلاحية: رتبة مخصصة للاختصار إن وُجدت، وإلا الرتبة الافتراضية
-    const perm = await shortcutPermission(
-        message.member,
-        message.guild,
-        shortcut,
-        command
-    );
-
-    if (!perm.ok) {
-        if (perm.roleMissing) {
-            return message.reply(
-                `❌ الرتبة المخصصة لاختصار **${shortcut?.name || ''}** غير موجودة في السيرفر.`
-            );
-        }
-
-        if (perm.role) {
-            return message.reply(
-                `❌ تحتاج رتبة **${perm.role.name}** لاستخدام هذا الاختصار.`
-            );
-        }
-
-        if (command !== 'warnings') {
-            return message.reply(
-                `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** لاستخدام الاختصارات.`
-            );
-        }
+    if (!memberHasStaffRole(message.member, message.guild)) {
+        return message.reply(
+            `❌ تحتاج رتبة **${STAFF_ROLE_NAME}** (فوق رتبة البوت) لاستخدام الاختصارات.`
+        );
     }
 
 
@@ -6271,158 +5511,6 @@ async function executeShortcut(
         return message.reply(
             `⏱️ تم إعطاء ${mention} تايم أوت ${duration}.`
         );
-    }
-
-
-    // ==============================================
-    // WARN (تحذير)
-    // ==============================================
-
-    if (command === 'warn') {
-
-        if (!mention) {
-            return message.reply(
-                '❌ استخدم الاختصار مع منشن العضو.'
-            );
-        }
-
-        // أول كلمة = المنشن، الباقي = السبب + (اختياري) المدة
-        const restTokens = args.slice(1);
-
-        if (!restTokens.length) {
-            return message.reply(
-                '❌ اكتب سبب التحذير بعد المنشن.'
-            );
-        }
-
-        let duration = null;
-        let reasonTokens = restTokens;
-
-        // لو آخِر كلمة على شكل مدة (7d / 10m / 2026/6/6) نعتبرها المدة
-        const lastToken =
-            restTokens[restTokens.length - 1];
-
-        const lastParsed =
-            parseWarningDuration(lastToken);
-
-        if (lastParsed && restTokens.length > 1) {
-            duration = lastParsed;
-            reasonTokens = restTokens.slice(0, -1);
-        }
-
-        const reason = reasonTokens.join(' ').trim();
-
-        if (!reason) {
-            return message.reply(
-                '❌ اكتب سبب التحذير بعد المنشن.'
-            );
-        }
-
-        const warn = await addWarning({
-            guildId: message.guild.id,
-            userId: mention.id,
-            moderatorId: message.author.id,
-            reason,
-            duration
-        });
-
-        sendLog(
-            message.guild,
-            'moderation',
-            '⚠️ Warning',
-            `⛔ تم تحذير ${mention}.\n` +
-            `رقم التحذير: **#${warn.number}**\n` +
-            `السبب: **${reason}**\n` +
-            `بواسطة: ${message.author}\n` +
-            `انتهاء التحذير: **${warn.expiresAt ? formatWarnDate(warn.expiresAt) : 'بدون مدة'}**`,
-            0xED4245
-        );
-
-        return message.reply(
-            `⛔ تم تحذير ${mention} (رقم **#${warn.number}**).\n` +
-            `السبب: **${reason}**`
-        );
-    }
-
-
-    // ==============================================
-    // UNWARN (إزالة تحذير)
-    // ==============================================
-
-    if (command === 'unwarn') {
-
-        if (!mention) {
-            return message.reply(
-                '❌ استخدم الاختصار مع منشن العضو.'
-            );
-        }
-
-        const number = parseInt(args[1], 10);
-
-        if (isNaN(number) || number < 1) {
-            return message.reply(
-                '❌ اكتب رقم التحذير. مثال: `unwarn @فلان 3`'
-            );
-        }
-
-        const removed = await removeWarning(
-            message.guild.id,
-            mention.id,
-            number
-        );
-
-        if (!removed) {
-            return message.reply(
-                `❌ لا يوجد تحذير رقم **#${number}** للعضو ${mention}.`
-            );
-        }
-
-        const remaining = await getWarnings(
-            message.guild.id,
-            mention.id
-        );
-
-        return message.reply(
-            `✅ تم إزالة التحذير **#${number}** عن ${mention}.\n` +
-            `التحذيرات المتبقية: **${remaining.length}**`
-        );
-    }
-
-
-    // ==============================================
-    // WARNINGS (عرض التحذيرات)
-    // ==============================================
-
-    if (command === 'warnings') {
-
-        const target = mention || message.member;
-
-        // عرض تحذيرات شخص آخر يتطلب نفس صلاحية الاختصار
-        if (
-            mention &&
-            mention.id !== message.author.id &&
-            !perm.ok
-        ) {
-            return message.reply(
-                '❌ تحتاج رتبة **' + STAFF_ROLE_NAME +
-                '** لعرض تحذيرات شخص آخر.'
-            );
-        }
-
-        const warnings = await getWarnings(
-            message.guild.id,
-            target.id
-        );
-
-        return message.reply({
-            embeds: [
-                buildWarningsEmbed(
-                    target,
-                    warnings,
-                    target.id === message.author.id
-                )
-            ]
-        });
     }
 
 
