@@ -937,18 +937,40 @@ async function getFloodExecutor(guild, type, maxEntries = 25, windowMs = 120000)
 async function resolveAbuseExecutor(guild, auditType, targetId) {
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            const audit = await guild.fetchAuditLogs({ type: auditType, limit: 5 });
+            const audit = await guild.fetchAuditLogs({ type: auditType, limit: 25 });
             const now = Date.now();
 
-            const entry = audit.entries.find(
+            // 1) أولاً: entry مطابق للهدف خلال 30 ثانية
+            const byTarget = audit.entries.find(
                 e => e.targetId === targetId &&
                      e.executor?.id &&
                      e.executor.id !== client.user.id &&
                      now - e.createdTimestamp <= 30000
             );
 
-            if (entry?.executor?.id) return entry.executor.id;
-        } catch {}
+            if (byTarget?.executor?.id) return byTarget.executor.id;
+
+            // 2) ثم: أحدث منفذ غير البوت خلال دقيقتين (ينجح مع الحذف الجماعي)
+            const anyExecutor = audit.entries.find(
+                e => e.executor?.id &&
+                     e.executor.id !== client.user.id &&
+                     now - e.createdTimestamp <= 120000
+            );
+
+            if (anyExecutor?.executor?.id) return anyExecutor.executor.id;
+
+            if (attempt === 1) {
+                console.log(
+                    `[PROTECT] resolveAbuseExecutor: لا منفذ مطابق في أول جلب ` +
+                    `(type=${auditType} entries=${audit.entries.size})`
+                );
+            }
+        } catch (error) {
+            console.error(
+                `[PROTECT] resolveAbuseExecutor ERROR ` +
+                `(type=${auditType} guild=${guild.id}):`, error.message
+            );
+        }
 
         if (attempt < 3) {
             await new Promise(r => setTimeout(r, 1000 * attempt));
@@ -956,7 +978,7 @@ async function resolveAbuseExecutor(guild, auditType, targetId) {
     }
 
     // ما لقينا من ينطبق على التارجت — نرجع لأحدث منفذ نشط غير البوت
-    return getFloodExecutor(guild, auditType, 10, 120000);
+    return getFloodExecutor(guild, auditType, 25, 120000);
 }
 
 function isLimitExceeded(counter, key, now, limit, timeframe) {
@@ -6310,6 +6332,21 @@ client.on('roleDelete', async role => {
         if (prot && prot.enabled) {
 
             const limit = prot.limit || 5;
+
+            const executorId = await resolveAbuseExecutor(
+                guild,
+                AuditLogEvent.RoleDelete,
+                role.id
+            );
+
+            // حذف البوت لنفسه (تنظيف إبداعات/استرجاع) لا يتم عده ولا معاقبته
+            if (!executorId || executorId === client.user.id) {
+                console.log(
+                    `[PROTECT] roleDelete ${guild.id} | سببه البوت نفسه أو غير مشخص — تم التجاهل لتجنب الفيضان الكاذب`
+                );
+                return;
+            }
+
             let floodLocked = false;
 
             try {
@@ -6321,13 +6358,7 @@ client.on('roleDelete', async role => {
             } catch {}
 
             console.log(
-                `[PROTECT] roleDelete ${guild.id} | flood=${floodLocked} | limit=${limit}`
-            );
-
-            const executorId = await resolveAbuseExecutor(
-                guild,
-                AuditLogEvent.RoleDelete,
-                role.id
+                `[PROTECT] roleDelete ${guild.id} | executor=${executorId} | flood=${floodLocked} | limit=${limit}`
             );
 
             if (executorId && executorId !== client.user.id) {
@@ -6739,6 +6770,21 @@ client.on('channelDelete', async channel => {
         if (prot && prot.enabled) {
 
             const limit = prot.limit || 5;
+
+            const executorId = await resolveAbuseExecutor(
+                guild,
+                AuditLogEvent.ChannelDelete,
+                channel.id
+            );
+
+            // حذف البوت لنفسه (تنظيف إبداعات/استرجاع) لا يتم عده ولا معاقبته
+            if (!executorId || executorId === client.user.id) {
+                console.log(
+                    `[PROTECT] channelDelete ${guild.id} | سببه البوت نفسه أو غير مشخص — تم التجاهل لتجنب الفيضان الكاذب`
+                );
+                return;
+            }
+
             let floodLocked = false;
 
             try {
@@ -6750,21 +6796,15 @@ client.on('channelDelete', async channel => {
             } catch {}
 
             console.log(
-                `[PROTECT] channelDelete ${guild.id} | flood=${floodLocked} | limit=${limit}`
+                `[PROTECT] channelDelete ${guild.id} | executor=${executorId} | flood=${floodLocked} | limit=${limit}`
             );
 
             // بدون استرجاع تلقائي — الاسترجاع يدوياً عبر سلاش /restore
             if (floodLocked) {
                 console.log(
-                    `[PROTECT] فيضان حذف رومات ${guild.id} — سيتم عقاب المسبب فوراً`
+                    `[PROTECT] فيضان حذف رومات ${guild.id} — سيتم عقاب المسبب <@${executorId}> فوراً`
                 );
             }
-
-            const executorId = await resolveAbuseExecutor(
-                guild,
-                AuditLogEvent.ChannelDelete,
-                channel.id
-            );
 
             if (executorId && executorId !== client.user.id) {
 
@@ -6815,7 +6855,7 @@ client.on('channelDelete', async channel => {
                                 `للفيضان/حذف رومات (${guild.id}) — نجحت=${punished}`
                             );
 
-                            if (!punished && member?.id === guild.ownerId) {
+                            if (!punished && executorId === guild.ownerId) {
                                 console.warn(
                                     `[PROTECT] ${executorId} هو مالك السيرفر — ` +
                                     `الديسكورد يمنع بند المالك، لاحظ أن الحماية لا تشمل مالك السيرفر`
@@ -7217,7 +7257,9 @@ client.on('messageCreate', async message => {
         ) {
 
             const shortcutName =
-                normalizeText(shortcut.name);
+                normalizeText(shortcut?.name || '');
+
+            if (!shortcutName) continue;
 
             if (
                 normalizedMessage ===
