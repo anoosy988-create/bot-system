@@ -1141,7 +1141,13 @@ async function punishFor(guild, member, executorId, action, reason) {
 // فحص صلاحية التجاوز عن الحماية (وايت ليست / مالك البوت / فوق رتبة البوت)
 async function protectionAllowed(guild, member, settings) {
     // عضو غير معروف = مش مخوّل (نحمي ولا نثق بالمجانين)
-    if (!member) return { allowed: false, level: 'unknown' };
+    if (!member) {
+        console.log(
+            `[PROTECT] protectionAllowed: member=null → unknown ` +
+            `(guild=${guild?.id})`
+        );
+        return { allowed: false, level: 'unknown' };
+    }
 
     if (member.id === OWNER_ID) {
         return { allowed: true, level: 'owner' };
@@ -1162,6 +1168,12 @@ async function protectionAllowed(guild, member, settings) {
     }
 
     const pos = member.roles.highest?.position ?? -1;
+
+    console.log(
+        `[PROTECT] protectionAllowed: user=${member.id} ` +
+        `pos=${pos} botHighest=${botHighest.position} ` +
+        `isOwner=${member.id === guild?.ownerId}`
+    );
 
     if (pos > botHighest.position) {
         return { allowed: true, level: 'above' };
@@ -1712,10 +1724,10 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
 
         if (executorId === client.user.id) return;
 
-        const member = await getMember(guild, executorId);
-        const check = protectionAllowed(guild, member, {
-            whitelist: cached?.whitelist || []
-        });
+const member = await getMember(guild, executorId);
+                const check = await protectionAllowed(guild, member, {
+                    whitelist: cached?.whitelist || []
+                });
 
         if (check.allowed) return;
 
@@ -1748,7 +1760,7 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
             // تجاوز الحد: عقوبة (لو تحت) + حذف كل الويب هوك
             const exceededDeletedCount = await deleteAllWebhooks(guild);
 
-            if (check.level === 'below') {
+            if (check.allowed === false) {
                 await applyPunishment(
                     member,
                     prot.action || 'ban',
@@ -1763,8 +1775,8 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
                 'moderation',
                 '🛡️ Webhook Protection',
                 `<@${executorId}> تجاوز حد إنشاء الويب هوك (**${limit}**).\n` +
-                `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                `تم حذف **${exceededDeletedCount}** ويب هوك${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+                `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : check.level === 'above' ? 'أعلى من رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                `تم حذف **${exceededDeletedCount}** ويب هوك${check.allowed === false ? `\nالعقوبة: **${prot.action}**` : ''}`
             );
 
             return;
@@ -1775,7 +1787,7 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
         // ==========================================
         const deletedCount = await deleteAllWebhooks(guild);
 
-        if (check.level === 'below') {
+        if (check.allowed === false) {
             await applyPunishment(
                 member,
                 prot.action || 'ban',
@@ -1788,8 +1800,8 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
             'moderation',
             '🛡️ Webhook Protection',
             `<@${executorId}> سوى ${label} ويب هوك بدون إذن.\n` +
-            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-            `تم حذف **${deletedCount}** ويب هوك${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : check.level === 'above' ? 'أعلى من رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+            `تم حذف **${deletedCount}** ويب هوك${check.allowed === false ? `\nالعقوبة: **${prot.action}**` : ''}`
         );
     } catch (error) {
         console.error('Webhook protection error:', error);
@@ -5915,7 +5927,7 @@ client.on('inviteDelete', async invite => {
         if (!executorId || executorId === client.user.id) return;
 
         const member = await getMember(guild, executorId);
-        const check = protectionAllowed(guild, member, settings);
+        const check = await protectionAllowed(guild, member, settings);
 
         // مسموح (وايت ليست / فوق رتبة البوت / المالك): سجل فقط
         if (check.allowed) {
@@ -5933,7 +5945,7 @@ client.on('inviteDelete', async invite => {
         // غير مسموح
         // ==============================
 
-        const isBelow = check.level === 'below';
+        const isBelow = check.allowed === false;
         let punished = false;
 
         if (isBelow) {
@@ -6197,7 +6209,7 @@ client.on('roleCreate', async role => {
                 );
 
                 const member = await getMember(guild, executorId);
-                const check = protectionAllowed(guild, member, {
+                const check = await protectionAllowed(guild, member, {
                     whitelist: cached?.whitelist || []
                 });
 
@@ -6228,8 +6240,7 @@ client.on('roleCreate', async role => {
                         );
 
                         if (
-                            check.level === 'below' ||
-                            check.level === 'unknown'
+                            check.allowed === false
                         ) {
                             const punishedNow = await punishFor(
                                 guild,
@@ -6262,11 +6273,11 @@ client.on('roleCreate', async role => {
                         `تجاوز حد إنشاء الرتب (**${limit}**)`}.\n` +
                     (floodLocked
                         ? 'تم حذف الرتب المنشأة فورياً.'
-                        : `تم حذف الرتب.${check.level === 'below' || check.level === 'unknown' ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
+                        : `تم حذف الرتب.${!check.allowed ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
                     (punished
                         ? `\n✅ تم تطبيق العقوبة على ${executorId}.`
-                        : check.level !== 'below' && !check.allowed
-                            ? `\n(مصدر النازح فوق/بنفس رتبة البوت — لا يمكن العقوبة عليه)`
+                        : check.allowed === false
+                            ? `\n(تمت محاولة العقوبة — تأكد من صلاحية البوت)`
                             : '')
                 );
             } else if (floodLocked) {
@@ -6364,7 +6375,7 @@ client.on('roleDelete', async role => {
             if (executorId && executorId !== client.user.id) {
 
                 const member = await getMember(guild, executorId);
-                const check = protectionAllowed(guild, member, {
+                const check = await protectionAllowed(guild, member, {
                     whitelist: cached?.whitelist || []
                 });
 
@@ -6393,8 +6404,7 @@ client.on('roleDelete', async role => {
                         let punished = false;
 
                         if (
-                            check.level === 'below' ||
-                            check.level === 'unknown'
+                            check.allowed === false
                         ) {
                             punished = await punishFor(
                                 guild,
@@ -6423,8 +6433,8 @@ client.on('roleDelete', async role => {
                             `<@${executorId}> ${floodLocked ?
                                 'يعمل فيضان حذف رتب' :
                                 'حذف رتب بدون إذن'}.\n` +
-                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                            (check.level === 'below' || check.level === 'unknown'
+                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : check.level === 'above' ? 'أعلى من رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                            (check.allowed === false
                                 ? punished
                                     ? `✅ العقوبة: **${prot.action || 'ban'}** تم تنفيذها`
                                     : `❌ العقوبة: **${prot.action || 'ban'}** فشلت — ` +
@@ -6519,7 +6529,7 @@ client.on('roleUpdate', async (oldRole, newRole) => {
                         await getMember(newRole.guild, executorId);
 
                     const check =
-                        protectionAllowed(newRole.guild, member, settings);
+                        await protectionAllowed(newRole.guild, member, settings);
 
                     if (!check.allowed) {
 
@@ -6537,7 +6547,7 @@ client.on('roleUpdate', async (oldRole, newRole) => {
                             prot.limit
                         )) {
 
-                            if (check.level === 'below') {
+                            if (check.allowed === false) {
                                 await applyPunishment(
                                     member,
                                     prot.action,
@@ -6552,7 +6562,7 @@ client.on('roleUpdate', async (oldRole, newRole) => {
                                 'moderation',
                                 '🛡️ Role Name Protection',
                                 `<@${executorId}> حاول تعديل اسم الرتبة **${oldRole.name}**.\n` +
-                                `تم إرجاع الاسم${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+                                `تم إرجاع الاسم${check.allowed === false ? `\nالعقوبة: **${prot.action}**` : ''}`
                             );
                         }
                     }
@@ -6634,7 +6644,7 @@ client.on('channelCreate', async channel => {
                 );
 
                 const member = await getMember(guild, executorId);
-                const check = protectionAllowed(guild, member, {
+                const check = await protectionAllowed(guild, member, {
                     whitelist: cached?.whitelist || []
                 });
 
@@ -6665,8 +6675,7 @@ client.on('channelCreate', async channel => {
                         );
 
                         if (
-                            check.level === 'below' ||
-                            check.level === 'unknown'
+                            check.allowed === false
                         ) {
                             const punishedNow = await punishFor(
                                 guild,
@@ -6698,11 +6707,11 @@ client.on('channelCreate', async channel => {
                         `تجاوز حد إنشاء الرومات (**${limit}**)`}.\n` +
                     (floodLocked
                         ? 'تم حذف الروم المنشأ فورياً.'
-                        : `تم حذف الروم.${check.level === 'below' || check.level === 'unknown' ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
+                        : `تم حذف الروم.${!check.allowed ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`) +
                     (punished
                         ? `\n✅ تم تطبيق العقوبة على ${executorId}.`
-                        : check.level !== 'below' && !check.allowed
-                            ? `\n(مصدر النازح فوق/بنفس رتبة البوت — لا يمكن العقوبة عليه)`
+                        : check.allowed === false
+                            ? `\n(تمت محاولة العقوبة — تأكد من صلاحية البوت فوق المخرب)`
                             : '')
                 );
             } else if (floodLocked) {
@@ -6809,7 +6818,7 @@ client.on('channelDelete', async channel => {
             if (executorId && executorId !== client.user.id) {
 
                 const member = await getMember(guild, executorId);
-                const check = protectionAllowed(guild, member, {
+                const check = await protectionAllowed(guild, member, {
                     whitelist: cached?.whitelist || []
                 });
 
@@ -6838,8 +6847,7 @@ client.on('channelDelete', async channel => {
                         let punished = false;
 
                         if (
-                            check.level === 'below' ||
-                            check.level === 'unknown'
+                            check.allowed === false
                         ) {
                             punished = await punishFor(
                                 guild,
@@ -6875,8 +6883,8 @@ client.on('channelDelete', async channel => {
                             `<@${executorId}> ${floodLocked ?
                                 'يعمل فيضان حذف رومات' :
                                 'حذف رومات بدون إذن'}.\n` +
-                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                            (check.level === 'below' || check.level === 'unknown'
+                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : check.level === 'above' ? 'أعلى من رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                            (check.allowed === false
                                 ? punished
                                     ? `✅ العقوبة: **${prot.action || 'ban'}** تم تنفيذها`
                                     : `❌ العقوبة: **${prot.action || 'ban'}** فشلت — ` +
@@ -6976,7 +6984,7 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
                         await getMember(newChannel.guild, executorId);
 
                     const check =
-                        protectionAllowed(newChannel.guild, member, settings);
+                        await protectionAllowed(newChannel.guild, member, settings);
 
                     if (!check.allowed) {
 
@@ -6994,7 +7002,7 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
                             prot.limit
                         )) {
 
-                            if (check.level === 'below') {
+                            if (check.allowed === false) {
                                 await applyPunishment(
                                     member,
                                     prot.action,
@@ -7007,7 +7015,7 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
                                 'moderation',
                                 '🛡️ Channel Name Protection',
                                 `<@${executorId}> حاول تعديل اسم الروم **${oldChannel.name}**.\n` +
-                                `تم إرجاع الاسم${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+                                `تم إرجاع الاسم${check.allowed === false ? `\nالعقوبة: **${prot.action}**` : ''}`
                             );
                         }
                     }
@@ -7122,7 +7130,7 @@ client.on('guildBanAdd', async ban => {
             if (executorId && executorId !== client.user.id) {
 
                 const member = await getMember(ban.guild, executorId);
-                const check = protectionAllowed(ban.guild, member, settings);
+                const check = await protectionAllowed(ban.guild, member, settings);
 
                 if (!check.allowed) {
 
@@ -7134,7 +7142,7 @@ client.on('guildBanAdd', async ban => {
                         prot.limit
                     )) {
 
-                        if (check.level === 'below') {
+                        if (check.allowed === false) {
                             await applyPunishment(
                                 member,
                                 prot.action,
@@ -7149,8 +7157,8 @@ client.on('guildBanAdd', async ban => {
                             'moderation',
                             '🛡️ Ban Protection',
                             `<@${executorId}> تجاوز حد عمليات الحظر (**${prot.limit}**).\n` +
-                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                            (check.level === 'below' ? `العقوبة: **${prot.action}**` : '')
+                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : check.level === 'above' ? 'أعلى من رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                            (check.allowed === false ? `العقوبة: **${prot.action}**` : '')
                         );
                     }
                 }
