@@ -12,6 +12,7 @@ const {
     TextInputStyle,
     ChannelType,
     AttachmentBuilder,
+    StickerFormatType,
     AuditLogEvent
 } = require('discord.js');
 
@@ -496,6 +497,18 @@ const backupSchema = new mongoose.Schema({
     roles: {
         type: mongoose.Schema.Types.Mixed,
         default: []
+    },
+    emojis: {
+        type: mongoose.Schema.Types.Mixed,
+        default: []
+    },
+    stickers: {
+        type: mongoose.Schema.Types.Mixed,
+        default: []
+    },
+    protections: {
+        type: mongoose.Schema.Types.Mixed,
+        default: {}
     }
 });
 
@@ -1074,6 +1087,53 @@ async function getMember(guild, userId) {
     return guild.members.fetch(userId).catch(() => null);
 }
 
+// تحميل صورة/ملف من رابط (CDN) لاستخدامه في استرجاع الإيموجي/الستيكرات
+async function downloadBuffer(url) {
+    // يعمل مع Node 16+ (بلا fetch مدمج): يستخدم https القياسي
+    if (typeof fetch === 'undefined') {
+        return await downloadWithHttps(url);
+    }
+
+    try {
+        const res = await fetch(url);
+
+        if (!res.ok) return null;
+
+        const buf = Buffer.from(await res.arrayBuffer());
+
+        if (!buf || !buf.length) return null;
+
+        return buf;
+    } catch (error) {
+        console.error(`[BACKUP] فشل تحميل ${url}:`, error.message);
+        return null;
+    }
+}
+
+// fallback للنسخ القديمة من Node دون fetch مدمج
+async function downloadWithHttps(url) {
+    const { get } = require('https');
+
+    return new Promise(resolve => {
+        get(url, res => {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                res.resume();
+                return resolve(null);
+            }
+
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const buf = Buffer.concat(chunks);
+                resolve(buf.length ? buf : null);
+            });
+        }).on('error', error => {
+            console.error(`[BACKUP] فشل تحميل ${url}:`, error.message);
+            resolve(null);
+        });
+    });
+}
+
 // عقوبة قوية للمسبب المحدد: الباند يتم حتى لو غادر السيرفر (بالأيدي)
 async function punishFor(guild, member, executorId, action, reason) {
     const fullReason = `[Anti-Nuke] ${reason}`;
@@ -1420,11 +1480,57 @@ async function captureGuildBackup(guild) {
             });
         }
 
+        // الإيموجي (المخصصة فقط — القياسية تُستعاد تلقائياً من Discord)
+        const emojis = [];
+        for (const e of guild.emojis.cache.values()) {
+            if (!e.managed) {
+                emojis.push({
+                    id: e.id,
+                    name: e.name,
+                    animated: !!e.animated,
+                    url: e.url || null
+                });
+            }
+        }
+
+        // الستيكرات المخصصة (المجموعات والدخول المخزّن في الرابط)
+        const stickers = [];
+        for (const s of guild.stickers.cache.values()) {
+            if (!s.managed) {
+                let ext = 'png';
+                if (s.format === StickerFormatType.Lottie) ext = 'json';
+                else if (s.format === StickerFormatType.GIF) ext = 'gif';
+
+                stickers.push({
+                    id: s.id,
+                    name: s.name,
+                    description: s.description || null,
+                    tags: s.tags || null,
+                    format: s.format || null,
+                    url: `https://cdn.discordapp.com/stickers/${s.id}.${ext}`
+                });
+            }
+        }
+
+        // إعدادات الحماية (رومات/رتب/باند/بوتات/سبام/ويب هوك/إنفايت)
+        let protections = null;
+        try {
+            const settings = await getSettings(guild.id);
+            protections = settings?.protections
+                ? JSON.parse(JSON.stringify(settings.protections))
+                : null;
+        } catch {
+            protections = null;
+        }
+
         const doc = {
             guildId: guild.id,
             capturedAt: new Date(),
             channels,
-            roles
+            roles,
+            emojis,
+            stickers,
+            protections
         };
 
         // updateOne + upsert حتى لا يدمج mongoose الـ Mixed بعمق (يختفي المصفوفات)
@@ -1438,6 +1544,9 @@ async function captureGuildBackup(guild) {
             saved: true,
             channels: channels.length,
             roles: roles.length,
+            emojis: emojis.length,
+            stickers: stickers.length,
+            protections: !!protections,
             capturedAt: doc.capturedAt
         };
     } catch (error) {
@@ -1633,6 +1742,102 @@ async function restoreGuildFromBackup(guild) {
         for (const item of parents) await createOne(item);
         for (const item of children) await createOne(item);
 
+        // ---------- الإيموجي ----------
+        let restoredEmojis = 0;
+        const backedEmojis = Array.isArray(backup.emojis) ? backup.emojis : [];
+
+        for (const emoji of backedEmojis) {
+            try {
+                if (!emoji?.name || !emoji?.url) continue;
+                if (guild.emojis.cache.some(e => e.name === emoji.name)) continue;
+
+                const buffer = await downloadBuffer(emoji.url);
+                if (!buffer) continue;
+
+                const created = await guild.emojis.create({
+                    attachment: buffer,
+                    name: emoji.name,
+                    reason: '[Anti-Nuke] استرجاع النسخة الاحتياطية'
+                });
+                if (created) restoredEmojis++;
+            } catch (error) {
+                console.error(
+                    `[BACKUP] فشل استرجاع إيموجي "${emoji?.name}": ${error.message}`
+                );
+            }
+        }
+
+        // ---------- الستيكرات ----------
+        let restoredStickers = 0;
+        const backedStickers = Array.isArray(backup.stickers) ? backup.stickers : [];
+
+        for (const sticker of backedStickers) {
+            try {
+                if (!sticker?.name || !sticker?.url) continue;
+                if (guild.stickers.cache.some(s => s.name === sticker.name)) continue;
+
+                const buffer = await downloadBuffer(sticker.url);
+                if (!buffer) continue;
+
+                const created = await guild.stickers.create({
+                    file: buffer,
+                    name: sticker.name,
+                    description: sticker.description || '',
+                    tags: sticker.tags || '',
+                    reason: '[Anti-Nuke] استرجاع النسخة الاحتياطية'
+                });
+                if (created) restoredStickers++;
+            } catch (error) {
+                console.error(
+                    `[BACKUP] فشل استرجاع ستيكر "${sticker?.name}": ${error.message}`
+                );
+            }
+        }
+
+        // ---------- إعدادات الحماية ----------
+        const backedProtections = backup.protections;
+
+        if (backedProtections && typeof backedProtections === 'object') {
+            try {
+                const settings = await getSettings(guild.id);
+
+                if (settings) {
+                    let changedProt = false;
+
+                    for (const key of Object.keys(backedProtections)) {
+                        const val = backedProtections[key];
+
+                        // نتجاهل الإعدادات الفارغة/المعطّلة تلقائياً إلا الإعدادات الأصلية فعلية
+                        if (!settings.protections) {
+                            settings.protections = {};
+                        }
+
+                        settings.protections[key] = JSON.parse(
+                            JSON.stringify(val)
+                        );
+                        changedProt = true;
+                    }
+
+                    if (changedProt) {
+                        settings.markModified('protections');
+                        await settings.save().catch(() => {});
+
+                        // تحديث الكاش المحلي
+                        try {
+                            protectionsCache.set(guild.id, {
+                                protections: JSON.parse(
+                                    JSON.stringify(settings.protections)
+                                ),
+                                whitelist: settings.whitelist || []
+                            });
+                        } catch {}
+                    }
+                }
+            } catch (error) {
+                console.error('[BACKUP] فشل استرجاع إعدادات الحماية:', error.message);
+            }
+        }
+
         // ---------- ترتيب المواقع (أفضل محاولة) ----------
         try {
             const mapping = [];
@@ -1661,7 +1866,7 @@ async function restoreGuildFromBackup(guild) {
         } catch {}
 
         console.log(
-            `[BACKUP] استرجاع ${guild.id} | رومات🔄=${restoredChannels.length} رتب🔄=${restoredRoles.length} رومات deleted=${deletedChannels} رتب deleted=${deletedRoles}`
+            `[BACKUP] استرجاع ${guild.id} | رومات🔄=${restoredChannels.length} رتب🔄=${restoredRoles.length} رومات deleted=${deletedChannels} رتب deleted=${deletedRoles} إيموجي🔄=${restoredEmojis} ستيكرات🔄=${restoredStickers}`
         );
 
         return {
@@ -1669,6 +1874,9 @@ async function restoreGuildFromBackup(guild) {
             restoredRoles,
             deletedChannels,
             deletedRoles,
+            restoredEmojis,
+            restoredStickers,
+            protectionsApplied: !!backedProtections,
             failed: 0
         };
     } catch (error) {
@@ -1698,22 +1906,61 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
 
             const deletedCount = await deleteAllWebhooks(guild);
 
-            const banned = await banSuspectedBots(guild, prot, 'فيضان إنشاء ويب هوك');
+            const executorId = await resolveAbuseExecutor(
+                guild,
+                AuditLogEvent.WebhookCreate,
+                webhookId
+            );
 
             console.log(
-                `[PROTECT] webhook flood — حذف ${deletedCount} ويب هوك (${guild.id})${banned.length ? `، بند ${banned.length} بوت` : ''}`
+                `[PROTECT] webhook flood — حذف ${deletedCount} ويب هوك (${guild.id}) | الفاعل=${executorId || 'غير مشخص'}`
             );
 
-            await sendLog(
-                guild,
-                'moderation',
-                '🛡️ Webhook Flood',
-                `فيضان إنشاء ويب هوك.\n` +
-                `تم حذف **${deletedCount}** ويب هوك.` +
-                (banned.length
-                    ? `\n✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
-                    : '')
-            );
+            if (executorId && executorId !== client.user.id) {
+                const member = await getMember(guild, executorId);
+                const check = await protectionAllowed(guild, member, {
+                    whitelist: cached?.whitelist || []
+                });
+
+                if (check.allowed === false) {
+                    const banned = await punishFor(
+                        guild,
+                        member,
+                        executorId,
+                        prot.action || 'ban',
+                        `فيضان إنشاء ويب هوك (أكثر من ${prot.limit || 5})`
+                    );
+
+                    await sendLog(
+                        guild,
+                        'moderation',
+                        '🛡️ Webhook Flood',
+                        `فيضان إنشاء ويب هوك.\n` +
+                        `تم حذف **${deletedCount}** ويب هوك.` +
+                        (banned
+                            ? `\n✅ تم بند الفاعل: <@${executorId}>`
+                            : `\n❌ فشلت العقوبة على <@${executorId}> — تأكد من رتب البوت/الصلاحيات.`)
+                    );
+                } else {
+                    await sendLog(
+                        guild,
+                        'moderation',
+                        '🛡️ Webhook Flood',
+                        `فيضان إنشاء ويب هوك.\n` +
+                        `تم حذف **${deletedCount}** ويب هوك.\n` +
+                        `<@${executorId}> فوق/بنفس رتبة البوت — تم التسجيل فقط.`
+                    );
+                }
+            } else {
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Webhook Flood',
+                    `فيضان إنشاء ويب هوك.\n` +
+                    `تم حذف **${deletedCount}** ويب هوك.\n` +
+                    'المسبب غير مشخص (تأكد من صلاحية **View Audit Log**).'
+                );
+            }
 
             return;
         }
@@ -1761,10 +2008,16 @@ const member = await getMember(guild, executorId);
             const exceededDeletedCount = await deleteAllWebhooks(guild);
 
             if (check.allowed === false) {
-                await applyPunishment(
+                const punished = await punishFor(
+                    guild,
                     member,
+                    executorId,
                     prot.action || 'ban',
                     `تجاوز حد إنشاء الويب هوك (${limit})`
+                );
+                console.log(
+                    `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} ` +
+                    `لتجاوز حد الويب هوك (${guild.id}) — نجحت=${punished}`
                 );
             }
 
@@ -1776,7 +2029,7 @@ const member = await getMember(guild, executorId);
                 '🛡️ Webhook Protection',
                 `<@${executorId}> تجاوز حد إنشاء الويب هوك (**${limit}**).\n` +
                 `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : check.level === 'above' ? 'أعلى من رتبة البوت' : 'تحت رتبة البوت'}**\n` +
-                `تم حذف **${exceededDeletedCount}** ويب هوك${check.allowed === false ? `\nالعقوبة: **${prot.action}**` : ''}`
+                `تم حذف **${exceededDeletedCount}** ويب هوك${check.allowed === false ? `\nالعقوبة: **${prot.action || 'ban'}**` : ''}`
             );
 
             return;
@@ -1788,10 +2041,16 @@ const member = await getMember(guild, executorId);
         const deletedCount = await deleteAllWebhooks(guild);
 
         if (check.allowed === false) {
-            await applyPunishment(
+            const punished = await punishFor(
+                guild,
                 member,
+                executorId,
                 prot.action || 'ban',
                 `Webhook ${label} غير مصرّح (${webhookId || ''})`
+            );
+            console.log(
+                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} ` +
+                `ل${label} ويب هوك بدون إذن (${guild.id}) — نجحت=${punished}`
             );
         }
 
@@ -4602,7 +4861,7 @@ const botsDesc = settings.protections.bots.enabled
                 }
 
                 console.log(
-                    `[BACKUP] تم الحفظ ${interaction.guild.id} | رومات=${result.channels} رتب=${result.roles}`
+                    `[BACKUP] تم الحفظ ${interaction.guild.id} | رومات=${result.channels} رتب=${result.roles} إيموجي=${result.emojis} ستيكرات=${result.stickers} حماية=${result.protections}`
                 );
 
                 await sendLog(
@@ -4612,6 +4871,9 @@ const botsDesc = settings.protections.bots.enabled
                     `تم حفظ نسخة كاملة من السيرفر بواسطة <@${interaction.user.id}>.\n` +
                     `القنوات: **${result.channels}**\n` +
                     `الرتب: **${result.roles}**\n` +
+                    `الإيموجي: **${result.emojis}**\n` +
+                    `الستيكرات: **${result.stickers}**\n` +
+                    `إعدادات الحماية: **${result.protections ? 'نعم' : 'لا'}**\n` +
                     `الوقت: <t:${Math.floor(result.capturedAt.getTime() / 1000)}:f>`
                 );
 
@@ -4633,6 +4895,21 @@ const botsDesc = settings.protections.bots.enabled
                                 {
                                     name: '🎭 الرتب',
                                     value: String(result.roles),
+                                    inline: true
+                                },
+                                {
+                                    name: '😀 الإيموجي',
+                                    value: String(result.emojis),
+                                    inline: true
+                                },
+                                {
+                                    name: '🖼️ ستيكرات',
+                                    value: String(result.stickers),
+                                    inline: true
+                                },
+                                {
+                                    name: '🛡️ إعدادات الحماية',
+                                    value: result.protections ? '✓ محفوظة' : '—',
                                     inline: true
                                 }
                             )
@@ -4681,7 +4958,7 @@ const botsDesc = settings.protections.bots.enabled
                 }
 
                 console.log(
-                    `[BACKUP] استرجاع ${interaction.guild.id} بواسطة <@${interaction.user.id}> | رومات↺=${result.restoredChannels.length} رتب↺=${result.restoredRoles.length} deleted=${result.deletedChannels}/${result.deletedRoles}`
+                    `[BACKUP] استرجاع ${interaction.guild.id} بواسطة <@${interaction.user.id}> | رومات↺=${result.restoredChannels.length} رتب↺=${result.restoredRoles.length} deleted=${result.deletedChannels}/${result.deletedRoles} إيموجي↺=${result.restoredEmojis || 0} ستيكرات↺=${result.restoredStickers || 0}`
                 );
 
                 await sendLog(
@@ -4691,6 +4968,9 @@ const botsDesc = settings.protections.bots.enabled
                     `تم استرجاع السيرفر من النسخة بواسطة المالك <@${interaction.user.id}>.\n` +
                     `🔄 قنوات معاد إنشاؤها: **${result.restoredChannels.length}**\n` +
                     `🔄 رتب معاد إنشاؤها: **${result.restoredRoles.length}**\n` +
+                    `🔄 إيموجي معاد: **${result.restoredEmojis || 0}**\n` +
+                    `🔄 ستيكرات معادة: **${result.restoredStickers || 0}**\n` +
+                    `🛡️ إعدادات الحماية: **${result.protectionsApplied ? 'تم استرجاعها' : 'لا إعدادات في النسخة'}**\n` +
                     `🗑️ قنوات زائدة حُذفت: **${result.deletedChannels}**\n` +
                     `🗑️ رتب زائدة حُذفت: **${result.deletedRoles}**`
                 );
@@ -4713,6 +4993,23 @@ const botsDesc = settings.protections.bots.enabled
                                 {
                                     name: '🔄 رتب معاد إنشاؤها',
                                     value: String(result.restoredRoles.length),
+                                    inline: true
+                                },
+                                {
+                                    name: '🔄 إيموجي معاد',
+                                    value: String(result.restoredEmojis || 0),
+                                    inline: true
+                                },
+                                {
+                                    name: '🔄 ستيكرات معادة',
+                                    value: String(result.restoredStickers || 0),
+                                    inline: true
+                                },
+                                {
+                                    name: '🛡️ الإعدادات الحماية',
+                                    value: result.protectionsApplied
+                                        ? '✓ تم استرجاعها'
+                                        : 'لا إعدادات في النسخة',
                                     inline: true
                                 },
                                 {
@@ -6281,17 +6578,12 @@ client.on('roleCreate', async role => {
                             : '')
                 );
             } else if (floodLocked) {
-                const banned = await banSuspectedBots(guild, prot, 'فيضان إنشاء رتب');
-
                 await sendLog(
                     guild,
                     'moderation',
                     '🛡️ Role Flood Detected',
-                    banned.length
-                        ? 'فيضان إنشاء رتب — تم حذف الرتبة المنشأة فورياً.\n' +
-                          `✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
-                        : 'فيضان إنشاء رتب — تم حذف الرتبة المنشأة فورياً.\n' +
-                          'المسبب غير مشخص (تأكد من صلاحية **View Audit Log**/رتب البوتات).'
+                    'فيضان إنشاء رتب — تم حذف الرتبة المنشأة فورياً.\n' +
+                    'المسبب غير مشخص (تأكد من صلاحية **View Audit Log**).'
                 );
             }
         } catch (error) {
@@ -6446,21 +6738,16 @@ client.on('roleDelete', async role => {
                     }
                 }
             } else if (floodLocked) {
-                const banned = await banSuspectedBots(guild, prot, 'فيضان حذف رتب');
-
                 console.log(
-                    `[PROTECT] فيضان حذف رتب ${guild.id} — المسبب غير مشخص${banned.length ? `، بند ${banned.length} بوت` : ''}`
+                    `[PROTECT] فيضان حذف رتب ${guild.id} — المسبب غير مشخص`
                 );
 
                 await sendLog(
                     guild,
                     'moderation',
                     '🛡️ Role Deletion Flood',
-                    banned.length
-                        ? 'فيضان حذف رتب — لم يُعرف المسبب من السجل.\n' +
-                          `✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
-                        : 'فيضان حذف رتب — المسبب غير مشخص.\n' +
-                          'تأكد من صلاحية **View Audit Log**/رتب البوتات.'
+                    'فيضان حذف رتب — المسبب غير مشخص.\n' +
+                    'تأكد من صلاحية **View Audit Log**.'
                 );
             }
         }
@@ -6715,17 +7002,12 @@ client.on('channelCreate', async channel => {
                             : '')
                 );
             } else if (floodLocked) {
-                const banned = await banSuspectedBots(guild, prot, 'فيضان إنشاء رومات');
-
                 await sendLog(
                     guild,
                     'moderation',
                     '🛡️ Channel Flood Detected',
-                    banned.length
-                        ? 'فيضان إنشاء رومات — تم حذف الروم المنشأ فورياً.\n' +
-                          `✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
-                        : 'فيضان إنشاء رومات — تم حذف الروم المنشأ فورياً.\n' +
-                          'المسبب غير مشخص (تأكد من صلاحية **View Audit Log**/رتب البوتات).'
+                    'فيضان إنشاء رومات — تم حذف الروم المنشأ فورياً.\n' +
+                    'المسبب غير مشخص (تأكد من صلاحية **View Audit Log**).'
                 );
             }
         } catch (error) {
@@ -6896,21 +7178,16 @@ client.on('channelDelete', async channel => {
                     }
                 }
             } else if (floodLocked) {
-                const banned = await banSuspectedBots(guild, prot, 'فيضان حذف رومات');
-
                 console.log(
-                    `[PROTECT] فيضان حذف رومات ${guild.id} — المسبب غير مشخص${banned.length ? `، بند ${banned.length} بوت` : ''}`
+                    `[PROTECT] فيضان حذف رومات ${guild.id} — المسبب غير مشخص`
                 );
 
                 await sendLog(
                     guild,
                     'moderation',
                     '🛡️ Channel Deletion Flood',
-                    banned.length
-                        ? 'فيضان حذف رومات — لم يُعرف المسبب من السجل.\n' +
-                          `✅ تم بند البوتات المشبوهة: ${banned.map(id => `<@${id}>`).join(', ')}`
-                        : 'فيضان حذف رومات — المسبب غير مشخص.\n' +
-                          'تأكد من صلاحية **View Audit Log**/رتب البوتات.'
+                    'فيضان حذف رومات — المسبب غير مشخص.\n' +
+                    'تأكد من صلاحية **View Audit Log**.'
                 );
             }
         }
