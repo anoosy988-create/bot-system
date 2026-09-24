@@ -1056,25 +1056,40 @@ async function getMember(guild, userId) {
 async function punishFor(guild, member, executorId, action, reason) {
     const fullReason = `[Anti-Nuke] ${reason}`;
 
+    const botHighest = guild?.members?.me?.roles?.highest;
+    const pos = member?.roles?.highest?.position ?? -1;
+
+    if (botHighest && pos >= botHighest.position) {
+        console.error(
+            `[PROTECT] فشل تنفيذ ${action} على ${executorId}: ` +
+            `رتبة الفاعل (${pos}) >= رتبة البوت (${botHighest.position}) — لم يُعدّل ترتيب الحماية`
+        );
+        return false;
+    }
+
     try {
         if (action === 'ban' && executorId) {
             if (member?.bannable) {
                 await member.ban({ reason: fullReason });
+                console.log(`[PROTECT] تم تنفيذ ban على ${executorId}`);
                 return true;
             }
 
             // العضو غادر أو الموجودة ما تقدر تشد — نبنّد بالـ ID
             await guild.bans.create(executorId, { reason: fullReason });
+            console.log(`[PROTECT] تم تنفيذ ban (by ID) على ${executorId}`);
             return true;
         }
 
         if (action === 'kick' && member?.kickable) {
             await member.kick(fullReason);
+            console.log(`[PROTECT] تم تنفيذ kick على ${executorId}`);
             return true;
         }
 
         if (action === 'timeout' && member?.moderatable) {
             await member.timeout(SPAM_TIMEOUT_MS, fullReason);
+            console.log(`[PROTECT] تم تنفيذ timeout على ${executorId}`);
             return true;
         }
 
@@ -1084,11 +1099,18 @@ async function punishFor(guild, member, executorId, action, reason) {
             );
             if (removable.size) {
                 await member.roles.remove(removable, fullReason);
+                console.log(`[PROTECT] تم تنفيذ removeroles على ${executorId}`);
             }
             return true;
         }
+
+        console.error(
+            `[PROTECT] لم ينفّذ ${action} على ${executorId}: ` +
+            `bannable=${!!member?.bannable} kickable=${!!member?.kickable} ` +
+            `moderatable=${!!member?.moderatable} member=${!!member}`
+        );
     } catch (error) {
-        console.error('PunishFor error:', error);
+        console.error(`PunishFor error (${action} on ${executorId}):`, error);
     }
 
     return false;
@@ -6187,7 +6209,7 @@ client.on('roleCreate', async role => {
                             check.level === 'below' ||
                             check.level === 'unknown'
                         ) {
-                            await punishFor(
+                            const punishedNow = await punishFor(
                                 guild,
                                 member,
                                 executorId,
@@ -6196,9 +6218,14 @@ client.on('roleCreate', async role => {
                                     ? `فيضان إنشاء رتب (أكثر من ${limit})`
                                     : `تجاوز حد إنشاء الرتب (${limit})`
                             );
-                            punished = true;
+                            if (punishedNow) punished = true;
                             console.log(
-                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} | حذف ${removed} رتبة (${guild.id})`
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} | حذف ${removed} رتبة (${guild.id}) — نجحت=${punishedNow}`
+                            );
+                        } else {
+                            console.log(
+                                `[PROTECT] تم التخطي: المستوى ${check.level} ` +
+                                `للمخالف ${executorId} — لا عقوبة (Discord يمنع)`
                             );
                         }
                     }
@@ -6322,6 +6349,12 @@ client.on('roleDelete', async role => {
                             Math.max(Math.round(limit / 2), 1)
                         );
 
+                    console.log(
+                        `[PROTECT] roleDelete executor=${executorId} ` +
+                        `level=${check.level} exceeded=${exceeded} ` +
+                        `flood=${floodLocked} action=${prot.action || 'ban'}`
+                    );
+
                     if (exceeded) {
 
                         clearCount(protectionCounts.roles, key);
@@ -6330,7 +6363,7 @@ client.on('roleDelete', async role => {
                             check.level === 'below' ||
                             check.level === 'unknown'
                         ) {
-                            await punishFor(
+                            const punished = await punishFor(
                                 guild,
                                 member,
                                 executorId,
@@ -6340,7 +6373,13 @@ client.on('roleDelete', async role => {
                                     : `حذف رتب غير مصرّح (نوك)`
                             );
                             console.log(
-                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} للفيضان/حذف رتب (${guild.id})`
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} ` +
+                                `للفيضان/حذف رتب (${guild.id}) — نجحت=${punished}`
+                            );
+                        } else {
+                            console.log(
+                                `[PROTECT] تم التخطي: المستوى ${check.level} ` +
+                                `للمخالف ${executorId} — لا عقوبة (Discord يمنع)`
                             );
                         }
 
@@ -6591,7 +6630,7 @@ client.on('channelCreate', async channel => {
                             check.level === 'below' ||
                             check.level === 'unknown'
                         ) {
-                            await punishFor(
+                            const punishedNow = await punishFor(
                                 guild,
                                 member,
                                 executorId,
@@ -6600,9 +6639,9 @@ client.on('channelCreate', async channel => {
                                     ? `فيضان إنشاء رومات (أكثر من ${limit})`
                                     : `تجاوز حد إنشاء الرومات (${limit})`
                             );
-                            punished = true;
+                            if (punishedNow) punished = true;
                             console.log(
-                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} | حذف ${removed} روم (${guild.id})`
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} | حذف ${removed} روم (${guild.id}) — نجحت=${punishedNow}`
                             );
                         } else {
                             console.log(
@@ -6739,6 +6778,12 @@ client.on('channelDelete', async channel => {
                             Math.max(Math.round(limit / 2), 1)
                         );
 
+                    console.log(
+                        `[PROTECT] channelDelete executor=${executorId} ` +
+                        `level=${check.level} exceeded=${exceeded} ` +
+                        `flood=${floodLocked} action=${prot.action || 'ban'}`
+                    );
+
                     if (exceeded) {
 
                         clearCount(protectionCounts.channels, key);
@@ -6747,7 +6792,7 @@ client.on('channelDelete', async channel => {
                             check.level === 'below' ||
                             check.level === 'unknown'
                         ) {
-                            await punishFor(
+                            const punished = await punishFor(
                                 guild,
                                 member,
                                 executorId,
@@ -6757,7 +6802,13 @@ client.on('channelDelete', async channel => {
                                     : `حذف رومات غير مصرّح (نوك)`
                             );
                             console.log(
-                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} للفيضان/حذف رومات (${guild.id})`
+                                `[PROTECT] عقوبة ${prot.action || 'ban'} على ${executorId} ` +
+                                `للفيضان/حذف رومات (${guild.id}) — نجحت=${punished}`
+                            );
+                        } else {
+                            console.log(
+                                `[PROTECT] تم التخطي: المستوى ${check.level} ` +
+                                `للمخالف ${executorId} — لا عقوبة (Discord يمنع)`
                             );
                         }
 
