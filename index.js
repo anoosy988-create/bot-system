@@ -620,7 +620,8 @@ const protectionCounts = {
     channels: new Map(),
     roles: new Map(),
     bans: new Map(),
-    spam: new Map()
+    spam: new Map(),
+    webhooks: new Map()
 };
 
 // عدّاد تحذيرات السبام لكل عضو (قبل تطبيق Time-out)
@@ -752,8 +753,9 @@ async function deleteAllWebhooks(guild) {
 }
 
 // حماية الويب هوك:
-//  - تحت رتبة البوت: عقوبة + حذف كل الويب هوك
-//  - بنفس رتبة البوت: حذف كل الويب هوك فقط (ما نقدر نعاقبه)
+//  - الإنشاء: مسموح حتى "الحد" المحدد، وعند التجاوز → عقوبة + حذف كل الويب هوك
+//  - الحذف/التعديل من غير مخوّل → حذف كل الويب هوك فوراً
+//  - تحت رتبة البوت: عقوبة | بنفس رتبة البوت: حذف فقط
 //  - وايت ليست / فوق رتبة البوت / المالك: لا نتدخل
 async function runWebhookProtection(guild, auditType, webhookId, label) {
     try {
@@ -772,6 +774,61 @@ async function runWebhookProtection(guild, auditType, webhookId, label) {
 
         if (check.allowed) return;
 
+        // ==========================================
+        // إنشاء ويب هوك: نحدّ عدد المسموح خلال الفترة
+        // ==========================================
+        if (auditType === AuditLogEvent.WebhookCreate) {
+
+            const now = Date.now();
+            const key = `${guild.id}-${executorId}`;
+            const timeframe = prot.timeframe || 60000;
+            const limit = prot.limit || 5;
+
+            const exceeded = isLimitExceeded(
+                protectionCounts.webhooks,
+                key,
+                now,
+                limit,
+                timeframe
+            );
+
+            // ضمن الحد المسموح: لا نتدخل
+            if (!exceeded) {
+                await sendLog(
+                    guild,
+                    'moderation',
+                    '🛡️ Webhook Created (Within Limit)',
+                    `<@${executorId}> أنشأ ويب هوك — ضمن الحد المسموح (**${limit}** خلال ${Math.round(timeframe / 1000)} ث).`
+                );
+                return;
+            }
+
+            // تجاوز الحد: عقوبة (لو تحت) + حذف كل الويب هوك
+            const exceededDeletedCount = await deleteAllWebhooks(guild);
+
+            if (check.level === 'below') {
+                await applyPunishment(
+                    member,
+                    prot.action || 'ban',
+                    `تجاوز حد إنشاء الويب هوك (${limit})`
+                );
+            }
+
+            await sendLog(
+                guild,
+                'moderation',
+                '🛡️ Webhook Protection',
+                `<@${executorId}> تجاوز حد إنشاء الويب هوك (**${limit}**).\n` +
+                `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                `تم حذف **${exceededDeletedCount}** ويب هوك${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+            );
+
+            return;
+        }
+
+        // ==========================================
+        // حذف / تعديل ويب هوك من شخص غير مخوّل
+        // ==========================================
         const deletedCount = await deleteAllWebhooks(guild);
 
         if (check.level === 'below') {
@@ -1629,11 +1686,23 @@ const slashCommands = [
         )
         .addSubcommand(sub =>
             sub.setName('webhooks')
-                .setDescription('حماية الويب هوك: حذف الكل + عقوبة المخالف تحت رتبة البوت')
+                .setDescription('حماية الويب هوك: حد الإنشاء المسموح ثم العقوبة')
                 .addBooleanOption(o =>
                     o.setName('enabled')
                         .setDescription('تفعيل الحماية')
                         .setRequired(true)
+                )
+                .addIntegerOption(o =>
+                    o.setName('limit')
+                        .setDescription('عدد الويب هوك المسموح إنشاؤها خلال الفترة')
+                        .setMinValue(1)
+                        .setMaxValue(50)
+                )
+                .addIntegerOption(o =>
+                    o.setName('duration')
+                        .setDescription('الفترة الزمنية بالثواني')
+                        .setMinValue(5)
+                        .setMaxValue(3600)
                 )
                 .addStringOption(o =>
                     o.setName('action')
@@ -3149,9 +3218,10 @@ const botsDesc = settings.protections.bots.enabled
                     const webhooksProt = settings.protections.webhooks;
 
                     const webhooksDesc = `**${webhooksProt.enabled ? '✅ مفعّلة' : '❌ متوقفة'}**\n` +
+                        `الحد المسموح: **${webhooksProt.limit}** | الفترة: **${Math.round(webhooksProt.timeframe / 1000)} ث**\n` +
                         `العقوبة (تحت رتبة البوت): **${webhooksProt.action}**\n` +
                         `المرجع: رتبة البوت والفوايت ليست\n` +
-                        `(فوقه/وايت ليست: مسموح | بنفسه: حذف كل الويب هوك | تحته: حظر + حذف الكل)`;
+                        `(فوقه/وايت ليست: مسموح | ضمن الحد: مسموح | بنفسه: حذف كل الويب هوك | تحته عند التجاوز: حظر + حذف الكل)`;
 
                     const spamProt = settings.protections.spam;
 
