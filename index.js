@@ -201,6 +201,30 @@ async function requireProtectionPermission(interaction) {
         );
     }
 
+    // ==========================================
+    // صلاحيات البوت الضرورية للحماية الفعلية
+    // ==========================================
+    const neededPerms = {
+        [PermissionsBitField.Flags.ViewAuditLog]: 'مشاهدة سجل التدقيق',
+        [PermissionsBitField.Flags.ManageChannels]: 'إدارة الرومات',
+        [PermissionsBitField.Flags.ManageRoles]: 'إدارة الرتب',
+        [PermissionsBitField.Flags.ManageWebhooks]: 'إدارة الويب هوك',
+        [PermissionsBitField.Flags.BanMembers]: 'حظر الأعضاء',
+        [PermissionsBitField.Flags.KickMembers]: 'طرد الأعضاء'
+    };
+
+    const missingPerms = Object.entries(neededPerms)
+        .filter(([flag]) => !guild?.members?.me?.permissions?.has(flag))
+        .map(([, label]) => `- ${label}`);
+
+    if (missingPerms.length) {
+        return replyContent(
+            `⚠️ البوت محتاج هذه الصلاحيات حتى تشتغل الحماية فعلاً:\n` +
+            missingPerms.join('\n') +
+            `\n(أسهل حل: أعطه صلاحية **Administrator** أو اعتمد عليه من إعدادات الرتب).`
+        );
+    }
+
     return true;
 }
 
@@ -714,11 +738,14 @@ async function getAuditExecutor(guild, type, targetId = null) {
         const entry = audit.entries.first();
 
         if (!entry) return null;
-        if (Date.now() - entry.createdTimestamp > 15000) return null;
+        if (Date.now() - entry.createdTimestamp > 30000) return null;
         if (targetId && entry.targetId !== targetId) return null;
 
         return entry.executor?.id || null;
-    } catch {
+    } catch (error) {
+        console.error(
+            `Audit log fetch error (${guild?.id}, type ${type}): ${error.message}`
+        );
         return null;
     }
 }
@@ -4285,16 +4312,27 @@ client.on('guildMemberAdd', async member => {
 
                 if (inviterPos < refPos) {
 
-                    // رتبة المسبب تحت رتبة البوت: بند البوت والمسبب معاً
-                    await member.ban('[Anti-Nuke] دخول بوت غير مصرّح').catch(() => {});
+                    // رتبة المسبب تحت رتبة البوت: نطرد/نبند البوت المضافة والمسبب معاً
+                    let botRemoved = false;
+
+                    try {
+                        await member.ban('[Anti-Nuke] دخول بوت غير مصرّح');
+                        botRemoved = true;
+                    } catch {
+                        botRemoved = await member.kick(
+                            '[Anti-Nuke] دخول بوت غير مصرّح'
+                        ).then(() => true).catch(() => false);
+                    }
+
                     await applyPunishment(inviter, 'ban', 'مسبب دخول بوت غير مصرّح');
 
                     await sendLog(
                         member.guild,
                         'moderation',
-                        '🤖 Bot Banned',
-                        `البوت **${member.user.tag}** حُظر لأنه دخول غير مصرّح.\n` +
-                        `المسبب: <@${inviter.id}> (تحت رتبة البوت ${refRole})`
+                        botRemoved ? '🤖 Bot Banned' : '🤖 Bot Removal Failed',
+                        `البوت **${member.user.tag}** ${botRemoved ? 'حُظر لأنه' : 'تعذر حذفه رغم أنه'} دخول غير مصرّح.\n` +
+                        `المسبب: <@${inviter.id}> (تحت رتبة البوت ${refRole})\n` +
+                        (botRemoved ? '' : '⚠️ البوت بقي في السيرفر — افحص رتب البوتات المرتفعة أو صلاحيات البوت.')
                     );
                     return;
                 }
@@ -4302,13 +4340,18 @@ client.on('guildMemberAdd', async member => {
                 if (inviterPos === refPos) {
 
                     // بنفس رتبة البوت: البوت لا يقدر يدخل ويُطرد
-                    await member.kick('[Anti-Nuke] دخول بوت غير مصرّح').catch(() => {});
+                    const kicked =
+                        await member.kick('[Anti-Nuke] دخول بوت غير مصرّح')
+                            .then(() => true)
+                            .catch(() => false);
+
                     await sendLog(
                         member.guild,
                         'moderation',
-                        '🤖 Bot Kicked',
-                        `البوت **${member.user.tag}** طُرد لأنه دخول غير مصرّح.\n` +
-                        `المسبب: <@${inviter.id}> (بنفس رتبة البوت ${refRole})`
+                        kicked ? '🤖 Bot Kicked' : '🤖 Bot Removal Failed',
+                        `البوت **${member.user.tag}** ${kicked ? 'طُرد لأنه' : 'تعذر طرده رغم أنه'} دخول غير مصرّح.\n` +
+                        `المسبب: <@${inviter.id}> (بنفس رتبة البوت ${refRole})\n` +
+                        (kicked ? '' : '⚠️ البوت بقي في السيرفر — رتبه أعلى أو مساوية لرتبة البوت.')
                     );
                     return;
                 }
@@ -4953,35 +4996,42 @@ client.on('roleCreate', async role => {
                 role.id
             );
 
-            if (executorId) {
+            if (executorId && executorId !== client.user.id) {
 
-                const key = `${role.guild.id}-${executorId}`;
+                const member = await getMember(role.guild, executorId);
+                const check = protectionAllowed(role.guild, member, settings);
 
-                if (countExceeded(
-                    protectionCounts.roles,
-                    key,
-                    prot.limit
-                )) {
+                if (!check.allowed) {
 
-                    const member = await getMember(role.guild, executorId);
+                    const key = `${role.guild.id}-${executorId}`;
 
-                    await applyPunishment(
-                        member,
-                        prot.action,
-                        `تجاوز حد إنشاء الرتب (${prot.limit})`
-                    );
+                    if (countExceeded(
+                        protectionCounts.roles,
+                        key,
+                        prot.limit
+                    )) {
 
-                    clearCount(protectionCounts.roles, key);
+                        await role.delete('[Anti-Nuke] تجاوز حد إنشاء الرتب').catch(() => {});
 
-                    await role.delete('[Anti-Nuke] تجاوز حد إنشاء الرتب').catch(() => {});
+                        if (check.level === 'below') {
+                            await applyPunishment(
+                                member,
+                                prot.action,
+                                `تجاوز حد إنشاء الرتب (${prot.limit})`
+                            );
+                        }
 
-                    await sendLog(
-                        role.guild,
-                        'moderation',
-                        '🛡️ Role Protection',
-                        `<@${executorId}> تجاوز حد إنشاء الرتب (**${prot.limit}**).\n` +
-                        `طبقت العقوبة: **${prot.action}**`
-                    );
+                        clearCount(protectionCounts.roles, key);
+
+                        await sendLog(
+                            role.guild,
+                            'moderation',
+                            '🛡️ Role Protection',
+                            `<@${executorId}> تجاوز حد إنشاء الرتب (**${prot.limit}**).\n` +
+                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                            `تم حذف الرتبة المنشأة${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+                        );
+                    }
                 }
             }
         }
@@ -5005,6 +5055,51 @@ client.on('roleDelete', async role => {
         `تم حذف الرتبة **${role.name}**.\n` +
         `المسبب: ${executor}`
     );
+
+    // حماية حذف الرتب
+    try {
+
+        const settings = await getSettings(role.guild.id);
+        ensureProtections(settings);
+        const prot = settings.protections.roles;
+
+        if (prot.enabled) {
+
+            const executorId = await getAuditExecutor(
+                role.guild,
+                AuditLogEvent.RoleDelete,
+                role.id
+            );
+
+            if (executorId && executorId !== client.user.id) {
+
+                const member = await getMember(role.guild, executorId);
+                const check = protectionAllowed(role.guild, member, settings);
+
+                if (!check.allowed) {
+
+                    if (check.level === 'below') {
+                        await applyPunishment(
+                            member,
+                            prot.action,
+                            'حذف رتبة (نوك)'
+                        );
+                    }
+
+                    await sendLog(
+                        role.guild,
+                        'moderation',
+                        '🛡️ Role Deletion Protection',
+                        `<@${executorId}> حذف رتبة **${role.name}** بدون إذن.\n` +
+                        `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                        (check.level === 'below' ? `العقوبة: **${prot.action}**` : '')
+                    );
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Role deletion protection error:', error);
+    }
 
 });
 
@@ -5150,33 +5245,45 @@ client.on('channelCreate', async channel => {
                 channel.id
             );
 
-            if (executorId) {
+            if (executorId && executorId !== client.user.id) {
 
-                const key = `${channel.guild.id}-${executorId}`;
+                const member = await getMember(channel.guild, executorId);
+                const check = protectionAllowed(channel.guild, member, settings);
 
-                if (countExceeded(
-                    protectionCounts.channels,
-                    key,
-                    prot.limit
-                )) {
+                if (!check.allowed) {
 
-                    const member = await getMember(channel.guild, executorId);
+                    const key = `${channel.guild.id}-${executorId}`;
 
-                    await applyPunishment(
-                        member,
-                        prot.action,
-                        `تجاوز حد إنشاء الرومات (${prot.limit})`
-                    );
+                    if (countExceeded(
+                        protectionCounts.channels,
+                        key,
+                        prot.limit
+                    )) {
 
-                    clearCount(protectionCounts.channels, key);
+                        // إزالة الروم المنشأ
+                        await channel.delete(
+                            '[Anti-Nuke] تجاوز حد إنشاء الرومات'
+                        ).catch(() => {});
 
-                    await sendLog(
-                        channel.guild,
-                        'moderation',
-                        '🛡️ Channel Protection',
-                        `<@${executorId}> تجاوز حد إنشاء الرومات (**${prot.limit}**).\n` +
-                        `طبقت العقوبة: **${prot.action}**`
-                    );
+                        if (check.level === 'below') {
+                            await applyPunishment(
+                                member,
+                                prot.action,
+                                `تجاوز حد إنشاء الرومات (${prot.limit})`
+                            );
+                        }
+
+                        clearCount(protectionCounts.channels, key);
+
+                        await sendLog(
+                            channel.guild,
+                            'moderation',
+                            '🛡️ Channel Protection',
+                            `<@${executorId}> تجاوز حد إنشاء الرومات (**${prot.limit}**).\n` +
+                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                            `تم حذف الروم المنشأ${check.level === 'below' ? `\nالعقوبة: **${prot.action}**` : ''}`
+                        );
+                    }
                 }
             }
         }
@@ -5202,6 +5309,51 @@ client.on('channelDelete', async channel => {
         `تم حذف الروم **${channel.name}**.\n` +
         `المسبب: ${executor}`
     );
+
+    // حماية حذف الرومات
+    try {
+
+        const settings = await getSettings(channel.guild.id);
+        ensureProtections(settings);
+        const prot = settings.protections.channels;
+
+        if (prot.enabled) {
+
+            const executorId = await getAuditExecutor(
+                channel.guild,
+                AuditLogEvent.ChannelDelete,
+                channel.id
+            );
+
+            if (executorId && executorId !== client.user.id) {
+
+                const member = await getMember(channel.guild, executorId);
+                const check = protectionAllowed(channel.guild, member, settings);
+
+                if (!check.allowed) {
+
+                    if (check.level === 'below') {
+                        await applyPunishment(
+                            member,
+                            prot.action,
+                            'حذف روم (نوك)'
+                        );
+                    }
+
+                    await sendLog(
+                        channel.guild,
+                        'moderation',
+                        '🛡️ Channel Deletion Protection',
+                        `<@${executorId}> حذف روم **${channel.name}** بدون إذن.\n` +
+                        `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                        (check.level === 'below' ? `العقوبة: **${prot.action}**` : '')
+                    );
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Channel deletion protection error:', error);
+    }
 
 });
 
@@ -5409,33 +5561,40 @@ client.on('guildBanAdd', async ban => {
                 ban.user?.id
             );
 
-            if (executorId) {
+            if (executorId && executorId !== client.user.id) {
 
-                const key = `${ban.guild.id}-${executorId}`;
+                const member = await getMember(ban.guild, executorId);
+                const check = protectionAllowed(ban.guild, member, settings);
 
-                if (countExceeded(
-                    protectionCounts.bans,
-                    key,
-                    prot.limit
-                )) {
+                if (!check.allowed) {
 
-                    const member = await getMember(ban.guild, executorId);
+                    const key = `${ban.guild.id}-${executorId}`;
 
-                    await applyPunishment(
-                        member,
-                        prot.action,
-                        `تجاوز حد الباند (${prot.limit})`
-                    );
+                    if (countExceeded(
+                        protectionCounts.bans,
+                        key,
+                        prot.limit
+                    )) {
 
-                    clearCount(protectionCounts.bans, key);
+                        if (check.level === 'below') {
+                            await applyPunishment(
+                                member,
+                                prot.action,
+                                `تجاوز حد الباند (${prot.limit})`
+                            );
+                        }
 
-                    await sendLog(
-                        ban.guild,
-                        'moderation',
-                        '🛡️ Ban Protection',
-                        `<@${executorId}> تجاوز حد عمليات الحظر (**${prot.limit}**).\n` +
-                        `طبقت العقوبة: **${prot.action}**`
-                    );
+                        clearCount(protectionCounts.bans, key);
+
+                        await sendLog(
+                            ban.guild,
+                            'moderation',
+                            '🛡️ Ban Protection',
+                            `<@${executorId}> تجاوز حد عمليات الحظر (**${prot.limit}**).\n` +
+                            `المستوى: **${check.level === 'equal' ? 'بنفس رتبة البوت' : 'تحت رتبة البوت'}**\n` +
+                            (check.level === 'below' ? `العقوبة: **${prot.action}**` : '')
+                        );
+                    }
                 }
             }
         }
@@ -5814,6 +5973,45 @@ async function executeShortcut(
 
 
     // ==============================================
+    // UNBAN
+    // ==============================================
+
+    if (command === 'unban') {
+
+        const userId =
+            mention?.id ||
+            args.find(x =>
+                /^\d{17,20}$/.test(x)
+            );
+
+        if (!userId) {
+            return message.reply(
+                '❌ اكتب آيدي العضو، مثال: <الاختصار> 123456789012345678'
+            );
+        }
+
+        const banned =
+            await message.guild.bans.fetch(userId)
+                .catch(() => null);
+
+        if (!banned) {
+            return message.reply(
+                '❌ العضو غير محظور.'
+            );
+        }
+
+        await message.guild.bans.remove(
+            userId,
+            `Shortcut بواسطة ${message.author.tag}`
+        );
+
+        return message.reply(
+            `🔓 تم فك حظر العضو **${banned.user.tag || userId}**.`
+        );
+    }
+
+
+    // ==============================================
     // JAIL
     // ==============================================
 
@@ -5856,6 +6054,70 @@ async function executeShortcut(
 
         return message.reply(
             `🔓 تم فك سجن ${mention}.`
+        );
+    }
+
+
+    // ==============================================
+    // ROLE ADD
+    // ==============================================
+
+    if (command === 'role-add') {
+
+        const role =
+            message.mentions.roles.first();
+
+        if (!mention || !role) {
+            return message.reply(
+                '❌ استخدم الاختصار مع منشن العضو والرتبة، مثال: <الاختصار> @عضو @رتبة'
+            );
+        }
+
+        if (role.managed || !role.editable) {
+            return message.reply(
+                `❌ لا أستطيع إعطاء رتبة ${role}.`
+            );
+        }
+
+        await mention.roles.add(
+            role,
+            `Shortcut بواسطة ${message.author.tag}`
+        );
+
+        return message.reply(
+            `🎭 تم إعطاء ${role} لـ ${mention}.`
+        );
+    }
+
+
+    // ==============================================
+    // ROLE REMOVE
+    // ==============================================
+
+    if (command === 'role-remove') {
+
+        const role =
+            message.mentions.roles.first();
+
+        if (!mention || !role) {
+            return message.reply(
+                '❌ استخدم الاختصار مع منشن العضو والرتبة، مثال: <الاختصار> @عضو @رتبة'
+            );
+        }
+
+        if (role.managed || !role.editable) {
+            return message.reply(
+                `❌ لا أستطيع إزالة رتبة ${role}.`
+            );
+        }
+
+        await mention.roles.remove(
+            role,
+            `Shortcut بواسطة ${message.author.tag}`
+        );
+
+        return message.reply(
+            `🎭 تم إزالة ${role} من ${mention}.`
         );
     }
 
@@ -6025,7 +6287,9 @@ async function executeShortcut(
     // ==============================================
 
     return message.reply(
-        '❌ هذا الأمر غير مدعوم في الاختصارات.'
+        '❌ هذا الأمر غير مدعوم في الاختصارات.\n' +
+        `الأمر المستلم: \`${command || '(فارغ)'}\`\n` +
+        'الأوامر المدعومة: ban / unban / kick / jail / unjail / timeout / untimeout / role-add / role-remove / purge / lock / unlock'
     );
 }
 
