@@ -1,0 +1,26 @@
+# ===== أسرار — لا تُرفع أبداً =====
+.env
+.env.*
+!.env.example
+config.json
+
+# ===== مكتبات =====
+node_modules/
+
+# ===== نظام التشغيل واللوق =====
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log
+logs/
+
+# ===== نسخ احتياطية وكاش =====
+.backup/
+.cache/
+.commands-hash
+*.tmp
+*.bak
+
+# ===== حزم الرفع =====
+dist/
+*.zip

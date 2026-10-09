@@ -1,0 +1,52 @@
+# ============================================================
+#  Render Blueprint — Cypher Security
+#  الاستخدام: New → Blueprint → اختر هذا المستودع
+# ============================================================
+services:
+  - type: web
+    name: cypher-security
+    runtime: node
+    plan: starter            # البوت ديسكورد لازم يكون **دايماً شغال**؛ الخطة المجانية توقفه بعد خمول
+    region: oregon
+    branch: main
+    buildCommand: npm install --omit=dev
+    startCommand: node index.js
+    healthCheckPath: /healthz
+
+    envVars:
+      # --- إجباري ---
+      - key: DISCORD_TOKEN
+        sync: false          # Bot Token من Discord Developer Portal > Bot
+      - key: MONGO_URI
+        sync: false          # MongoDB Atlas connection string
+
+      # --- إجباري للداشبورد (Discord OAuth2) ---
+      - key: CLIENT_ID
+        sync: false          # Application ID (من OAuth2 > General)
+      - key: CLIENT_SECRET
+        sync: false          # Client Secret (من OAuth2 > General)
+
+      - key: SESSION_SECRET
+        generateValue: true  # Render يولّد سر عشوائي — لا تحتاج تحطه يدوياً
+
+      # --- اختياري ---
+      - key: DASHBOARD_REDIRECT_URI
+        sync: false
+        # اتركه فاضي: البوت يكتشف رابطه تلقائياً من أول طلب.
+        # لو حطيته، لازم يساوي بالضبط:
+        #   https://<اسم-السيرفيس>.onrender.com/api/auth/callback
+        # ⚠️ هذا الرابط لازم يكون مسجّل في
+        #    Discord Developer Portal > OAuth2 > Redirects (بعد النشر)
+
+      - key: DASHBOARD_URL
+        sync: false
+        # مثال: https://cypher-security.onrender.com
+
+      - key: OWNER_IDS
+        sync: false
+        # يوزرنيم/آيدي مالك البوت، مفصولة بفاصلة
+
+      - key: NODE_VERSION
+        value: "20.11.1"
+      - key: NODE_ENV
+        value: production
