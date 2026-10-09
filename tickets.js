@@ -248,16 +248,62 @@ async function resolveTicketUser(guild, input) {    const raw = String(input || 
     return null;
 }
 
-// هل هذا التفاعل من شخص يقدر يدير أهل التكت؟
-// (فريق / دعم / صاحب التكت نفسه)
+// آيدي مستلم التكت من موضوع القناة (الصيغة الجديدة تخزّن الاسم + الآيدي)
+function ticketClaimerId(channel) {
+    const topic = String(channel?.topic || '');
+    const m = topic.match(/مطالب به:\s*([^|\n]*)/u);
+    if (!m) return null;
+    const id = m[1].match(/\d{15,21}/);
+    return id ? id[0] : null;
+}
+
+function ticketClaimerName(channel) {
+    const topic = String(channel?.topic || '');
+    const m = topic.match(/مطالب به:\s*([^|\n]+)/u);
+    if (!m) return null;
+    return m[1].replace(/\d{15,21}/g, '').trim() || null;
+}
+
+// هل هذا الشخص هو من استلم (طالب) التكت؟
+function isTicketClaimer(interaction) {
+    const userId = String(interaction.user.id);
+
+    const claimerId = ticketClaimerId(interaction.channel);
+    if (claimerId && claimerId === userId) return true;
+
+    // دعم الصيغة القديمة اللي تخزّن اسم المستلم فقط
+    const claimerName = ticketClaimerName(interaction.channel);
+    if (!claimerName) return false;
+
+    const uname = String(interaction.user.username || '').toLowerCase();
+    const tag = String(interaction.user.tag || '').toLowerCase();
+
+    return claimerName.toLowerCase() === uname || claimerName.toLowerCase() === tag;
+}
+
+// أدمن / ستريتر فقط (هذولا مسموح لهم دائماً بكل تكت)
+function isTicketAdminOrStaff(interaction) {
+    return !!(
+        deps.isServerAdmin?.(interaction.member, interaction.guild) ||
+        deps.memberHasStaffRole?.(interaction.member, interaction.guild)
+    );
+}
+
+// صاحب رتبة الدعم المحددة بالتكت (يقدر يستلم، وبعد الاستلام يدير)
+function hasTicketSupportRole(interaction, settings) {
+    const supportRoleId = settings?.tickets?.supportRoleId;
+    return !!(supportRoleId && interaction.member?.roles?.cache?.has(supportRoleId));
+}
+
+// إدارة أهل التكت (إضافة/طرد): أدمن/ستريتر أو مستلم التكت فقط — وليس فاتح التكت
 function canManageTicket(interaction, settings) {
-    const t = settings.tickets || {};
+    return isTicketAdminOrStaff(interaction) || isTicketClaimer(interaction);
+}
 
-    if (deps.isServerAdmin?.(interaction.member, interaction.guild)) return true;
-    if (deps.memberHasStaffRole?.(interaction.member, interaction.guild)) return true;
-    if (t.supportRoleId && interaction.member.roles.cache.has(t.supportRoleId)) return true;
-
-    return interaction.user.id === ticketOwnerId(interaction.channel);
+// عرض أعضاء التكت: أدمن/ستريتر أو مستلم التكت أو فاتح التكت
+function canViewTicketMembers(interaction, settings) {
+    return canManageTicket(interaction, settings)
+        || interaction.user.id === ticketOwnerId(interaction.channel);
 }
 
 // إضافة شخص للتكت
@@ -764,10 +810,7 @@ async function claimTicket(interaction) {
         });
     }
 
-    const isSupport =
-        deps.memberHasStaffRole?.(interaction.member, interaction.guild) ||
-        deps.isServerAdmin?.(interaction.member, interaction.guild) ||
-        (settings.tickets?.supportRoleId && interaction.member.roles.cache.has(settings.tickets.supportRoleId));
+    const isSupport = isTicketAdminOrStaff(interaction) || hasTicketSupportRole(interaction, settings);
 
     if (!isSupport) {
         return interaction.reply({
@@ -781,7 +824,9 @@ async function claimTicket(interaction) {
         .replace(/\s*\|\s*مطالب به:.*$/u, '')
         .trim();
 
-    await interaction.channel.setTopic(`${topic} | مطالب به: ${interaction.user.username}`.slice(0, 1024)).catch(() => {});
+    await interaction.channel.setTopic(
+        `${topic} | مطالب به: ${interaction.user.username} ${interaction.user.id}`.slice(0, 1024)
+    ).catch(() => {});
 
     const claimed = new EmbedBuilder()
         .setColor(0xFEE75C)
@@ -988,13 +1033,20 @@ async function handleSlash(interaction) {
         }
 
         if (sub === 'members') {
+            if (!canViewTicketMembers(interaction, settings)) {
+                return interaction.reply({
+                    content: '❌ عرض أعضاء التكت لصاحب التكت أو مستلمه أو الفريق فقط.',
+                    ephemeral: true
+                });
+            }
+
             await listTicketMembers(interaction);
             return true;
         }
 
         if (!canManageTicket(interaction, settings)) {
             return interaction.reply({
-                content: '❌ رتبة الدعم فقط (أو صاحب التكت) تقدر تضيف أو تطرد أشخاص.',
+                content: '❌ إضافة/طرد الأعضاء لمستلم التكت أو الفريق فقط.',
                 ephemeral: true
             });
         }
@@ -1280,7 +1332,7 @@ async function handleButton(interaction) {
 
         if (!canManageTicket(interaction, settings)) {
             return interaction.reply({
-                content: '❌ رتبة الدعم فقط (أو صاحب التكت) تقدر تدير أهل التكت.',
+                content: '❌ إدارة أعضاء التكت لمستلم التكت أو الفريق فقط.',
                 ephemeral: true
             });
         }
@@ -1295,6 +1347,13 @@ async function handleButton(interaction) {
         if (!isTicketChannel(interaction.channel, settings)) {
             return interaction.reply({
                 content: '❌ هذا الزر يعمل داخل قناة تكت فقط.',
+                ephemeral: true
+            });
+        }
+
+        if (!canViewTicketMembers(interaction, settings)) {
+            return interaction.reply({
+                content: '❌ عرض أعضاء التكت لصاحب التكت أو مستلمه أو الفريق فقط.',
                 ephemeral: true
             });
         }
@@ -1329,7 +1388,7 @@ async function handleModal(interaction) {
 
     if (!canManageTicket(interaction, settings)) {
         return interaction.reply({
-            content: '❌ رتبة الدعم فقط (أو صاحب التكت) تقدر تدير أهل التكت.',
+            content: '❌ إدارة أعضاء التكت لمستلم التكت أو الفريق فقط.',
             ephemeral: true
         });
     }
