@@ -483,6 +483,42 @@ function safeChannelName(channel) {
     return channel?.name ? `#${channel.name}` : 'غير معروف';
 }
 
+function attachmentKind(contentType) {
+    const ct = contentType || '';
+    if (ct.startsWith('image/')) return '🖼️ صورة';
+    if (ct.startsWith('video/')) return '🎬 فيديو';
+    if (ct.startsWith('audio/')) return '🔊 صوت';
+    return '📄 ملف';
+}
+
+function describeMessageMedia(message) {
+    const lines = [];
+
+    const stickers = message?.stickers ? [...message.stickers.values()] : [];
+    if (stickers.length) {
+        lines.push('🧩 ستيكر: ' + stickers.map(s => s.name || 'ستيكر').join(', '));
+    }
+
+    const attachments = message?.attachments ? [...message.attachments.values()] : [];
+    if (attachments.length) {
+        lines.push('📎 المرفقات:');
+        for (const a of attachments) {
+            lines.push(`> ${attachmentKind(a.contentType)} — ${a.name || 'ملف'} — ${a.url}`);
+        }
+    }
+
+    const embedCount = message?.embeds?.length || 0;
+    if (embedCount) lines.push(`🔗 إيمبدات: ${embedCount}`);
+
+    return lines.join('\n');
+}
+
+function firstImageUrl(message) {
+    const attachments = message?.attachments ? [...message.attachments.values()] : [];
+    const img = attachments.find(a => (a.contentType || '').startsWith('image/'));
+    return img?.url || null;
+}
+
 // بيانات كل نوع لوق: اسم واضح + لون ثابت + أيقونة
 const LOG_TYPE_META = {
     voice: { label: 'القنوات الصوتية', color: 0x5865F2, icon: '🔊' },
@@ -495,7 +531,7 @@ const LOG_TYPE_META = {
     protection: { label: 'الحماية', color: 0xE67E22, icon: '🚨' }
 };
 
-async function sendLog(guild, type, title, description, color) {
+async function sendLog(guild, type, title, description, color, extra) {
     try {
         const settings = await GuildSettings.findById(guild.id);
 
@@ -510,17 +546,27 @@ async function sendLog(guild, type, title, description, color) {
         if (!channel || !channel.isTextBased()) return;
 
         const meta = LOG_TYPE_META[type] || { label: type, color: 0x5865F2, icon: '📌' };
+        const guildIcon = guild.iconURL({ size: 128 }) || undefined;
 
         const embed = new EmbedBuilder()
             .setAuthor({
                 name: `${meta.icon}  سجل ${meta.label}`,
-                iconURL: guild.iconURL({ size: 64 }) || undefined
+                iconURL: guildIcon
             })
             .setTitle(title)
-            .setDescription(description)
+            .setDescription(description ? String(description).slice(0, 4000) : '—')
             .setColor(color ?? meta.color)
-            .setFooter({ text: `CYPHER • ${meta.label}` })
+            .setFooter({
+                text: `${meta.label} • ${guild.name}`,
+                iconURL: guildIcon
+            })
             .setTimestamp();
+
+        if (extra?.thumbnail) embed.setThumbnail(extra.thumbnail);
+        if (extra?.image) embed.setImage(extra.image);
+        if (Array.isArray(extra?.fields) && extra.fields.length) {
+            embed.addFields(extra.fields.slice(0, 25));
+        }
 
         await channel.send({ embeds: [embed] }).catch(() => {});
     } catch (err) {
@@ -9195,14 +9241,32 @@ client.on('messageDelete', async message => {
         message.id
     );
 
+    const media = describeMessageMedia(message);
+
+    const lines = [
+        `👤 العضو: ${message.author ? `<@${message.author.id}> (${message.author.tag || message.author.username})` : 'غير معروف'}`,
+        `📁 الروم: ${message.channel || 'غير معروف'}`
+    ];
+
+    if (message.content) {
+        lines.push(`💬 المحتوى:\n${message.content.slice(0, 1000)}`);
+    }
+    if (media) lines.push(media);
+    if (!message.content && !media) {
+        lines.push('💬 المحتوى: غير متوفر (رسالة غير محفوظة بالمخزن)');
+    }
+    lines.push(`🗑️ المسبب: ${executor}`);
+
     await sendLog(
         message.guild,
         'message',
-        '🗑️ Message Deleted',
-        `👤 العضو: ${message.author || 'غير معروف'}\n` +
-        `📁 الروم: ${message.channel}\n` +
-        `💬 المحتوى: ${message.content || 'غير متوفر'}\n` +
-        `🗑️ المسبب: ${executor}`
+        '🗑️ حذف رسالة',
+        lines.join('\n'),
+        undefined,
+        {
+            thumbnail: message.author?.displayAvatarURL?.({ size: 128 }) || undefined,
+            image: firstImageUrl(message) || undefined
+        }
     );
 
 });
@@ -9219,10 +9283,12 @@ client.on(
         if (!oldMessage.guild) return;
         if (oldMessage.author?.bot) return;
 
-        if (
-            oldMessage.content ===
-            newMessage.content
-        ) return;
+        const contentChanged = oldMessage.content !== newMessage.content;
+        const mediaChanged =
+            (oldMessage.attachments?.size || 0) !== (newMessage.attachments?.size || 0) ||
+            (oldMessage.stickers?.size || 0) !== (newMessage.stickers?.size || 0);
+
+        if (!contentChanged && !mediaChanged) return;
 
         const executor = await executorMention(
             oldMessage.guild,
@@ -9230,15 +9296,31 @@ client.on(
             oldMessage.id
         );
 
+        const media = describeMessageMedia(newMessage);
+
+        const lines = [
+            `👤 العضو: ${oldMessage.author ? `<@${oldMessage.author.id}> (${oldMessage.author.tag || oldMessage.author.username})` : 'غير معروف'}`,
+            `📁 الروم: ${oldMessage.channel || 'غير معروف'}`,
+            `🔗 الرابط: ${newMessage.url || '—'}`
+        ];
+
+        if (contentChanged) {
+            lines.push('', `قبل:\n${oldMessage.content || 'فارغ'}`);
+            lines.push('', `بعد:\n${newMessage.content || 'فارغ'}`);
+        }
+        if (media) lines.push('', media);
+        lines.push('', `✏️ المسبب: ${executor}`);
+
         await sendLog(
             oldMessage.guild,
             'message',
-            '✏️ Message Edited',
-            `👤 العضو: ${oldMessage.author}\n` +
-            `📁 الروم: ${oldMessage.channel}\n\n` +
-            `قبل:\n${oldMessage.content || 'فارغ'}\n\n` +
-            `بعد:\n${newMessage.content || 'فارغ'}\n\n` +
-            `✏️ المسبب: ${executor}`
+            '✏️ تعديل رسالة',
+            lines.join('\n'),
+            undefined,
+            {
+                thumbnail: oldMessage.author?.displayAvatarURL?.({ size: 128 }) || undefined,
+                image: firstImageUrl(newMessage) || undefined
+            }
         );
     }
 );
@@ -9408,6 +9490,33 @@ client.on('messageCreate', async message => {
 
                 return;
             }
+        }
+
+        // ==============================================
+        // 💬 روم الفيدباك: تُمسح رسالة العضو وتُنشر إيمبد
+        // ==============================================
+
+        if (await feedback.handleMessage(message)) return;
+
+        // ==============================================
+        // 📨 سجل الرسائل اللي فيها وسائط (صورة / فيديو / ستيكر / ملف)
+        // ==============================================
+
+        if ((message.attachments?.size || 0) > 0 || (message.stickers?.size || 0) > 0) {
+            await sendLog(
+                message.guild,
+                'message',
+                '📨 رسالة جديدة',
+                `👤 العضو: ${message.author} (${message.author.id})\n` +
+                `📁 الروم: ${message.channel}\n` +
+                `🔗 الرابط: ${message.url}\n\n` +
+                describeMessageMedia(message),
+                undefined,
+                {
+                    thumbnail: message.author.displayAvatarURL?.({ size: 128 }) || undefined,
+                    image: firstImageUrl(message) || undefined
+                }
+            );
         }
 
         const settings =

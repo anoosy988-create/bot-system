@@ -27,6 +27,17 @@ const feedbackSchema = new mongoose.Schema({
     userId: { type: String, required: true },
     subject: { type: String, default: null },
     body: { type: String, required: true },
+    rating: { type: Number, default: 0 },
+    ratedBy: { type: String, default: null },
+    attachments: {
+        type: [{
+            url: { type: String, required: true },
+            name: { type: String, default: null },
+            contentType: { type: String, default: null }
+        }],
+        default: []
+    },
+    stickers: { type: [String], default: [] },
     status: { type: String, default: 'open' },
     replies: {
         type: [{
@@ -69,13 +80,55 @@ function log(guild, title, description) {
     } catch {}
 }
 
+function ratingText(rating) {
+    const r = Math.max(0, Math.min(5, Number(rating) || 0));
+    return '⭐'.repeat(r) + '☆'.repeat(5 - r);
+}
+
+function memberOf(fb) {
+    const guild = client?.guilds?.cache?.get(fb.guildId);
+    if (!guild) return null;
+    return guild.members.cache.get(fb.userId)
+        || client.users.cache.get(fb.userId)
+        || null;
+}
+
 function buildEmbed(fb) {
+    const member = memberOf(fb);
+    const displayName = member?.displayName || member?.globalName || member?.username || 'عضو';
+    const avatar = member?.displayAvatarURL?.({ size: 128 }) || undefined;
+    const rating = Number(fb.rating) || 0;
+    const attachments = fb.attachments || [];
+    const stickers = fb.stickers || [];
+
     const embed = new EmbedBuilder()
         .setTitle('💬 فيدباك')
         .setColor(fb.status === 'answered' ? 0x57F287 : 0xFEE75C)
-        .setAuthor({ name: 'عضو' })
-        .setDescription(`**${fb.subject || 'بدون عنوان'}**\n\n${fb.body}`)
-        .setFooter({ text: `الحالة: ${fb.status === 'answered' ? 'تم الرد' : 'بانتظار الرد'}` });
+        .setAuthor({ name: displayName, iconURL: avatar });
+
+    if (avatar) embed.setThumbnail(avatar);
+
+    let desc = `**${fb.subject || 'بدون عنوان'}**\n\n${fb.body}`;
+
+    if (attachments.length) {
+        desc += '\n\n📎 **المرفقات:**\n' + attachments
+            .map(a => `> ${a.name || 'ملف'} — ${a.url}`)
+            .join('\n');
+    }
+
+    if (stickers.length) {
+        desc += '\n\n🧩 **ستيكر:** ' + stickers.join(', ');
+    }
+
+    embed.setDescription(desc.slice(0, 4000));
+
+    const image = attachments.find(a => (a.contentType || '').startsWith('image/'));
+    if (image) embed.setImage(image.url);
+
+    embed.addFields(
+        { name: '⭐ التقييم', value: ratingText(rating), inline: true },
+        { name: '📌 الحالة', value: fb.status === 'answered' ? '✅ تم الرد' : '⏳ بانتظار الرد', inline: true }
+    );
 
     if ((fb.replies || []).length) {
         embed.addFields({
@@ -90,6 +143,24 @@ function buildEmbed(fb) {
     return embed;
 }
 
+function starRow(fb) {
+    const fbId = fb._id ? fb._id.toString() : fb.id;
+    const rating = Number(fb.rating) || 0;
+    const row = new ActionRowBuilder();
+
+    for (let i = 1; i <= 5; i++) {
+        row.addComponents(
+            new ButtonBuilder()
+                .setCustomId(`feedback_rate:${fbId}:${i}`)
+                .setLabel(String(i))
+                .setEmoji('⭐')
+                .setStyle(i <= rating ? ButtonStyle.Success : ButtonStyle.Secondary)
+        );
+    }
+
+    return row;
+}
+
 function actionRow(fbId) {
     return new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -98,6 +169,11 @@ function actionRow(fbId) {
             .setEmoji('💬')
             .setStyle(ButtonStyle.Primary)
     );
+}
+
+function componentsFor(fb) {
+    const fbId = fb._id ? fb._id.toString() : fb.id;
+    return [starRow(fb), actionRow(fbId)];
 }
 
 // ======================================================
@@ -170,6 +246,7 @@ async function handleSlash(interaction) {
 
     const lines = list.map(fb =>
         `**${fb.subject || 'بدون عنوان'}** — <@${fb.userId}> · ` +
+        `${ratingText(fb.rating)} · ` +
         `${fb.status === 'answered' ? '✅ تم الرد' : '⏳ بانتظار'} · \`${(fb.body || '').slice(0, 60)}\``
     );
 
@@ -189,6 +266,50 @@ async function handleSlash(interaction) {
 // ======================================================
 
 async function handleButton(interaction) {
+    // ⭐ تقييم الفيدباك بالنجوم (صاحب الفيدباك أو الإدارة)
+    if (interaction.customId.startsWith('feedback_rate:')) {
+        const [, fbId, starRaw] = interaction.customId.split(':');
+        const stars = Number(starRaw);
+
+        const fb = await Feedback.findById(fbId).catch(() => null);
+
+        if (!fb) {
+            await interaction.reply({ content: '❌ الفيدباك مو موجود.', ephemeral: true });
+            return true;
+        }
+
+        const isAuthor = interaction.user.id === fb.userId;
+
+        if (!isAuthor && !allowed(interaction)) {
+            await interaction.reply({ content: '❌ صاحب الفيدباك أو الإدارة فقط يقيّمون.', ephemeral: true });
+            return true;
+        }
+
+        fb.rating = stars;
+        fb.ratedBy = interaction.user.id;
+        await fb.save().catch(() => {});
+
+        const guild = interaction.guild;
+        const channel = guild.channels.cache.get(fb.channelId)
+            || await guild.channels.fetch(fb.channelId).catch(() => null);
+
+        if (channel && fb.messageId) {
+            const target = await channel.messages.fetch(fb.messageId).catch(() => null);
+            if (target) {
+                await target.edit({
+                    embeds: [buildEmbed(fb.toObject())],
+                    components: componentsFor(fb.toObject())
+                }).catch(() => {});
+            }
+        }
+
+        await interaction.reply({
+            content: `✅ تم تسجيل تقييمك: ${'⭐'.repeat(stars)} (${stars}/5)`,
+            ephemeral: true
+        });
+        return true;
+    }
+
     if (!interaction.customId.startsWith('feedback_reply:')) return false;
 
     if (!allowed(interaction)) {
@@ -249,7 +370,7 @@ async function handleModal(interaction) {
 
         const msg = await channel.send({
             embeds: [buildEmbed(fb.toObject())],
-            components: [actionRow(fb._id.toString())]
+            components: componentsFor(fb.toObject())
         }).catch(() => null);
 
         if (msg) {
@@ -302,7 +423,10 @@ async function handleModal(interaction) {
                 await target.reply({ content }).catch(async () => {
                     await channel.send({ content }).catch(() => {});
                 });
-                await target.edit({ embeds: [buildEmbed(fb.toObject())] }).catch(() => {});
+                await target.edit({
+                    embeds: [buildEmbed(fb.toObject())],
+                    components: componentsFor(fb.toObject())
+                }).catch(() => {});
             } else {
                 await channel.send({ content }).catch(() => {});
             }
@@ -315,10 +439,64 @@ async function handleModal(interaction) {
     return false;
 }
 
+// ======================================================
+// رسائل روم الفيدباك: تُمسح وتُنشر من البوت كإيمبد
+// ======================================================
+
+async function handleMessage(message) {
+    try {
+        if (!message.guild || message.author?.bot || message.system) return false;
+
+        const settings = await getSettingsSafe(message.guild.id);
+        if (!settings?.feedbackChannelId) return false;
+        if (message.channel.id !== settings.feedbackChannelId) return false;
+
+        const body = (message.content || '').trim();
+        const attachments = message.attachments ? [...message.attachments.values()] : [];
+        const stickers = message.stickers ? [...message.stickers.values()] : [];
+
+        if (!body && !attachments.length && !stickers.length) return false;
+
+        const deleted = await message.delete().then(() => true).catch(() => false);
+        if (!deleted) return false;
+
+        const fb = await Feedback.create({
+            guildId: message.guild.id,
+            channelId: message.channel.id,
+            userId: message.author.id,
+            subject: null,
+            body: body || '(مرفق بدون نص)',
+            attachments: attachments.map(a => ({
+                url: a.url,
+                name: a.name || null,
+                contentType: a.contentType || null
+            })),
+            stickers: stickers.map(s => s.name || s.id)
+        });
+
+        const msg = await message.channel.send({
+            embeds: [buildEmbed(fb.toObject())],
+            components: componentsFor(fb.toObject())
+        }).catch(() => null);
+
+        if (msg) {
+            fb.messageId = msg.id;
+            await fb.save().catch(() => {});
+        }
+
+        log(message.guild, '💬 فيدباك جديد', `فيدباك من <@${message.author.id}> في ${message.channel}`);
+        return true;
+    } catch (err) {
+        console.error('feedback.handleMessage:', err);
+        return false;
+    }
+}
+
 module.exports = {
     init,
     handleSlash,
     handleButton,
     handleModal,
+    handleMessage,
     Feedback
 };
