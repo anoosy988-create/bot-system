@@ -110,6 +110,7 @@ function isSnowflake(value) {
 
 const sessions = new Map();                    // token -> { userId, createdAt }
 const serversCache = new Map();                // userId -> { guilds, cachedAt }
+const serversInflight = new Map();             // userId -> Promise (منع الجلب المتوازي المكرر)
 const oauthStates = new Map();                 // state -> { createdAt }
 const accessCache = new Map();                 // userId -> { revoked, at }
 const ACCESS_CACHE_TTL = 15 * 1000;            // 15 ثانية
@@ -558,11 +559,27 @@ module.exports = function setupDashboard(app, deps) {
     // HELPERS
     // ======================================================
 
-    async function getUserGuildMember(guild, userId) {
+    // مهلة قاسية لأي وعد (نداء ديسكورد): لا نخلي طلب معلّق يوقف كل شي
+    function withTimeout(promise, ms, label) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`timeout: ${label}`)), ms);
+            promise.then(
+                value => { clearTimeout(timer); resolve(value); },
+                err => { clearTimeout(timer); reject(err); }
+            );
+        });
+    }
+
+    // allowFetch=false → من الكاش فقط (بدون أي نداء لديسكورد)
+    async function getUserGuildMember(guild, userId, allowFetch = true) {
         try {
             let member = guild.members.cache.get(userId);
-            if (!member) {
-                member = await guild.members.fetch({ user: userId, cache: true, force: false });
+            if (!member && allowFetch) {
+                member = await withTimeout(
+                    guild.members.fetch({ user: userId, cache: true, force: false }),
+                    6000,
+                    `members.fetch ${guild.id}`
+                );
             }
             return member || null;
         } catch {
@@ -626,10 +643,10 @@ module.exports = function setupDashboard(app, deps) {
     }
 
     // هل المستخدم يقدر يشوف/يدير هذا السيرفر؟
-    async function canManage(userId, guild) {
+    async function canManage(userId, guild, allowFetch = true) {
         if (await isDashboardRevoked(userId)) return false;
 
-        const member = await getUserGuildMember(guild, userId);
+        const member = await getUserGuildMember(guild, userId, allowFetch);
         if (!member) return false;
 
         return isServerAdmin(member, guild) || memberHasStaffRole(member, guild);
@@ -642,29 +659,43 @@ module.exports = function setupDashboard(app, deps) {
         return Boolean(guild?.ownerId) && String(guild.ownerId) === String(userId);
     }
 
-    // جلب السيرفرات المجوّزة للمستخدم، وحفظها في قاعدة البيانات (كاش دائم)
-    async function fetchAccessibleServers(userId) {
-        const guilds = [];
-        for (const guild of client.guilds.cache.values()) {
-            const ok = await canManage(userId, guild);
-            if (!ok) continue;
+    // تنفيذ متوازٍ محدود العدد (نتجنّب ضرب rate-limit لديسكورد)
+    async function mapLimit(items, limit, fn) {
+        const out = new Array(items.length);
+        let cursor = 0;
 
-            guilds.push({
-                id: guild.id,
-                name: guild.name,
-                icon: guild.iconURL({ size: 256 }),
-                banner: guild.bannerURL({ size: 256 }),
-                memberCount: guild.memberCount,
-                ownerId: guild.ownerId,
-                verified: guild.verified,
-                boostTier: guild.premiumTier,
-                boostCount: guild.premiumSubscriptionCount,
-                createdAt: guild.createdTimestamp
-            });
-        }
+        const workers = Array.from(
+            { length: Math.max(1, Math.min(limit, items.length)) },
+            async () => {
+                while (cursor < items.length) {
+                    const index = cursor++;
+                    out[index] = await fn(items[index], index);
+                }
+            }
+        );
 
-        serversCache.set(userId, { guilds, cachedAt: Date.now() });
+        await Promise.all(workers);
+        return out;
+    }
 
+    // شكل السيرفر الموحّد اللي ترجعه الواجهة
+    function serverEntry(guild) {
+        return {
+            id: guild.id,
+            name: guild.name,
+            icon: guild.iconURL({ size: 256 }),
+            banner: guild.bannerURL({ size: 256 }),
+            memberCount: guild.memberCount,
+            ownerId: guild.ownerId,
+            verified: guild.verified,
+            boostTier: guild.premiumTier,
+            boostCount: guild.premiumSubscriptionCount,
+            createdAt: guild.createdTimestamp
+        };
+    }
+
+    // حفظ السيرفرات في قاعدة البيانات (كاش دائم)
+    async function saveServersToDb(userId, guilds) {
         try {
             await DashboardUser.updateOne(
                 { userId },
@@ -679,41 +710,147 @@ module.exports = function setupDashboard(app, deps) {
                 ).catch(() => {});
             }
         }
+    }
 
-        return guilds;
+    // جلب السيرفرات المجوّزة للمستخدم، وحفظها في قاعدة البيانات (كاش دائم)
+    // candidateIds: آيديات السيرفرات اللي المستخدم عضو فيها (من OAuth) — نفحصها
+    // بس، بدل ما نمرّ على كل سيرفرات البوت ونسوي members.fetch لكل واحد.
+    async function fetchAccessibleServers(userId, candidateIds = null) {
+        // لو فيه جلب شغّال لنفس المستخدم، ننتظر نفس النتيجة بدل ما نبدأ جلب ثاني
+        const running = serversInflight.get(userId);
+        if (running) return running;
+
+        const task = (async () => {
+            const startedAt = Date.now();
+
+            if (await isDashboardRevoked(userId)) {
+                serversCache.set(userId, { guilds: [], cachedAt: Date.now() });
+                return [];
+            }
+
+            // عندنا قائمة سيرفرات المستخدم بالتحديد؟ نفحصها بعمق (مع جلب العضو).
+            // ما عندنا (جلسة قديمة)؟ نفحص كل سيرفرات البوت من الكاش فقط — بدون شبكة.
+            const hasCandidates = Array.isArray(candidateIds) && candidateIds.length > 0;
+            const candidates = hasCandidates
+                ? candidateIds.map(id => client.guilds.cache.get(String(id))).filter(Boolean)
+                : [...client.guilds.cache.values()];
+
+            const checked = await mapLimit(candidates, hasCandidates ? 16 : 32, async guild => {
+                const ok = await canManage(userId, guild, hasCandidates);
+                return ok ? serverEntry(guild) : null;
+            });
+
+            const guilds = checked.filter(Boolean);
+
+            serversCache.set(userId, { guilds, cachedAt: Date.now() });
+            await saveServersToDb(userId, guilds);
+
+            console.log(
+                `[panel] ✅ جلب السيرفرات ${userId}: ${guilds.length} من ${candidates.length} مرشّح خلال ${Date.now() - startedAt}ms`
+            );
+
+            return guilds;
+        })();
+
+        serversInflight.set(userId, task);
+
+        try {
+            return await task;
+        } finally {
+            serversInflight.delete(userId);
+        }
     }
 
     // تحديث في الخلفية حتى لا ينتظر المستخدم عندما يكون الكاش جاهزاً
-    async function refreshServersInBackground(userId) {
+    async function refreshServersInBackground(userId, candidateIds = null) {
         try {
-            await fetchAccessibleServers(userId);
+            await fetchAccessibleServers(userId, candidateIds);
         } catch {}
+    }
+
+    // فلترة سريعة للكاش: نتأكد بس إن البوت لسا داخل السيرفر — بدون فحص صلاحيات
+    // لكل سيرفر (كان يسوي members.fetch ويعطّل كل طلب). الفحص الكامل يصير عند
+    // التحديث بالخلفية، وأي إجراء فعلي محمي بـ canManage داخل requireGuild.
+    async function filterCachedServers(userId, entries) {
+        return entries.filter(entry => client.guilds.cache.has(String(entry.id)));
+    }
+
+    // آيديات السيرفرات المرشّحة من الجلسة: القائمة الكاملة (guildIds) وإلا قائمة
+    // الأدمن المحفوظة (للجلسات القديمة) — نتجنّب المرور على كل سيرفرات البوت.
+    function sessionCandidateIds(s) {
+        if (Array.isArray(s?.guildIds) && s.guildIds.length) return s.guildIds;
+        if (Array.isArray(s?.guilds) && s.guilds.length) return s.guilds.map(g => g.id);
+        return null;
+    }
+
+    // قائمة فورية من الذاكرة — بدون أي نداء لديسكورد إطلاقاً:
+    // 1) سيرفرات OAuth اللي فيها المستخدم Administrator أو مالك (نجيبتها وقت الدخول)
+    // 2) سيرفرات البوت اللي عضو المستخدم موجودة بكاش الأعضاء وعنده أدمن أو ستريتر
+    function instantAccessibleServers(userId, session) {
+        const uid = String(userId || session?.userId || '');
+        const out = [];
+        const seen = new Set();
+
+        const push = guild => {
+            if (!guild || seen.has(guild.id)) return;
+            seen.add(guild.id);
+            out.push(serverEntry(guild));
+        };
+
+        for (const g of session?.guilds || []) {
+            if (!(g.owner === true || g.hasAdministrator === true)) continue;
+            push(client.guilds.cache.get(String(g.id)));
+        }
+
+        for (const guild of client.guilds.cache.values()) {
+            if (seen.has(guild.id)) continue;
+            const member = guild.members.cache.get(uid);
+            if (!member) continue;
+            if (isServerAdmin(member, guild) || memberHasStaffRole(member, guild)) push(guild);
+        }
+
+        return out;
     }
 
     // لائحة السيرفرات المسموح للمستخدم إدارتها:
     // 1) إذا كان بالذاكرة (30 دقيقة) -> فوراً
     // 2) إلا إذا لُفيت له من قبل (قاعدة البيانات) -> فوراً + تحديث بالخلفية
-    // 3) غير ذلك -> يجلب ويفحص ويحفظ أول مرة
-    async function filterCachedServers(userId, entries) {
-        const allowed = [];
-        for (const entry of entries) {
-            const guild = client.guilds.cache.get(entry.id);
-            if (guild && await canManage(userId, guild)) allowed.push(entry);
-        }
-        return allowed;
-    }
-
-    async function accessibleServers(userId, forceRefresh = false) {
+    // 3) غير ذلك -> قائمة فورية من الذاكرة + فحص كامل بالخلفية
+    async function accessibleServers(userId, forceRefresh = false, session = null) {
         const cached = serversCache.get(userId);
         if (!forceRefresh && cached && cached.guilds.length && Date.now() - cached.cachedAt < SERVERS_CACHE_TTL) {
-            const guilds = await filterCachedServers(userId, cached.guilds);
-            if (guilds.length !== cached.guilds.length) {
-                serversCache.set(userId, { guilds, cachedAt: Date.now() });
-            }
-            return guilds;
+            return filterCachedServers(userId, cached.guilds);
         }
 
-        return fetchAccessibleServers(userId);
+        const candidateIds = sessionCandidateIds(session);
+
+        // الكاش الدائم: أول مرة تُحفظ بقاعدة البيانات، وبعدها نرجّعها فوراً ونحدّث بالخلفية
+        if (!forceRefresh) {
+            try {
+                const row = await DashboardUser.findOne({ userId }).lean();
+                const saved = Array.isArray(row?.guilds) ? row.guilds : [];
+                if (saved.length) {
+                    const guilds = filterCachedServers(userId, saved);
+                    serversCache.set(userId, { guilds: saved, cachedAt: Date.now() });
+                    refreshServersInBackground(userId, candidateIds);
+                    return guilds;
+                }
+            } catch {}
+        }
+
+        // أول مرة (ولا كاش): نرجّع فوراً من الذاكرة ونكمل الفحص الكامل بالخلفية
+        if (!forceRefresh) {
+            const instant = instantAccessibleServers(userId, session);
+            if (instant.length) {
+                serversCache.set(userId, { guilds: instant, cachedAt: Date.now() });
+                saveServersToDb(userId, instant).catch(() => {});
+                refreshServersInBackground(userId, candidateIds);
+                return instant;
+            }
+        }
+
+        // ما فيه شي فوري: ننتظر الفحص الكامل (أو المستخدم ضغط "تحديث").
+        return fetchAccessibleServers(userId, candidateIds);
     }
 
     // مالك الداشبورد: OWNER_IDS (مفصولة بفاصلة) أو OWNER_ID
@@ -1302,11 +1439,14 @@ module.exports = function setupDashboard(app, deps) {
 
         // ===== 3) جلب قائمة السيرفرات من /users/@me/guilds ثم الفلترة بصلاحية Administrator =====
         let oauthGuilds = [];
+        let oauthGuildIds = [];
         try {
             const raw = await discordRequest(`${DISCORD_API}/users/@me/guilds`, {
                 headers: { Authorization: `Bearer ${oauth.access_token}` }
             });
             oauthGuilds = filterAdminGuilds(raw);
+            // نحفظ كل سيرفرات المستخدم (مو الأدمن بس) كمرشّحين للفحص لاحقاً
+            oauthGuildIds = Array.isArray(raw) ? raw.map(g => String(g.id)) : [];
         } catch (e) {
             notifyFailedLogin(req, `تعذّر جلب السيرفرات: ${safeLogValue(e.message, 200)}`).catch(() => {});
             // ما نمنع الدخول — الفلترة الحقيقية تتم على بيانات البوت
@@ -1327,6 +1467,7 @@ module.exports = function setupDashboard(app, deps) {
             tokenType: oauth.token_type || 'Bearer',
             scopes: oauth.scope || OAUTH_SCOPES,
             guilds: oauthGuilds,
+            guildIds: oauthGuildIds,
             guildsFetchedAt: Date.now(),
             loggedInAt: Date.now()
         };
@@ -1338,7 +1479,7 @@ module.exports = function setupDashboard(app, deps) {
         notifyDashboardLogin(req, userId, account).catch(() => {});
 
         // جهّز السيرفرات لحساب المستخدم أول ما يدخل (بدون ما يستنى)
-        refreshServersInBackground(userId);
+        refreshServersInBackground(userId, oauthGuildIds);
 
         res.setHeader('Set-Cookie', sessionCookie(req, token, Math.floor(SESSION_TTL / 1000)));
         return res.redirect('/#home');
@@ -1406,7 +1547,7 @@ module.exports = function setupDashboard(app, deps) {
         }
 
         // سيرفرات البوت الحقيقية (المصدر الأساسي للصلاحيات)
-        const live = await accessibleServers(s.userId, req.query.refresh === '1');
+        const live = await accessibleServers(s.userId, req.query.refresh === '1', data || s);
 
         // سيرفرات المستخدم من ديسكورد (متجددة كل 30 دقيقة) — تشمل اللي البوت مو داخلها
         const oauthGuilds = await sessionOAuthGuilds(req, req.query.refresh === '1');
@@ -1483,7 +1624,7 @@ module.exports = function setupDashboard(app, deps) {
         if (!me) return;
 
         const force = req.query.refresh === '1';
-        const live = await accessibleServers(me.userId, force);
+        const live = await accessibleServers(me.userId, force, req.session?.user || me);
         const oauthGuilds = await sessionOAuthGuilds(req, force);
         const guilds = mergeUserServers(live, oauthGuilds);
 
