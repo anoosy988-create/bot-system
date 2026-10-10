@@ -1273,7 +1273,11 @@ const PROTECTION_METRICS = {
     spam: [
         { key: 'messages', label: 'عدد الرسائل' },
         { key: 'length', label: 'أقصى طول رسالة' },
-        { key: 'repeat', label: 'تكرار نفس الحرف ورا بعض' }
+        { key: 'repeat', label: 'تكرار نفس الحرف ورا بعض' },
+        { key: 'mentions', label: 'أقصى منشنات بالرسالة' },
+        { key: 'spaces', label: 'أقصى مسافات متتالية' },
+        { key: 'bigtext', label: 'أقصى نسبة خط كبير (%)' },
+        { key: 'files', label: 'أقصى عدد ملفات بالرسالة' }
     ],
     webhooks: [
         { key: 'create', label: 'إنشاء الويب هوك' },
@@ -1369,6 +1373,43 @@ function collectScamConfig() {
     const out = { channelIds };
     for (const rule of ['onTalk', 'onImage', 'onLink']) {
         out[rule] = !!document.querySelector(`[data-scam-rule="${rule}"]`)?.checked;
+    }
+    return out;
+}
+
+// 🧩 قواعد السبام الإضافية: يطفّي/يشغّل كل نوع رصد لحاله
+const SPAM_RULE_ROWS = [
+    { key: 'onMentions', label: '👥 منشنات كثيرة', hint: 'أكثر من 6 منشنات برسالة واحدة' },
+    { key: 'onSpaces', label: '🕳️ مسافات متتالية', hint: 'أكثر من 10 مسافات ورا بعض (حماية التفليش)' },
+    { key: 'onBigText', label: '🔠 تكبير الخط', hint: 'أكثر من 60% من الرسالة أحرف كبيرة' },
+    { key: 'onFiles', label: '📎 ملفات كثيرة', hint: 'أكثر من 4 ملفات برسالة واحدة' },
+    { key: 'onLinks', label: '🔗 روابط خارجية', hint: 'أي رابط http/https' },
+    { key: 'onInvites', label: '🎫 دعوات سيرفرات', hint: 'أي رابط دعوة discord.gg' }
+];
+
+function spamProtectionBlockHTML(conf) {
+    const on = k => conf[k] !== false;
+    return `
+        <div class="scam-block" data-spam-block>
+            <div class="scam-block-title">🧩 قواعد السبام <small>فعّل أو عطّل كل قاعدة — حدّها وأقصى قيمة من الخانات اللي فوق</small></div>
+            <div class="scam-rules">
+                ${SPAM_RULE_ROWS.map(r => `
+                    <label class="scam-rule ${on(r.key) ? 'on' : ''}" data-scam-rule-row="${r.key}">
+                        <input type="checkbox" data-spam-rule="${r.key}" ${on(r.key) ? 'checked' : ''}>
+                        <div>
+                            <b>${r.label}</b>
+                            <small>${r.hint}</small>
+                        </div>
+                    </label>`).join('')}
+            </div>
+        </div>`;
+}
+
+function collectSpamConfig() {
+    const out = {};
+    for (const r of SPAM_RULE_ROWS) {
+        const box = document.querySelector(`[data-spam-rule="${r.key}"]`);
+        if (box) out[r.key] = box.checked;
     }
     return out;
 }
@@ -1603,6 +1644,7 @@ function protectionCardHTML(typeKey, conf) {
                 ${metrics.length ? metrics.map(m => metricRowHTML(typeKey, m.key, m.label, conf)).join('') : ''}
                 ${typeKey === 'invites' ? inviteProtectionBlockHTML(conf) : ''}
                 ${typeKey === 'scams' ? scamProtectionBlockHTML(conf) : ''}
+                ${typeKey === 'spam' ? spamProtectionBlockHTML(conf) : ''}
             </div>
         </div>`;
 }
@@ -1818,6 +1860,12 @@ function collectProtectionData() {
         Object.assign(payload.scams, collectScamConfig());
     }
 
+    // 🧩 قواعد السبام: تفعيل/إيقاف كل رصد لحاله
+    if (document.querySelector('[data-spam-block]')) {
+        if (!payload.spam) payload.spam = { metrics: {}, metricActions: {} };
+        Object.assign(payload.spam, collectSpamConfig());
+    }
+
     return payload;
 }
 
@@ -1872,6 +1920,18 @@ function refreshImagePreviews() {
         box.classList.remove('ok', 'err');
 
         if (!url) { box.innerHTML = ''; input.style.borderColor = ''; return; }
+
+        // الصور المرفوعة من الداشبورد نفسها (مسار محلي) تعمل مباشرة
+        if (url.startsWith('/uploads/')) {
+            input.style.borderColor = '';
+            box.classList.add('ok');
+            box.innerHTML =
+                '<img src="' + escapeHtml(url) + '" alt="معاينة" loading="lazy" ' +
+                'onerror="this.parentNode.classList.remove(\'ok\');this.parentNode.classList.add(\'err\');' +
+                'this.parentNode.textContent=\'❌ الصورة ضاعت من المخزن — ارفعها من جديد\'">' +
+                '<span>✅ صورة مرفوعة من الداشبورد</span>';
+            return;
+        }
 
         if (!/^https?:\/\//i.test(url)) {
             box.classList.add('err');
@@ -1928,8 +1988,13 @@ function renderWelcome() {
                 </select>
             </div>
             <div class="form-field" style="margin-bottom:12px">
-                <label>رسالة الترحيب (المتغيرات: {user} {username} {tag} {count} {server} {id})</label>
+                <label>رسالة الترحيب <small style="opacity:.7">(انقر على أي متغير لإدراجه)</small></label>
                 <textarea id="w-message">${escapeHtml(w.message || '')}</textarea>
+                <div class="w-var-chips">
+                    ${[['{user}', 'منشن العضو'], ['{username}', 'اسم العضو'], ['{tag}', 'الاسم + اللقب'], ['{count}', 'عدد الأعضاء'], ['{server}', 'اسم السيرفر'], ['{id}', 'آيدي العضو']].map(([v, label]) =>
+                        `<button type="button" class="var-chip" data-action="insert-welcome-var" data-var="${v}">${v} <small>${label}</small></button>`
+                    ).join('')}
+                </div>
             </div>
             <div class="switch-row">
                 <div class="txt">
@@ -1943,11 +2008,17 @@ function renderWelcome() {
             </div>
             <div class="form-field" style="margin-top:12px">
                 <label>صورة ترحيبية خاصة بك (اختياري — إن وُضعت تحل محل البطاقة)</label>
-                <input id="w-image" placeholder="https://i.imgur.com/....png" value="${escapeHtml(w.image || '')}">
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+                    <button type="button" class="btn btn-ghost btn-sm" data-action="welcome-image-pick">📁 اختر صورة من جهازك</button>
+                    <input type="file" id="w-image-file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
+                    <span class="small" id="w-image-status" style="opacity:.85"></span>
+                    ${w.image ? `<button type="button" class="btn btn-danger btn-sm" data-action="welcome-image-remove">🗑️ حذف الصورة</button>` : ''}
+                </div>
+                <input id="w-image" placeholder="أو ضع رابط مباشر https://....png" value="${escapeHtml(w.image || '')}">
                 <div class="img-preview" id="w-image-prev"></div>
                 <small class="form-hint">
-                    لازم <b>رابط مباشر</b> للصورة (.png / .jpg / .gif / .webp).
-                    تقدر ترفع الصورة كمرفق بالأمر: <code>/welcome image set</code>
+                    تقدر ترفع الصورة من جهازك بالزر فوق، أو تضع <b>رابط مباشر</b> (.png / .jpg / .gif / .webp).
+                    أو بالأمر: <code>/welcome image set file:📎</code>
                 </small>
             </div>
             <div style="margin-top:14px">
@@ -1977,6 +2048,76 @@ async function saveWelcome() {
     } catch (e) {
         $('#w-result').innerHTML = `<div class="result-box err">${escapeHtml(e.message)}</div>`;
     }
+}
+
+// 🖼️ رفع صورة الترحيب من جهاز المستخدم مباشرة
+async function uploadWelcomeImage(file) {
+    const status = $('#w-image-status');
+    if (!file) return;
+
+    if (!/^image\/(png|jpe?g|gif|webp)$/i.test(file.type)) {
+        toast('لازم صورة png أو jpg أو gif أو webp', 'err');
+        return;
+    }
+
+    if (file.size > 8 * 1024 * 1024) {
+        toast('الصورة أكبر من 8MB — اختصرها وحاول مرة ثانية', 'err');
+        return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = async () => {
+        try {
+            if (status) status.textContent = '⏳ جاري الرفع...';
+            const res = await api(`/api/server/${currentGuildId}/welcome/image`, {
+                method: 'POST',
+                body: JSON.stringify({ dataUrl: String(reader.result) })
+            });
+            GUILD.settings = res.settings;
+            $('#w-image').value = res.image || '';
+            if (status) status.textContent = '✅ تم رفع الصورة — اضغط 💾 حفظ';
+            refreshImagePreviews();
+            toast('🖼️ تم رفع صورة الترحيب');
+        } catch (e) {
+            if (status) status.textContent = '';
+            toast(e.message, 'err');
+        }
+    };
+
+    reader.onerror = () => {
+        if (status) status.textContent = '';
+        toast('ما قدرنا نقرأ الملف — جرب صورة ثانية', 'err');
+    };
+
+    reader.readAsDataURL(file);
+}
+
+async function removeWelcomeImage() {
+    try {
+        const res = await api(`/api/server/${currentGuildId}/welcome/image`, {
+            method: 'POST',
+            body: JSON.stringify({ remove: true })
+        });
+        GUILD.settings = res.settings;
+        $('#w-image').value = '';
+        $('#w-image-status').textContent = '🗑️ تم حذف الصورة — رجعنا للبطاقة';
+        refreshImagePreviews();
+        renderWelcome();
+        toast('🗑️ تم حذف صورة الترحيب');
+    } catch (e) { toast(e.message, 'err'); }
+}
+
+// إدراج متغير في رسالة الترحيب (منشن العضو / العدد / اسم السيرفر...)
+function insertWelcomeVar(v) {
+    const area = $('#w-message');
+    if (!area) return;
+    const start = area.selectionStart ?? area.value.length;
+    const end = area.selectionEnd ?? area.value.length;
+    area.value = area.value.slice(0, start) + v + area.value.slice(end);
+    const pos = start + v.length;
+    area.focus();
+    area.setSelectionRange(pos, pos);
 }
 
 /* ---------- TICKETS ---------- */
@@ -2750,19 +2891,37 @@ function paintGiveaways() {
             <div class="section-note">أنشئ سحباً من هنا — يرسل البوت بطاقة السحب للروم مباشرة، ويختار الفائزين تلقائياً عند الانتهاء.</div>
             <div class="form-grid">
                 <div class="form-field"><label>الجائزة</label><input id="gw-prize" placeholder="مثال: Nitro شهر"></div>
-                <div class="form-field"><label>المدة (دقائق)</label><input type="number" id="gw-minutes" min="1" max="10080" value="60"></div>
-            </div>
-            <div class="form-grid">
-                <div class="form-field"><label>عدد الفائزين</label><input type="number" id="gw-winners" min="1" max="25" value="1"></div>
-                <div class="form-field">
-                    <label>روم السحوبات</label>
-                    <select id="gw-channel">
-                        <option value="">— اختر الروم —</option>
-                        ${GUILD.channels.filter(c => c.type === 0).map(c =>
-                            `<option value="${c.id}" ${String(c.id) === String(GW_STATE.channelId || '') ? 'selected' : ''}>${channelName(0, c.name)}</option>`
-                        ).join('')}
+                <div class="form-field"><label>وحدة المدة</label>
+                    <select id="gw-unit">
+                        <option value="seconds">⏱️ ثواني</option>
+                        <option value="minutes" selected>🕐 دقائق</option>
+                        <option value="hours">🕑 ساعات</option>
+                        <option value="days">📅 أيام</option>
+                        <option value="weeks">🗓️ أسابيع</option>
+                        <option value="months">🌙 شهر</option>
                     </select>
                 </div>
+            </div>
+            <div class="form-grid">
+                <div class="form-field"><label>المدة</label><input type="number" id="gw-duration" min="1" value="60"></div>
+                <div class="form-field">
+                    <label>عدد الفائزين</label><input type="number" id="gw-winners" min="1" max="25" value="1">
+                </div>
+            </div>
+            <div class="gw-presets">
+                <span class="small" style="opacity:.7">سريع:</span>
+                ${[['1 ساعة', 1, 'hours'], ['يوم', 1, 'days'], ['يومين', 2, 'days'], ['أسبوع', 1, 'weeks'], ['شهر', 1, 'months']].map(([label, v, unit]) =>
+                    `<button type="button" class="btn btn-ghost btn-xs" data-action="gw-preset" data-value="${v}" data-unit="${unit}">${label}</button>`
+                ).join('')}
+            </div>
+            <div class="form-field" style="margin-top:10px">
+                <label>روم السحوبات</label>
+                <select id="gw-channel">
+                    <option value="">— اختر الروم —</option>
+                    ${GUILD.channels.filter(c => c.type === 0).map(c =>
+                        `<option value="${c.id}" ${String(c.id) === String(GW_STATE.channelId || '') ? 'selected' : ''}>${channelName(0, c.name)}</option>`
+                    ).join('')}
+                </select>
             </div>
             <div class="form-field" style="margin-top:10px">
                 <label>رتبة مطلوبة للاشتراك (اختياري)</label>
@@ -2770,10 +2929,6 @@ function paintGiveaways() {
                     <option value="">— بدون شروط —</option>
                     ${GUILD.roles.map(r => `<option value="${r.id}">${escapeHtml(r.name)}</option>`).join('')}
                 </select>
-            </div>
-            <div style="display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap">
-                <label class="switch-row" style="border:none;padding:4px 0"><input type="checkbox" id="gw-avatar" style="width:auto"> صورة بروفايل مطلوبة</label>
-                <label class="switch-row" style="border:none;padding:4px 0"><input type="checkbox" id="gw-tag" style="width:auto"> تاق السيرفر مطلوب</label>
             </div>
             <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
                 <button type="button" class="btn btn-primary btn-sm" data-action="create-giveaway">🎉 بدء السحب</button>
@@ -2797,8 +2952,6 @@ function paintGiveaways() {
                                         · 👥 ${gw.entries} مشارك${gw.entries === 1 ? '' : 'ين'}
                                         ${gw.channelName ? ` · ${channelName(0, gw.channelName)}` : ''}
                                         ${gw.requirements.roleId ? ` · 🔑 ${escapeHtml(gwRoleName(gw.requirements.roleId))}` : ''}
-                                        ${gw.requirements.requireAvatar ? ' · 🖼️ صورة' : ''}
-                                        ${gw.requirements.requireTag ? ' · 🏷️ تاق' : ''}
                                     </div>
                                     ${gw.winnerIds.length ? `<div class="small">🏆 الفائزون: ${gw.winnerIds.length} (${gw.winnersCount})</div>` : ''}
                                 </div>
@@ -2818,17 +2971,18 @@ function paintGiveaways() {
 async function createGiveaway() {
     const prize = $('#gw-prize').value.trim();
     if (!prize) return toast('اكتب اسم الجائزة أولاً', 'err');
+    const duration = Number($('#gw-duration').value);
+    if (!(duration > 0)) return toast('اكتب مدة صحيحة للسحب', 'err');
     try {
         const res = await api(`/api/server/${currentGuildId}/giveaways`, {
             method: 'POST',
             body: JSON.stringify({
                 prize,
-                minutes: $('#gw-minutes').value,
+                duration,
+                unit: $('#gw-unit').value,
                 winners: $('#gw-winners').value,
                 channelId: $('#gw-channel').value,
-                roleId: $('#gw-role').value || null,
-                requireAvatar: $('#gw-avatar').checked,
-                requireTag: $('#gw-tag').checked
+                roleId: $('#gw-role').value || null
             })
         });
         $('#gw-result').innerHTML = `<div class="result-box ok">${escapeHtml(res.message)}</div>`;
@@ -2837,6 +2991,12 @@ async function createGiveaway() {
     } catch (e) {
         $('#gw-result').innerHTML = `<div class="result-box err">${escapeHtml(e.message)}</div>`;
     }
+}
+
+function gwApplyPreset(value, unit) {
+    $('#gw-duration').value = value;
+    $('#gw-unit').value = unit;
+    $('#gw-duration').focus();
 }
 
 async function saveGiveawayChannel() {
@@ -3482,6 +3642,9 @@ function dashboardAction(trigger) {
         case 'save-tickets': return () => saveTickets();
         case 'send-ticket-panel': return () => sendTicketPanel();
         case 'save-welcome': return () => saveWelcome();
+        case 'welcome-image-pick': return () => $('#w-image-file')?.click();
+        case 'welcome-image-remove': return () => removeWelcomeImage();
+        case 'insert-welcome-var': return () => insertWelcomeVar(String(data.var || ''));
         case 'save-logs': return () => saveLogs();
         case 'load-dashboard-logs': return () => loadDashLogs();
         case 'add-auto-response': return () => addAutoResponse();
@@ -3494,6 +3657,7 @@ function dashboardAction(trigger) {
         case 'save-levels': return () => saveLevels();
         case 'save-auto-role': return () => saveAutoRole();
         case 'create-giveaway': return () => createGiveaway();
+        case 'gw-preset': return () => gwApplyPreset(Number(data.value), data.unit);
         case 'save-giveaway-channel': return () => saveGiveawayChannel();
         case 'end-giveaway': return () => endGiveawayFromDash(data.id);
         case 'reroll-giveaway': return () => rerollGiveawayFromDash(data.id);
@@ -3532,6 +3696,14 @@ document.addEventListener('change', event => {
     const key = event.target.dataset?.protectionKey;
     if (!key) return;
     protToggle(key, event.target.checked).catch(error => toast(error.message, 'err'));
+});
+
+// 🖼️ اختيار صورة الترحيب من جهاز المستخدم
+document.addEventListener('change', event => {
+    if (event.target.id !== 'w-image-file') return;
+    const file = event.target.files && event.target.files[0];
+    if (file) uploadWelcomeImage(file).catch(error => toast(error.message, 'err'));
+    event.target.value = '';
 });
 
 /* ---------- INIT */

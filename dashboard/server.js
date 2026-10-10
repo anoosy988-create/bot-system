@@ -594,6 +594,21 @@ module.exports = function setupDashboard(app, deps) {
         }
     }));
 
+    // 📁 الصور المرفوعة من الداشبورد (صورة الترحيب مثلًا) — تُخدَّم بنفس السيرفر
+    const uploadsDir = path.join(__dirname, '..', 'uploads');
+
+    try {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+    } catch {}
+
+    app.use('/uploads', express.static(uploadsDir, {
+        maxAge: 0,
+        setHeaders: res => {
+            res.setHeader('Cache-Control', 'no-store, must-revalidate');
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+        }
+    }));
+
     // ======================================================
     // HELPERS
     // ======================================================
@@ -2202,6 +2217,13 @@ module.exports = function setupDashboard(app, deps) {
                             }
                         }
 
+                        // 🧩 قواعد السبام: تحويل المفاتيح إلى Boolean صحيح
+                        if (key === 'spam') {
+                            for (const k of ['onMentions', 'onSpaces', 'onBigText', 'onFiles', 'onLinks', 'onInvites']) {
+                                if (val[k] !== undefined) val[k] = !!val[k];
+                            }
+                        }
+
                         settings.protections[key] = {
                             ...settings.protections[key],
                             ...val,
@@ -2312,6 +2334,84 @@ module.exports = function setupDashboard(app, deps) {
             res.json({ ok: true, settings: jsonSettings(settings) });
         } catch (error) {
             res.status(500).json({ ok: false, error: error.message });
+        }
+    });
+
+    // ======================================================
+    // 🖼️ رفع صورة الترحيب من الداشبورد (بدل ما تكتب رابط)
+    // ======================================================
+    const MAX_WELCOME_IMG_BYTES = 8 * 1024 * 1024;
+    const WELCOME_MIME_RE = /^data:image\/(png|jpeg|jpg|gif|webp);base64,(.+)$/i;
+
+    app.post('/api/server/:guildId/welcome/image', express.json(), async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+
+        const { dataUrl, remove } = req.body || {};
+
+        try {
+            const settings = await getSettings(guild.id);
+
+            // حذف الصورة الحالية والعودة للبطاقة
+            if (remove === true) {
+                const old = settings.welcome.image;
+                if (typeof old === 'string' && old.startsWith('/uploads/')) {
+                    const fileName = path.basename(old);
+                    if (/^welcome-[A-Za-z0-9]+.*\.(png|jpe?g|gif|webp)$/i.test(fileName)) {
+                        await fs.promises.unlink(path.join(uploadsDir, fileName)).catch(() => {});
+                    }
+                }
+                settings.welcome.image = null;
+                settings.welcome.cardEnabled = true;
+                await settings.save();
+                logDashboard(guild.id, ctx.s.userId, 'تعديل إعدادات', 'welcome(image)');
+                return res.json({ ok: true, image: null, settings: jsonSettings(settings) });
+            }
+
+            if (typeof dataUrl !== 'string') {
+                return res.status(400).json({ ok: false, error: 'ما وصلك ملف صورة صحيح.' });
+            }
+
+            const match = String(dataUrl).match(WELCOME_MIME_RE);
+            if (!match) {
+                return res.status(400).json({ ok: false, error: 'لازم صورة بصيغة png أو jpg أو gif أو webp.' });
+            }
+
+            const ext = match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase();
+            const buffer = Buffer.from(match[2], 'base64');
+
+            if (!buffer.length) {
+                return res.status(400).json({ ok: false, error: 'الملف فاضي أو تالف.' });
+            }
+
+            if (buffer.length > MAX_WELCOME_IMG_BYTES) {
+                return res.status(400).json({ ok: false, error: 'حجم الصورة أكبر من 8MB — اختصرها وحاول مرة ثانية.' });
+            }
+
+            const fileName = `welcome-${guild.id}.${ext}`;
+
+            // حذف الصورة القديمة (نفس الملف غالباً — نتأكد ونحذف القديم بامتداد مختلف)
+            const old = settings.welcome.image;
+            if (typeof old === 'string' && old.startsWith('/uploads/') && path.basename(old) !== fileName) {
+                const oldName = path.basename(old);
+                if (/^welcome-[A-Za-z0-9]+.*\.(png|jpe?g|gif|webp)$/i.test(oldName)) {
+                    await fs.promises.unlink(path.join(uploadsDir, oldName)).catch(() => {});
+                }
+            }
+
+            await fs.promises.writeFile(path.join(uploadsDir, fileName), buffer);
+
+            settings.welcome.image = `/uploads/${fileName}`;
+            settings.welcome.cardEnabled = false;
+            await settings.save();
+            ensureProtections(settings);
+
+            logDashboard(guild.id, ctx.s.userId, 'تعديل إعدادات', 'welcome(image)');
+            res.json({ ok: true, image: `/uploads/${fileName}`, settings: jsonSettings(settings) });
+        } catch (error) {
+            console.error('Welcome image upload error:', error);
+            res.status(500).json({ ok: false, error: 'تعذر حفظ الصورة: ' + (error.message || '—') });
         }
     });
 
@@ -2636,6 +2736,22 @@ module.exports = function setupDashboard(app, deps) {
     // 🎁 السحوبات (Giveaway) — من الداشبورد
     // ======================================================
 
+    // وحدات مدة السحب + تحويل المدة إلى مللي ثانية (نفس قواعد giveaways.js)
+    const GW_UNIT_MS = {
+        seconds: 1000,
+        minutes: 60 * 1000,
+        hours: 60 * 60 * 1000,
+        days: 24 * 60 * 60 * 1000,
+        weeks: 7 * 24 * 60 * 60 * 1000,
+        months: Math.round(30.44 * 24 * 60 * 60 * 1000)
+    };
+
+    function giveawayDurationMs(value, unit) {
+        const mult = GW_UNIT_MS[String(unit || '').toLowerCase()] || GW_UNIT_MS.minutes;
+        const v = Math.max(1, Math.round(Number(value) || 1));
+        return Math.min(Math.round(v * mult), 2 * 365 * 24 * 60 * 60 * 1000);
+    }
+
     app.get('/api/server/:guildId/giveaways', async (req, res) => {
         try {
             const ctx = await requireGuild(req, res, hasSession(req)?.userId);
@@ -2698,12 +2814,20 @@ module.exports = function setupDashboard(app, deps) {
         const { guild } = ctx;
         const actorId = ctx.s.userId;
 
-        const { prize, minutes, winners, channelId, roleId, requireAvatar, requireTag } = req.body || {};
+        const { prize, duration, unit, minutes, winners, channelId, roleId, requireAvatar, requireTag } = req.body || {};
 
         const cleanPrize = String(prize || '').trim();
         if (!cleanPrize) return res.status(400).json({ ok: false, error: 'اكتب اسم الجائزة.' });
 
-        const mins = Math.max(1, Math.min(10080, Math.round(Number(minutes) || 60)));
+        // المدة: يدعم الوحدة الجديدة (ثواني/دقائق/ساعات/أيام/أسابيع/شهور)
+        // ويتوافق مع الطلبات القديمة اللي ترسل minutes فقط
+        let durMs;
+        if (duration !== undefined && duration !== null && duration !== '') {
+            durMs = giveawayDurationMs(Number(duration) || 1, String(unit || 'minutes'));
+        } else {
+            durMs = Math.max(1, Math.min(10080, Math.round(Number(minutes) || 60))) * 60 * 1000;
+        }
+
         const count = Math.max(1, Math.min(25, Math.round(Number(winners) || 1)));
 
         let channel = channelId ? guild.channels.cache.get(String(channelId)) : null;
@@ -2716,7 +2840,7 @@ module.exports = function setupDashboard(app, deps) {
         }
 
         const role = roleId ? (guild.roles.cache.get(String(roleId)) || null) : null;
-        const endsAt = new Date(Date.now() + mins * 60 * 1000);
+        const endsAt = new Date(Date.now() + durMs);
 
         const gw = await Giveaway.create({
             guildId: guild.id,

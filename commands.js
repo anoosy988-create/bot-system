@@ -797,9 +797,22 @@ const slashCommands = [
                 )
                 .addIntegerOption(o =>
                     o.setName('duration')
-                        .setDescription('المدة بالدقائق')
+                        .setDescription('مقدار المدة (رقم فقط — الوحدة تحت)')
                         .setRequired(true)
                         .setMinValue(1)
+                )
+                .addStringOption(o =>
+                    o.setName('unit')
+                        .setDescription('وحدة المدة (افتراضي: دقائق)')
+                        .setRequired(false)
+                        .addChoices(
+                            { name: '⏱️ ثواني', value: 'seconds' },
+                            { name: '🕐 دقائق', value: 'minutes' },
+                            { name: '🕑 ساعات', value: 'hours' },
+                            { name: '📅 أيام', value: 'days' },
+                            { name: '🗓️ أسابيع', value: 'weeks' },
+                            { name: '🌙 شهر', value: 'months' }
+                        )
                 )
                 .addIntegerOption(o =>
                     o.setName('winners')

@@ -739,6 +739,16 @@ label { font-size: 13px; color: var(--muted); margin-bottom: 6px; display: block
 
 .btn-sm { padding: 8px 14px; font-size: 13px; border-radius: 9px; }
 
+.btn-xs { padding: 4px 10px; font-size: 12px; border-radius: 8px; }
+
+.gw-presets {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
 .btn-success { background: var(--green); color: #07211a; }
 
 .btn-danger { background: var(--red-dark); color: #fff; }
@@ -1339,6 +1349,35 @@ kbd {
     padding: 1px 5px;
     direction: ltr;
     display: inline-block;
+}
+
+/* ---------- رقاقات متغيرات الترحيب ---------- */
+.w-var-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+.var-chip {
+    background: var(--card-2);
+    border: 1px dashed var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 4px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: border-color .15s, color .15s;
+}
+
+.var-chip:hover {
+    border-color: var(--red);
+    color: var(--red-bright);
+}
+
+.var-chip small {
+    color: var(--muted);
+    margin-inline-start: 4px;
 }
 
 .img-preview {

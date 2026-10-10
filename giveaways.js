@@ -19,6 +19,23 @@ let deps = {};
 
 const TICK_MS = 30 * 1000;
 
+// وحدات المدة للسحب: يختار صاحب السيرفر الوحدة والمقدار
+const GW_UNIT_MS = {
+    seconds: 1000,
+    minutes: 60 * 1000,
+    hours: 60 * 60 * 1000,
+    days: 24 * 60 * 60 * 1000,
+    weeks: 7 * 24 * 60 * 60 * 1000,
+    months: Math.round(30.44 * 24 * 60 * 60 * 1000) // شهر ≈ 30.44 يوم
+};
+
+function durationMs(value, unit = 'minutes') {
+    const mult = GW_UNIT_MS[String(unit || '').toLowerCase()] || GW_UNIT_MS.minutes;
+    const v = Math.max(1, Math.round(Number(value) || 1));
+    // حد أقصى سنتين مش بس شهر — يحمي من أخطاء الإدخال الضخمة
+    return Math.min(Math.round(v * mult), 2 * 365 * 24 * 60 * 60 * 1000);
+}
+
 const giveawaySchema = new mongoose.Schema({
     guildId: { type: String, required: true, index: true },
     channelId: { type: String, required: true },
@@ -273,7 +290,8 @@ async function handleSlash(interaction) {
     // ---------------- start ----------------
     if (sub === 'start') {
         const prize = interaction.options.getString('prize');
-        const minutes = interaction.options.getInteger('duration');
+        const duration = interaction.options.getInteger('duration');
+        const unit = interaction.options.getString('unit') || 'minutes';
         const winners = interaction.options.getInteger('winners') || 1;
         const role = interaction.options.getRole('role');
         const requireAvatar = interaction.options.getBoolean('require_avatar') ?? true;
@@ -296,7 +314,7 @@ async function handleSlash(interaction) {
             });
         }
 
-        const endsAt = new Date(Date.now() + minutes * 60 * 1000);
+        const endsAt = new Date(Date.now() + durationMs(duration, unit));
 
         const gw = await Giveaway.create({
             guildId: guild.id,
@@ -524,5 +542,7 @@ module.exports = {
     actionRow,
     pickWinners,
     meetsRequirements,
+    durationMs,
+    GW_UNIT_MS,
     log
 };

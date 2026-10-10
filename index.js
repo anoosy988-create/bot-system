@@ -5224,10 +5224,20 @@ client.on('interactionCreate', async interaction => {
 
                     if (sub === 'remove') {
 
+                        const removed = settings.welcome.image;
+
                         settings.welcome.image = null;
                         settings.welcome.cardEnabled = true;
 
                         await settings.save();
+
+                        // لو كانت من رفع الداشبورد نمسح الملف من القرص
+                        if (removed && String(removed).startsWith('/uploads/')) {
+                            const fileName = path.basename(String(removed));
+                            if (/^welcome-[A-Za-z0-9]+.*\.(png|jpe?g|gif|webp)$/i.test(fileName)) {
+                                fs.promises.unlink(path.join(__dirname, 'uploads', fileName)).catch(() => {});
+                            }
+                        }
 
                         return interaction.reply({
                             content: '🗑️ تم حذف صورة الترحيب — رجعنا للبطاقة الافتراضية.\n' +
@@ -7862,7 +7872,18 @@ client.on('guildMemberAdd', async member => {
 
             const customImage = settings.welcome.image;
 
-            if (customImage) {
+            if (customImage && typeof customImage === 'string' && customImage.startsWith('/uploads/')) {
+                // 🖼️ صورة رُفعت من الداشبورد — نقرأها من القرص نفسها
+                const fileName = path.basename(customImage);
+                const localPath = path.join(__dirname, 'uploads', fileName);
+                const buffer = fs.readFileSync(localPath);
+
+                await channel.send({
+                    content: text,
+                    files: [{ attachment: buffer, name: fileName }]
+                });
+
+            } else if (customImage) {
 
                 // ⚠️ كان يفرض اسم welcome-image.png على أي صورة —
                 // صور jpg/gif كانت تنكسر أو تتحوّل لصور مكسورة.
@@ -11341,20 +11362,22 @@ async function executeDashboardCommand(ctx) {
 
             if (sub === 'start') {
                 const prize = String(opt('prize') || '').trim();
-                const minutes = Number(opt('duration'));
+                const duration = Number(opt('duration'));
+                const unit = String(opt('unit') || 'minutes');
                 const winners = Math.max(1, Number(opt('winners')) || 1);
                 const role = opt('role') ? resolveRole(opt('role')) : null;
-                const requireAvatar = opt('require_avatar') !== false;
-                const requireTag = opt('require_tag') !== false;
+                const requireAvatar = opt('require_avatar') === true;
+                const requireTag = opt('require_tag') === true;
 
                 if (!prize) return fail('الجائزة مطلوبة.');
-                if (!(minutes > 0)) return fail('حدد مدة السحب بالدقائق.');
+                if (!(duration > 0)) return fail('حدد مدة السحب (الرقم فقط).');
+
+                const endsAt = new Date(Date.now() + giveaways.durationMs(duration, unit));
 
                 let ch = resolveChannel(opt('channel'));
                 if (!ch) ch = settings.giveawayChannelId ? guild.channels.cache.get(settings.giveawayChannelId) : null;
                 if (!ch || !ch.isTextBased()) return fail('حدد روم نصي أو اضبطه أولاً عبر /giveaway setup.');
 
-                const endsAt = new Date(Date.now() + minutes * 60 * 1000);
                 const gw = await giveaways.Giveaway.create({
                     guildId: guild.id,
                     channelId: ch.id,
@@ -11374,7 +11397,7 @@ async function executeDashboardCommand(ctx) {
                 await gw.save();
 
                 giveaways.log(guild, '🎁 Giveaway Started', `تم إنشاء سحب **${prize}** في ${ch} من الداشبورد بواسطة <@${actorId}>.`);
-                return done(`🎁 تم إنشاء السحب في ${ch} — ينتهي بعد **${minutes}** دقيقة.`);
+                return done(`🎁 تم إنشاء السحب في ${ch} — ينتهي بعد **${duration} ${unit}**.`);
             }
 
             if (sub === 'end') {
