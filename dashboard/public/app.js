@@ -185,12 +185,7 @@ async function boot() {
             return;
         }
 
-        // ما فيه جلسة: ندخله على طول (محاولة صامتة = فورية)
-        if (AUTH_READY && !SKIP_AUTO_LOGIN) {
-            location.replace(AUTH_QUICK ? '/api/auth/quick' : '/api/auth/login?silent=1');
-            return;
-        }
-
+        // ما فيه جلسة: نعرض الصفحة مع زر «تسجيل الدخول» بالأعلى — بدون تحويل صامت
         renderLanding();
     } catch (e) {
         renderLanding();
@@ -221,7 +216,16 @@ function renderLanding(loginError = '') {
 
     const userNote = ME
         ? `<div class="hero-user-note">مسجل دخول كـ <b>${escapeHtml(ME.username)}</b></div>`
-        : `<div class="hero-user-note">اضغط "ابدأ الآن" وبتطلع لك على طول قائمة سيرفراتك — بدون آيدي وبدون كود وبدون باسوورد.</div>`;
+        : `<div class="hero-user-note">🔑 سجّل دخولك أول من زر <b>«تسجيل الدخول»</b> بأعلى الصفحة ← وبعدين اضغط «ابدأ الآن».</div>`;
+
+    const topRight = ME
+        ? `<div class="topbar-user">
+                <img src="${escapeHtml(iconFor(ME.avatar))}" alt="">
+                <span>${escapeHtml(ME.username || ME.globalName || '')}</span>
+                <button id="topbar-go" type="button" class="btn btn-primary btn-sm">▶ سيرفراتي</button>
+                <button type="button" class="btn btn-ghost btn-sm" data-action="logout">خروج</button>
+            </div>`
+        : `<button id="topbar-login" type="button" class="btn btn-primary btn-sm">🔑 تسجيل الدخول</button>`;
 
     // الرسالة تجينا جاهزة من السيرفر (/api/auth/status) فتقل بالضبط وش الناقص
     const notReady = !ME && !AUTH_READY
@@ -241,6 +245,10 @@ function renderLanding(loginError = '') {
         : '';
 
     appEl.innerHTML = `
+        <div class="topbar">
+            <div class="topbar-brand">🛡️ <b>${escapeHtml(botName(n))}</b></div>
+            <div class="topbar-actions">${topRight}</div>
+        </div>
         <div class="hero">
             <div class="hero-badge">🛡️ <b>${escapeHtml(botName(n))}</b> — نظام حماية و إدارة</div>
 
@@ -254,7 +262,7 @@ function renderLanding(loginError = '') {
             </div>
 
             <div class="hero-actions">
-                <button id="start-button" type="button" class="btn btn-primary btn-cta btn-start" ${ME || AUTH_READY ? '' : 'disabled'}>${startLabel}</button>
+                <button id="start-button" type="button" class="btn btn-primary btn-cta btn-start">${startLabel}</button>
                 ${n.inviteUrl ? `<a class="btn btn-ghost" href="${escapeHtml(n.inviteUrl)}" target="_blank" rel="noopener noreferrer">إضافة البوت إلى سيرفر</a>` : ''}
             </div>
             ${userNote}
@@ -289,20 +297,46 @@ function renderLanding(loginError = '') {
     startLandingTimers();
 }
 
+// تسجيل الدخول عبر ديسكورد (OAuth) — نطلب الموافقة صراحةً
+function login() {
+    if (!AUTH_READY) {
+        toast(
+            AUTH_DIAG?.hint ||
+            'تسجيل الدخول غير مُفعّل على البوت. أضف CLIENT_ID و CLIENT_SECRET ثم أعد التشغيل.',
+            'err'
+        );
+        return;
+    }
+    location.href = AUTH_QUICK ? '/api/auth/quick' : '/api/auth/login';
+}
+
+function goServers() {
+    history.replaceState(null, '', '#servers');
+    renderServers();
+}
+
 function bindLandingActions() {
     const startButton = $('#start-button');
-    if (!startButton) return;
+    if (startButton) {
+        startButton.addEventListener('click', () => {
+            if (ME) return goServers();
 
-    startButton.addEventListener('click', () => {
-        if (ME) {
-            history.replaceState(null, '', '#servers');
-            renderServers();
-            return;
-        }
+            // مو مسجل → نطلبه يسجّل من زر الدخول بالأعلى
+            toast('سجّل دخولك أول من زر «تسجيل الدخول» بأعلى الصفحة ← وبعدين اضغط ابدأ الآن.', 'err');
 
-        // دخول على طول — وضع مباشر (بضغطة وحدة) أو ديسكورد (صامت)
-        location.href = AUTH_QUICK ? '/api/auth/quick' : '/api/auth/login?silent=1';
-    });
+            const loginBtn = $('#topbar-login');
+            if (loginBtn) {
+                loginBtn.classList.add('flash');
+                setTimeout(() => loginBtn.classList.remove('flash'), 1600);
+            }
+        });
+    }
+
+    const loginBtn = $('#topbar-login');
+    if (loginBtn) loginBtn.addEventListener('click', login);
+
+    const goBtn = $('#topbar-go');
+    if (goBtn) goBtn.addEventListener('click', goServers);
 }
 
 function stopLandingTimers() {

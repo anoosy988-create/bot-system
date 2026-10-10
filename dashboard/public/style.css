@@ -160,6 +160,57 @@ label { font-size: 13px; color: var(--muted); margin-bottom: 6px; display: block
 
 .login-warning b { color: #fff; }
 
+/* شريط أعلى الصفحة: اسم البوت يسار + زر تسجيل الدخول يمين */
+.topbar {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 20px;
+    background: rgba(15, 8, 8, 0.82);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(12px);
+}
+
+.topbar-brand {
+    font-size: 15px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.topbar-brand b { color: var(--red-bright); }
+
+.topbar-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.topbar-user {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.topbar-user img {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 2px solid var(--red);
+    background: var(--card-2);
+}
+
+@keyframes topbarFlash {
+    0%, 100% { box-shadow: 0 0 0 0 var(--red-glow); transform: translateY(0); }
+    50% { box-shadow: 0 0 0 10px rgba(214, 61, 61, 0.28); transform: translateY(-2px); }
+}
+
+.btn.flash { animation: topbarFlash 0.8s ease-in-out 2; }
+
 .hero-stats {
     display: flex;
     flex-wrap: wrap;
