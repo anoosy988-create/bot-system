@@ -97,9 +97,10 @@ const deps = {
     sendLog: async () => {},
     jailMember: async () => {},
     unjailMember: async () => {},
-    // كل عضو بسيرفر الفيكسشر عنده رتبة الستريتر (محاكاة العضوية)
+    // كل عضو بسيرفر الفيكسشر عنده صلاحيات إدارية + رتبة الستريتر
     isServerAdmin: () => true,
     memberHasStaffRole: () => true,
+    hasStaffAccess: () => true,
     hasStaffAccess: () => true,
     DashboardUser: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
     DashboardLog: { find: () => ({ sort: () => ({ limit: () => ({ lean: async () => [] }) }) }) },

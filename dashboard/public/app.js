@@ -22,6 +22,8 @@ let currentTab = 'overview';
 let currentGuildId = null;
 let botStatsTimer = null;
 let uptimeTicker = null;
+let serverRefreshTimer = null;
+let serverRefreshBusy = false;
 let AUTH_READY = false;
 let AUTH_QUICK = false;
 let AUTH_DIAG = null;
@@ -213,6 +215,7 @@ function botName(n = BOT || {}) {
 }
 
 function renderLanding(loginError = '') {
+    stopServerRefresh();
     const n = BOT || {};
     const startLabel = ME ? '▶️ ابدأ الآن — سيرفراتك' : '▶️ ابدأ الآن';
 
@@ -428,7 +431,7 @@ async function renderHome() {
             <div class="home-hero">
                 <div class="home-hero-text">
                     <h1 class="home-title">أهلاً <span class="red">${escapeHtml(ME.globalName || ME.username || '')}</span> 👋</h1>
-                    <p class="home-sub">من هنا تبدأ — اضغط <b>ابدأ الآن</b> وبتطلع على كل سيرفراتك اللي عندك فيها رتبة <b>${escapeHtml(data.staffRoleName || 'ستريتر')}</b>.</p>
+                    <p class="home-sub">من هنا تبدأ — اضغط <b>ابدأ الآن</b> وبتطلع على كل سيرفراتك اللي عندك فيها صلاحيات إدارية أو رتبة <b>${escapeHtml(data.staffRoleName || 'ستريتر')}</b>.</p>
                     <div class="home-actions">
                         <button type="button" class="btn btn-primary btn-cta btn-start" data-action="go-servers">▶️ ابدأ الآن</button>
                         ${bot.inviteUrl
@@ -543,7 +546,7 @@ function noServersNotice(staffRoleName, inviteUrl) {
                 <li><b>البوت مو داخل سيرفرك</b> — أضفه أولاً من الزر تحت.</li>
                 <li>
                     أو ما عندك صلاحية عليه — لازم تكون عندك رتبة
-                    <b>${role}</b> فقط (بدون Grade أو Admin إضافي).
+                    <b>${role}</b> أو صلاحية آدمن (Administrator) على السيرفر.
                 </li>
             </ul>
 
@@ -562,6 +565,7 @@ function noServersNotice(staffRoleName, inviteUrl) {
 
 async function renderServers() {
     stopLandingTimers();
+    stopServerRefresh();
     try {
         // بيانات الجلسة (المستخدم + السيرفرات المفلترة بصلاحية Administrator)
         let data = await api('/api/session');
@@ -592,7 +596,7 @@ async function renderServers() {
                     <div>
                         <h1 class="page-title">🛡️ لوحة التحكم</h1>
                         <div style="color:var(--muted);font-size:13px;margin-top:4px">
-                            تظهر لك سيرفراتك التي تملك فيها رتبة <b>${escapeHtml(data.staffRoleName || 'ستريتر')}</b> فقط —
+                            تظهر لك سيرفراتك التي تملك فيها صلاحيات إدارية (آدمن) أو رتبة <b>${escapeHtml(data.staffRoleName || 'ستريتر')}</b> —
                             والبوت يدير <b>${SERVERS.filter(isBotInside).length}</b> منها.
                         </div>
                     </div>
@@ -644,6 +648,7 @@ async function logout() {
         SERVERS = null;
         GUILD = null;
         currentGuildId = null;
+        stopServerRefresh();
         SKIP_AUTO_LOGIN = true;
         history.replaceState(null, '', location.pathname);
         renderLanding();
@@ -709,6 +714,7 @@ async function renderServer(guildId) {
 
         renderServerShell(data);
         renderTab(currentTab);
+        startServerRefresh();
     } catch (e) {
         console.error('Dashboard server render failed:', e);
         toast(e.message, 'err');
@@ -739,6 +745,7 @@ function renderServerShell(data) {
                     </div>
                 </div>
                 <div class="dash-actions">
+                    <button type="button" class="btn btn-ghost btn-sm" data-action="refresh-server">🔄 تحديث</button>
                     <button type="button" class="btn btn-ghost btn-sm" data-action="show-servers">↩ القائمة</button>
                     <button type="button" class="btn btn-danger btn-sm" data-action="logout">تسجيل الخروج</button>
                 </div>
@@ -749,6 +756,86 @@ function renderServerShell(data) {
             </div>
         </div>
     `;
+}
+
+function stopServerRefresh() {
+    if (serverRefreshTimer) clearInterval(serverRefreshTimer);
+    serverRefreshTimer = null;
+}
+
+// مزامنة حيّة: كل تعديل يصير بالسيرفر (أوامر سلاش/ديسكورد) يجي تلقائياً للداشبورد
+function startServerRefresh() {
+    stopServerRefresh();
+    serverRefreshTimer = setInterval(() => {
+        autoRefreshServer().catch(() => {});
+    }, 20000);
+}
+
+// أي عنصر عليه الكتابة حالياً؟ ما نلمس الشاشة وقتها
+function isEditingField() {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+}
+
+function serverDataSignature(data) {
+    if (!data) return '';
+    try {
+        return JSON.stringify({
+            s: data.settings,
+            c: (data.channels || []).map(c => c.id).join(','),
+            r: (data.roles || []).map(r => r.id).join(',')
+        });
+    } catch {
+        return '';
+    }
+}
+
+// نجيب أحدث بيانات السيرفر من البوت — لو فيها تغيير من أوامر ديسكورد نعيد الرسم
+// بهدوء بدون ما نلمس أي حقل مكتوب فيه. لا نعيد رسم نماذج الأوامر/الإيمبد أثناء الكتابة.
+async function autoRefreshServer() {
+    if (!currentGuildId || serverRefreshBusy) return;
+    if (document.visibilityState === 'hidden') return;
+    if (location.hash !== `#server/${currentGuildId}`) return;
+    if (isEditingField()) return;
+    if (currentTab === 'commands' || currentTab === 'embed') return;
+
+    serverRefreshBusy = true;
+    try {
+        const data = await api(`/api/server/${currentGuildId}`);
+        if (!data?.ok) return;
+
+        const before = serverDataSignature(GUILD);
+        const after = serverDataSignature(data);
+        GUILD = data;
+        if (before === after) return;
+
+        const scrollY = window.scrollY;
+        renderServerShell(data);
+        renderTab(currentTab);
+        window.scrollTo(0, scrollY);
+        toast('تمت مزامنة آخر تعديلات السيرفر');
+    } finally {
+        serverRefreshBusy = false;
+    }
+}
+
+// تحديث يدوي كامل (زر 🔄 داخل السيرفر)
+async function refreshServer() {
+    if (!currentGuildId) return;
+    toast('جاري تحديث بيانات السيرفر...');
+    try {
+        const data = await api(`/api/server/${currentGuildId}?refresh=1`);
+        GUILD = data;
+        const scrollY = window.scrollY;
+        renderServerShell(data);
+        renderTab(currentTab);
+        window.scrollTo(0, scrollY);
+        toast('تم تحديث بيانات السيرفر');
+    } catch (e) {
+        toast(e.message, 'err');
+    }
 }
 
 function switchTab(tab) {
@@ -2865,7 +2952,7 @@ async function renderCommands() {
                 كل أوامر السلاش المسجّلة على السيرفر ظاهرة هنا. اللي يظهر عليه <b>✅ ينفذ من الداشبورد</b>
                 يتنفّذ فوراً على السيرفر بدون ما تدخل ديسكورد (مثل /ban، /embed، /giveaway start...).
                 اللي عنده <b>💬 من ديسكورد</b> يحتاج تفاعل حي داخل ديسكورد (زر/إيموجي/رسالة).
-                <br>🔐 الوصول لكل شيء هنا محصور برتبة <b>${escapeHtml(GUILD.staffRoleName || 'ستريتر')}</b>.
+                <br>🔐 الوصول لكل شيء هنا لأصحاب رتبة <b>${escapeHtml(GUILD.staffRoleName || 'ستريتر')}</b> أو صلاحية آدمن على السيرفر.
             </div>
             <div class="form-field" style="margin-top:10px">
                 <input id="cmd-search" class="cmd-input" placeholder="🔍 ابحث عن أمر..." value="${escapeHtml(COMMANDS.search)}">
@@ -2984,6 +3071,7 @@ function dashboardAction(trigger) {
 
     switch (data.action) {
         case 'refresh-servers': return () => refreshServers();
+        case 'refresh-server': return () => refreshServer();
         case 'go-servers': return () => {
             history.pushState(null, '', '#servers');
             return renderServers();
@@ -3092,6 +3180,11 @@ document.addEventListener('input', event => {
     if (el.id === 'w-image' || el.id === 't-panel-image' || el.id === 't-welcome-image') {
         refreshImagePreviews();
     }
+});
+
+// رجعت للداشبورد؟ اسحب آخر تعديلات السيرفر فوراً (بدل انتظار الـ polling)
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') autoRefreshServer().catch(() => {});
 });
 
 boot();

@@ -646,14 +646,14 @@ module.exports = function setupDashboard(app, deps) {
     }
 
     // هل المستخدم يقدر يشوف/يدير هذا السيرفر؟
-    // 🎯 الوصول للستريتر فقط: بدون Admin كدخول إضافي (وبس)
+    // 🎯 الوصول: أي شخص عنده صلاحيات إدارية فعلية (آدمن) أو رتبة الستريتر.
     async function canManage(userId, guild, allowFetch = true) {
         if (await isDashboardRevoked(userId)) return false;
 
         const member = await getUserGuildMember(guild, userId, allowFetch);
         if (!member) return false;
 
-        return memberHasStaffRole(member, guild);
+        return hasStaffAccess(member, guild);
     }
 
     // 🔒 الوايت ليست: راعي البوت (OWNER_IDS) أو راعي السيرفر فقط
@@ -735,9 +735,27 @@ module.exports = function setupDashboard(app, deps) {
             // عندنا قائمة سيرفرات المستخدم بالتحديد؟ نفحصها بعمق (مع جلب العضو).
             // ما عندنا (جلسة قديمة)؟ نفحص كل سيرفرات البوت من الكاش فقط — بدون شبكة.
             const hasCandidates = Array.isArray(candidateIds) && candidateIds.length > 0;
-            const candidates = hasCandidates
-                ? candidateIds.map(id => client.guilds.cache.get(String(id))).filter(Boolean)
-                : [...client.guilds.cache.values()];
+            const union = new Map();
+
+            // المرشّحون من الجلسة (OAuth) — قد تكون القائمة قديمة وفاتها سيرفر جديد
+            // انضميت له مؤخراً. نضيفهم كاملة.
+            for (const id of hasCandidates ? candidateIds : []) {
+                const g = client.guilds.cache.get(String(id));
+                if (g) union.set(g.id, g);
+            }
+
+            // عين ثانية من كاش البوت: أي سيرفر أنت أصلاً موجود كعضو بكاشه
+            // (بدون أي طلب شبكة) — يغطي الحالات اللي ما توصلها قائمة OAuth.
+            for (const g of client.guilds.cache.values()) {
+                if (g.members.cache.has(String(userId))) union.set(g.id, g);
+            }
+
+            // لو ما جه المرشّحون ولا عين الكاش، نمر على كل سيرفرات البوت.
+            if (!union.size && !hasCandidates) {
+                for (const g of client.guilds.cache.values()) union.set(g.id, g);
+            }
+
+            const candidates = [...union.values()];
 
             const checked = await mapLimit(candidates, hasCandidates ? 16 : 32, async guild => {
                 const ok = await canManage(userId, guild, hasCandidates);
@@ -775,14 +793,14 @@ module.exports = function setupDashboard(app, deps) {
     // فلترة سريعة للكاش: نتأكد بس إن البوت لسا داخل السيرفر — بدون فحص صلاحيات
     // لكل سيرفر (كان يسوي members.fetch ويعطّل كل طلب). الفحص الكامل يصير عند
     // التحديث بالخلفية، وأي إجراء فعلي محمي بـ canManage داخل requireGuild.
-    // 🎯 لو العضو موجود بكاش الأعضاء نتحقق فوراً من رتبة الستريتر (بدون صفة Admin).
+    // 🎯 لو العضو موجود بكاش الأعضاء نتحقق فوراً من صلاحياته (آدمن أو ستريتر).
     async function filterCachedServers(userId, entries) {
         const out = [];
         for (const entry of entries) {
             const guild = client.guilds.cache.get(String(entry.id));
             if (!guild) continue;
             const member = guild.members.cache.get(String(userId));
-            if (member && !memberHasStaffRole(member, guild)) continue;
+            if (member && !hasStaffAccess(member, guild)) continue;
             out.push(entry);
         }
         return out;
@@ -797,7 +815,7 @@ module.exports = function setupDashboard(app, deps) {
     }
 
     // قائمة فورية من الذاكرة — بدون أي نداء لديسكورد إطلاقاً:
-    // 🎯 الستريتر فقط: كل السيرفرات اللي المستخدم عنده رتبة ستريتر فيها
+    // 🎯 آدمن/ستريتر: كل السيرفرات اللي المستخدم عنده صلاحيات إدارية فيها
     function instantAccessibleServers(userId, session) {
         const uid = String(userId || session?.userId || '');
         const out = [];
@@ -814,14 +832,14 @@ module.exports = function setupDashboard(app, deps) {
             const guild = client.guilds.cache.get(String(g.id));
             if (!guild) continue;
             const member = guild.members.cache.get(uid);
-            if (member && memberHasStaffRole(member, guild)) push(guild);
+            if (member && hasStaffAccess(member, guild)) push(guild);
         }
 
         for (const guild of client.guilds.cache.values()) {
             if (seen.has(guild.id)) continue;
             const member = guild.members.cache.get(uid);
             if (!member) continue;
-            if (memberHasStaffRole(member, guild)) push(guild);
+            if (hasStaffAccess(member, guild)) push(guild);
         }
 
         return out;

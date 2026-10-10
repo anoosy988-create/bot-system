@@ -215,6 +215,14 @@ app.disable('x-powered-by');
 
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Web server running on port ${PORT} (bound 0.0.0.0)`);
+
+    const announceUrl = (RUNTIME_DASHBOARD_URL || DASHBOARD_URL || '').replace(/\/+$/, '');
+    if (announceUrl) {
+        console.log(`🔗 [داشبورد] افتح: ${announceUrl}`);
+        console.log(`🔗 [داشبورد] رابط OAuth callback (ضيفه لدى Discord إن لم يكن موجوداً): ${announceUrl}/api/auth/callback`);
+    } else {
+        console.log('🔗 [داشبورد] ما انضبط DASHBOARD_URL — ضيفه في .env (مثلاً DASHBOARD_URL=https://دومينك) ليظهر رابطه في السجلات.');
+    }
 });
 
 // Render /Railway يرسلون SIGTERM قبل الإيقاف — نغلق بشكل نظيف
