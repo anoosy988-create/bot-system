@@ -327,7 +327,8 @@ function publicRequestHost(req) {
 
     const pick = [forwardedHost, rawHost].find(h => h && !isInternalHost(h));
 
-    return pick ? pick.replace(/^https?:\/\//i, '').replace(/\/+$/, '') : '';
+    // نشيل البروتوكول والبورت والمسار — نبي الدومين النظيف فقط
+    return pick ? pick.replace(/^https?:\/\//i, '').split('/')[0].split(':')[0] : '';
 }
 
 function isInternalHost(host) {
@@ -554,8 +555,8 @@ module.exports = function setupDashboard(app, deps) {
             const host = publicRequestHost(req);
 
             if (host) {
-                const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
-                const detected = `${proto}://${host}`.replace(/\/+$/, '');
+                // الدومين العام دايم https وبدون بورت (الدومين الجاهز يخدم على 443)
+                const detected = `https://${host}`;
 
                 if (typeof deps.setRuntimeDashboardUrl === 'function') {
                     deps.setRuntimeDashboardUrl(detected);
@@ -1367,8 +1368,11 @@ module.exports = function setupDashboard(app, deps) {
 
     function oauthRedirectUri(req) {
         const configured = envValue('DASHBOARD_REDIRECT_URI');
-        const host = publicRequestHost(req) || String(req.get('host') || '').trim();
-        const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+        const publicHost = publicRequestHost(req);
+        const host = publicHost || String(req.get('host') || '').trim();
+        const proto = publicHost
+            ? 'https'
+            : String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
         const detected = `${proto}://${host}/api/auth/callback`;
 
         // رابط مكتوب على localhost ما ينفع على استضافة عامة — نتجاهله ونكتشفه من الطلب

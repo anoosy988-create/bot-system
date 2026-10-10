@@ -113,25 +113,61 @@ const OWNER_IDS = String(process.env.OWNER_IDS || OWNER_ID)
 
 // رابط الداشبورد العام (مثال: https://my-bot.onrender.com)
 // لو ما حددته، يكتشفه البوت تلقائياً من أول طلب يجيه (يشتغل على أي استضافة)
+// رابط الداشبورد العام — نرجّع دومين نظيف https بدون بورت، ونتجاهل أي localhost
+function normalizeDashboardUrl(url) {
+    const host = String(url || '')
+        .trim()
+        .replace(/^https?:\/\//i, '')
+        .split('/')[0]
+        .split(':')[0];
+
+    if (!host) return '';
+    if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0)$/i.test(host)) return '';
+
+    return `https://${host}`;
+}
+
 let RUNTIME_DASHBOARD_URL = '';
+
+// بعض الاستضافات تعطيك الدومين في متغيّر بيئة جاهز — ناخذه تلقائياً
+function envDashboardUrl() {
+    const raw = [
+        process.env.DASHBOARD_URL,
+        process.env.DASHBOARD_PUBLIC_URL,
+        process.env.PUBLIC_URL,
+        process.env.APP_URL,
+        process.env.APP_BASE_URL,
+        process.env.RENDER_EXTERNAL_URL,
+        process.env.RAILWAY_PUBLIC_DOMAIN && `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`,
+        process.env.WEBSITE_HOSTNAME && `https://${process.env.WEBSITE_HOSTNAME}`,
+        process.env.DOMAIN && (/^https?:\/\//i.test(process.env.DOMAIN) ? process.env.DOMAIN : `https://${process.env.DOMAIN}`),
+        process.env.PUBLIC_DOMAIN && (/^https?:\/\//i.test(process.env.PUBLIC_DOMAIN) ? process.env.PUBLIC_DOMAIN : `https://${process.env.PUBLIC_DOMAIN}`)
+    ];
+
+    for (const value of raw) {
+        const clean = normalizeDashboardUrl(value);
+        if (clean) return clean;
+    }
+
+    return '';
+}
 
 // نحفظ الدومين اللي انكشف مرة — عشان يبقى بعد إعادة تشغيل الاستضافة
 const DASHBOARD_URL_FILE = path.join(__dirname, '.dashboard-url');
 
 try {
-    const cached = String(fs.readFileSync(DASHBOARD_URL_FILE, 'utf8') || '').trim();
-    if (/^https?:\/\//i.test(cached) && !/localhost|127\.0\.0\.1/i.test(cached)) {
-        RUNTIME_DASHBOARD_URL = cached.replace(/\/+$/, '');
-    }
+    RUNTIME_DASHBOARD_URL = normalizeDashboardUrl(fs.readFileSync(DASHBOARD_URL_FILE, 'utf8'));
 } catch {}
+
+// ما فيه دومين محفوظ؟ ناخذه من متغيّرات الاستضافة لو موجود
+if (!RUNTIME_DASHBOARD_URL) RUNTIME_DASHBOARD_URL = envDashboardUrl();
 
 const DASHBOARD_URL = String(process.env.DASHBOARD_URL || '').replace(/\/+$/, '');
 
 function setRuntimeDashboardUrl(url) {
-    const clean = String(url || '').replace(/\/+$/, '');
+    const clean = normalizeDashboardUrl(url);
 
-    if (!clean || /localhost|127\.0\.0\.1/i.test(clean)) return;
-    if (clean === RUNTIME_DASHBOARD_URL) return;
+    if (!clean || clean === RUNTIME_DASHBOARD_URL) return;
 
     RUNTIME_DASHBOARD_URL = clean;
 
@@ -4294,14 +4330,8 @@ async function userManagedGuilds(userId) {
 }
 
 function dashboardBaseUrl() {
-    const configured = String(DASHBOARD_URL || '').replace(/\/+$/, '');
-
-    // لو المحطوط localhost (أو فاضي) — نتجاهله ونستخدم اللي اكتشفه من الطلب
-    if (!configured || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(configured)) {
-        return String(RUNTIME_DASHBOARD_URL || '').replace(/\/+$/, '');
-    }
-
-    return configured;
+    // نرجّع دومين https نظيف بدون بورت؛ أي localhost أو قيمة فاضية تتجاهل
+    return normalizeDashboardUrl(DASHBOARD_URL) || normalizeDashboardUrl(RUNTIME_DASHBOARD_URL);
 }
 
 function dashboardLinkLine() {
