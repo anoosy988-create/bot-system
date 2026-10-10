@@ -206,7 +206,14 @@ if (!TOKEN) {
 // ======================================================
 
 const app = express();
-const PORT = Number(process.env.PORT) || 10000;
+// بعض الاستضافات (Pterodactyl/Wispbyte) تحط البورت في SERVER_PORT مو PORT —
+// لو أخذنا الغلط، الدومين يوجّه لبورت ثاني ويطلع "رفض الاتصال".
+const PORT = Number(
+    process.env.PORT ||
+    process.env.SERVER_PORT ||
+    process.env.DASHBOARD_PORT ||
+    process.env.HTTP_PORT
+) || 10000;
 
 // ✅ ضروري لـ Render / أي استضافة خلف بروكسي: بدونه req.protocol يطلع http دائماً
 //    في constructions رابط OAuth callback بيطلع غلط و Discord يرفضه.
@@ -214,7 +221,9 @@ app.set('trust proxy', true);
 app.disable('x-powered-by');
 
 const server = app.listen(PORT, '0.0.0.0', () => {
+    const portFromEnv = process.env.PORT || process.env.SERVER_PORT || process.env.DASHBOARD_PORT || process.env.HTTP_PORT;
     console.log(`🌐 Web server running on port ${PORT} (bound 0.0.0.0)`);
+    console.log(`   ↳ مصدر البورت: ${portFromEnv ? `env (${portFromEnv})` : 'افتراضي 10000 — لو استضافتك تعطيك بورت ثاني، اضبط PORT أو SERVER_PORT'}`);
 
     const announceUrl = (RUNTIME_DASHBOARD_URL || DASHBOARD_URL || '').replace(/\/+$/, '');
     if (announceUrl) {
@@ -1533,6 +1542,13 @@ function recordEvent(counterKey, guildId, userId) {
     return key;
 }
 
+// أخطاء سجل التدقيق المتوقّعة (البوت انطرد/مو بالسيرفر أو ما عنده View Audit Log)
+// ما تستاهل تطبّع وتزحم اللوق — نتعامل معها كـ "ما فيه فاعل" ونكمل.
+function isIgnorableAuditError(error) {
+    const code = error?.code || error?.status || error?.rawError?.code;
+    return code === 10004 || code === 50013 || code === 50001;
+}
+
 async function getAuditExecutor(guild, type, targetId = null) {
     try {
         const audit = await guild.fetchAuditLogs({ type, limit: 1 });
@@ -1544,9 +1560,11 @@ async function getAuditExecutor(guild, type, targetId = null) {
 
         return entry.executor?.id || null;
     } catch (error) {
-        console.error(
-            `Audit log fetch error (${guild?.id}, type ${type}): ${error.message}`
-        );
+        if (!isIgnorableAuditError(error)) {
+            console.error(
+                `Audit log fetch error (${guild?.id}, type ${type}): ${error.message}`
+            );
+        }
         return null;
     }
 }
@@ -1578,9 +1596,11 @@ async function getFloodExecutor(guild, type, maxEntries = 25, windowMs = 120000)
                 await new Promise(r => setTimeout(r, 1500 * attempt));
             }
         } catch (error) {
-            console.error(
-                `Audit flood fetch error (${guild.id}, type ${type}): ${error.message}`
-            );
+            if (!isIgnorableAuditError(error)) {
+                console.error(
+                    `Audit flood fetch error (${guild.id}, type ${type}): ${error.message}`
+                );
+            }
 
             if (attempt < 3) {
                 await new Promise(r => setTimeout(r, 1500 * attempt));
@@ -1625,10 +1645,12 @@ async function resolveAbuseExecutor(guild, auditType, targetId) {
                 );
             }
         } catch (error) {
-            console.error(
-                `[PROTECT] resolveAbuseExecutor ERROR ` +
-                `(type=${auditType} guild=${guild.id}):`, error.message
-            );
+            if (!isIgnorableAuditError(error)) {
+                console.error(
+                    `[PROTECT] resolveAbuseExecutor ERROR ` +
+                    `(type=${auditType} guild=${guild.id}):`, error.message
+                );
+            }
         }
 
         if (attempt < 3) {

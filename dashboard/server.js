@@ -319,6 +319,32 @@ function clientIp(req) {
     return safeLogValue(clean, 45);
 }
 
+// الرابط العام الحقيقي للطلب — نرجّع الهوست العام فقط، ونرفض أي هوست داخلي
+// (فحوصات الاستضافة أو البروكسي الداخلي ترسل localhost/ip داخلي وتسوّي الرابط غلط)
+function publicRequestHost(req) {
+    const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+    const rawHost = String(req.get('host') || '').trim();
+
+    const pick = [forwardedHost, rawHost].find(h => h && !isInternalHost(h));
+
+    return pick ? pick.replace(/^https?:\/\//i, '').replace(/\/+$/, '') : '';
+}
+
+function isInternalHost(host) {
+    const h = String(host || '').split(':')[0].trim().toLowerCase();
+    if (!h) return true;
+    if (h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0' || h === '::1' || h === '[::1]') return true;
+    if (/^10\./.test(h)) return true;
+    if (/^192\.168\./.test(h)) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true;
+    if (/^169\.254\./.test(h)) return true;
+
+    // نطاق عام لازم يكون فيه نقطة (نستبعد أسماء الحاويات الداخلية بدون نقطة)
+    if (!h.includes('.')) return true;
+
+    return false;
+}
+
 function fallbackAvatarSvg() {
     return `
         <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
@@ -525,7 +551,7 @@ module.exports = function setupDashboard(app, deps) {
     // نكتشف الرابط العام من أول طلب — لازم قبل أي route عشان يلتقط كل شي
     app.use((req, res, next) => {
         try {
-            const host = String(req.get('host') || '').trim();
+            const host = publicRequestHost(req);
 
             if (host) {
                 const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
@@ -1341,7 +1367,9 @@ module.exports = function setupDashboard(app, deps) {
 
     function oauthRedirectUri(req) {
         const configured = envValue('DASHBOARD_REDIRECT_URI');
-        const detected = `${req.protocol}://${req.get('host')}/api/auth/callback`;
+        const host = publicRequestHost(req) || String(req.get('host') || '').trim();
+        const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+        const detected = `${proto}://${host}/api/auth/callback`;
 
         // رابط مكتوب على localhost ما ينفع على استضافة عامة — نتجاهله ونكتشفه من الطلب
         const finalUri = configured && !/localhost|127\.0\.0\.1/i.test(configured) ? configured : detected;
