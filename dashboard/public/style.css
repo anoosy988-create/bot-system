@@ -1330,3 +1330,128 @@ kbd {
 ::-webkit-scrollbar-track { background: var(--bg-2); }
 ::-webkit-scrollbar-thumb { background: var(--red-dark); border-radius: 6px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--red); }
+
+/* ---------- تبويب الأوامر (من الداشبورد) ---------- */
+
+.cmd-page { display: flex; flex-direction: column; gap: 14px; }
+
+.cmd-card { box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15); }
+
+.cmd-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+}
+
+.cmd-code {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px 9px;
+    font-size: 14px;
+    color: var(--green);
+    direction: ltr;
+    display: inline-block;
+}
+
+.cmd-desc {
+    margin-top: 6px;
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.7;
+}
+
+.cmd-badge {
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.cmd-badge-on {
+    background: rgba(87, 242, 135, 0.12);
+    border: 1px solid rgba(87, 242, 135, 0.4);
+    color: var(--green);
+}
+
+.cmd-badge-off {
+    background: rgba(148, 155, 164, 0.1);
+    border: 1px solid var(--border);
+    color: var(--muted);
+}
+
+.cmd-subpills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+
+.cmd-subpill {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    direction: ltr;
+}
+
+.cmd-subpill:hover { border-color: var(--red); }
+
+.cmd-subpill.active {
+    background: rgba(88, 101, 242, 0.16);
+    border-color: #5865F2;
+    color: #fff;
+}
+
+.cmd-subpill-off { opacity: 0.45; }
+
+.cmd-option { margin-bottom: 8px; }
+
+.cmd-input {
+    width: 100%;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 8px 11px;
+    font-size: 13px;
+    font-family: inherit;
+}
+
+.cmd-input:focus { outline: none; border-color: #5865F2; }
+
+.cmd-opt-hint { color: var(--muted); font-size: 11px; font-weight: normal; }
+
+.cmd-req { color: var(--red-bright); }
+
+.cmd-result {
+    display: none;
+    margin-top: 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 13px;
+    line-height: 2;
+    white-space: normal;
+    max-height: 320px;
+    overflow: auto;
+}
+
+.cmd-result.show { display: block; }
+
+.cmd-report-block {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin: 8px 0;
+}
+
+.cmd-report-block b { color: var(--yellow); display: block; margin-bottom: 4px; }

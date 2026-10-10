@@ -428,7 +428,7 @@ async function renderHome() {
             <div class="home-hero">
                 <div class="home-hero-text">
                     <h1 class="home-title">أهلاً <span class="red">${escapeHtml(ME.globalName || ME.username || '')}</span> 👋</h1>
-                    <p class="home-sub">من هنا تبدأ — اضغط <b>ابدأ الآن</b> وبتطلع على كل سيرفراتك اللي عندك فيها صلاحية <b>Admin</b> أو رتبة <b>${escapeHtml(data.staffRoleName || 'ستريتر')}</b>.</p>
+                    <p class="home-sub">من هنا تبدأ — اضغط <b>ابدأ الآن</b> وبتطلع على كل سيرفراتك اللي عندك فيها رتبة <b>${escapeHtml(data.staffRoleName || 'ستريتر')}</b>.</p>
                     <div class="home-actions">
                         <button type="button" class="btn btn-primary btn-cta btn-start" data-action="go-servers">▶️ ابدأ الآن</button>
                         ${bot.inviteUrl
@@ -542,10 +542,8 @@ function noServersNotice(staffRoleName, inviteUrl) {
             <ul class="no-servers-list">
                 <li><b>البوت مو داخل سيرفرك</b> — أضفه أولاً من الزر تحت.</li>
                 <li>
-                    أو ما عندك صلاحية عليه — لازم تكون
-                    <b>مالك السيرفر</b>، أو عندك صلاحية
-                    <b>Administrator</b>، أو رتبة
-                    <b>${role}</b>، أو رتبتك <b>فوق رتبة البوت</b>.
+                    أو ما عندك صلاحية عليه — لازم تكون عندك رتبة
+                    <b>${role}</b> فقط (بدون Grade أو Admin إضافي).
                 </li>
             </ul>
 
@@ -594,7 +592,7 @@ async function renderServers() {
                     <div>
                         <h1 class="page-title">🛡️ لوحة التحكم</h1>
                         <div style="color:var(--muted);font-size:13px;margin-top:4px">
-                            تظهر لك سيرفراتك التي تملك فيها صلاحية <b>Admin</b> أو رتبة <b>${escapeHtml(data.staffRoleName || 'ستريتر')}</b> —
+                            تظهر لك سيرفراتك التي تملك فيها رتبة <b>${escapeHtml(data.staffRoleName || 'ستريتر')}</b> فقط —
                             والبوت يدير <b>${SERVERS.filter(isBotInside).length}</b> منها.
                         </div>
                     </div>
@@ -674,6 +672,7 @@ async function inviteBot(guild) {
 
 const TABS = [
     { id: 'overview', label: 'نظرة عامة', icon: '🏠' },
+    { id: 'commands', label: 'الأوامر', icon: '⌨️' },
     { id: 'embed', label: 'إيمبد', icon: '📩' },
     { id: 'protection', label: 'الحماية', icon: '🛡️' },
     { id: 'welcome', label: 'الترحيب', icon: '👋' },
@@ -771,6 +770,7 @@ function panelHTML(html) {
 function renderTab(tab) {
     switch (tab) {
         case 'overview': return renderOverview();
+        case 'commands': return renderCommands();
         case 'embed': return renderEmbed();
         case 'protection': return renderProtection();
         case 'welcome': return renderWelcome();
@@ -2711,6 +2711,274 @@ async function removeWhitelist(id) {
     } catch (e) { toast(e.message, 'err'); }
 }
 
+/* ---------- COMMANDS — أوامر السلاش من الداشبورد ---------- */
+
+const COMMANDS = { loaded: false, list: [], search: '', active: {} };
+
+const CMD_OPT_TYPE = { 3: 'نص', 4: 'رقم', 5: 'اختيار', 6: 'عضو', 7: 'روم', 8: 'رتبة', 9: 'عضو', 10: 'رقم', 11: 'مرفق' };
+
+// إظهار النتائج كنص عادي مع أسطر نظيفة (يمررها escapeHtml)
+function cmdTextResult(text) {
+    return escapeHtml(String(text || '')).replace(/\n/g, '<br>');
+}
+
+function commandsFieldHTML(o) {
+    const reqMark = o.required ? ' <span class="cmd-req">*</span>' : '';
+    const label = `<label>${escapeHtml(o.name)}${reqMark} <small class="cmd-opt-hint">${CMD_OPT_TYPE[o.type] || ''}</small></label>`;
+    const nameAttr = `data-opt-name="${escapeHtml(o.name)}" data-opt-type="${o.type}"`;
+
+    let input = '';
+
+    if (o.type === 3 && Array.isArray(o.choices) && o.choices.length) {
+        input = `<select class="cmd-input" ${nameAttr}>
+            <option value="">— اختر —</option>
+            ${o.choices.map(c => `<option value="${escapeHtml(c.value)}">${escapeHtml(c.name)}</option>`).join('')}
+        </select>`;
+    } else if (o.type === 5) {
+        input = `<select class="cmd-input" ${nameAttr}>
+            <option value="">— ${o.required ? 'مطلوب' : 'بدون'} —</option>
+            <option value="true">✅ نعم</option>
+            <option value="false">❌ لا</option>
+        </select>`;
+    } else if (o.type === 7) {
+        const chans = (GUILD.channels || []).slice().sort((a, b) => (a.position - b.position) || ((a.type === 4 ? -1 : 1) - (b.type === 4 ? -1 : 1)));
+        input = `<select class="cmd-input" ${nameAttr}>
+            <option value="">🔘 افتراضي</option>
+            ${chans.map(c => `<option value="${c.id}"># ${escapeHtml(c.name)} (${c.type === 0 ? 'نصي' : c.type === 2 ? 'صوتي' : c.type === 4 ? 'كاتقري' : 'أخرى'})</option>`).join('')}
+        </select>`;
+    } else if (o.type === 8) {
+        input = `<select class="cmd-input" ${nameAttr}>
+            <option value="">— اختر رتبة —</option>
+            ${(GUILD.roles || []).map(r => `<option value="${r.id}">${escapeHtml(r.name)}</option>`).join('')}
+        </select>`;
+    } else if (o.type === 6 || o.type === 9) {
+        input = `<input class="cmd-input" dir="ltr" ${nameAttr} list="cmds-members" placeholder="آيدي / منشن / اسم العضو">`;
+    } else if (o.type === 4 || o.type === 10) {
+        input = `<input class="cmd-input" type="number" ${nameAttr} placeholder="${o.required ? 'مطلوب' : 'اختياري'}">`;
+    } else if (o.type === 11) {
+        input = `<input class="cmd-input" dir="ltr" ${nameAttr} placeholder="رابط مباشر للملف (بدل الرفع)">`;
+    } else {
+        input = `<input class="cmd-input" ${nameAttr} placeholder="${o.required ? 'مطلوب' : 'اختياري'}">`;
+    }
+
+    return `<div class="form-field cmd-option">${label}${input}</div>`;
+}
+
+// نجمع قيم الخيارات من النموذج
+function commandsCollect(root) {
+    const options = {};
+    root.querySelectorAll('[data-opt-name]').forEach(el => {
+        const key = el.dataset.optName;
+        const type = Number(el.dataset.optType);
+        let v = el.value;
+        if (v === '' || v === null || v === undefined) return;
+        if (type === 5) v = v === 'true';
+        else if (type === 4 || type === 10) v = Number(v);
+        options[key] = v;
+    });
+    return options;
+}
+
+function commandsFormHTML(options) {
+    if (!options.length) return '<div style="color:var(--muted);font-size:12px">هذا الأمر بلا خيارات — اضغط تنفيذ مباشرة.</div>';
+    return options.map(commandsFieldHTML).join('');
+}
+
+function commandsCardHTML(cmd) {
+    const active = COMMANDS.active[cmd.name] || {};
+
+    // نحدد الزوج الفرعي النشط (أول زوج افتراضياً)
+    let chosen = null;
+    let isGrouped = null;
+    if (cmd.hasSubcommands) {
+        const subs = cmd.subcommands;
+        const activeGroup = active.group || '';
+        const activeSub = active.sub;
+        chosen = subs.find(s => (s.group || '') === activeGroup && s.name === activeSub)
+            || subs[0] || null;
+        isGrouped = chosen ? chosen.group : null;
+    }
+
+    const formOptions = chosen ? chosen.options : (cmd.options || []);
+    const chosenSub = chosen ? chosen.name : null;
+
+    const subPills = cmd.hasSubcommands ? `
+        <div class="cmd-subpills">
+            ${cmd.subcommands.map(s => `
+                <button type="button" class="cmd-subpill ${(s.name === chosenSub && (s.group || '') === (isGrouped || '')) ? 'active' : ''} ${!s.supported ? 'cmd-subpill-off' : ''}"
+                        data-action="cmd-sub" data-command="${escapeHtml(cmd.name)}" data-sub="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}"
+                        title="${escapeHtml(s.description)}">${s.group ? escapeHtml(s.group) + ' ' : ''}${escapeHtml(s.name)}</button>
+            `).join('')}
+        </div>
+    ` : '';
+
+    const body = cmd.supported ? `
+        <div class="cmd-form" data-cmd-form>
+            ${formOptions.length ? commandsFormHTML(formOptions) : ''}
+            <datalist id="cmds-members"></datalist>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button type="button" class="btn btn-primary btn-sm" data-action="cmd-execute"
+                    data-command="${escapeHtml(cmd.name)}" data-sub="${escapeHtml(chosenSub || '')}" data-group="${escapeHtml(isGrouped || '')}">▶ تنفيذ</button>
+            <span class="cmd-opt-hint">${chosenSub && chosenSub !== cmd.name ? `زوج: /${cmd.name} ${chosenSub}` : ''}</span>
+        </div>
+        <div class="cmd-result" data-cmd-result></div>
+    ` : `
+        <div class="section-note" style="margin-top:10px;margin-bottom:0">
+            ⚠️ هذا الأمر ما يقدر ينفذ من الداشبورد — <b>ينفّذ من ديسكورد فقط</b>:
+            ${escapeHtml(cmd.unsupportedReason || 'يحتاج تفاعل حي (زر/إيموجي/رسالة).')}
+        </div>
+    `;
+
+    return `
+        <div class="panel-card cmd-card" id="cmd-${escapeHtml(cmd.name)}">
+            <div class="cmd-head">
+                <div>
+                    <code class="cmd-code">/${escapeHtml(cmd.name)}</code>
+                    <div class="cmd-desc">${escapeHtml(cmd.description)}</div>
+                </div>
+                <span class="cmd-badge ${cmd.supported ? 'cmd-badge-on' : 'cmd-badge-off'}">${cmd.supported ? '✅ ينفذ من الداشبورد' : '💬 من ديسكورد'}</span>
+            </div>
+            ${subPills}
+            ${body}
+        </div>
+    `;
+}
+
+async function renderCommands() {
+    if (!COMMANDS.loaded || !COMMANDS.list.length) {
+        try {
+            const data = await api(`/api/server/${currentGuildId}/commands`);
+            COMMANDS.list = data.commands || [];
+            COMMANDS.loaded = true;
+            COMMANDS.active = {};
+        } catch (e) {
+            panelHTML(`<div class="panel-card">تعذر تحميل الأوامر: ${escapeHtml(e.message)}</div>`);
+            return;
+        }
+    }
+
+    panelHTML(`
+        <div class="panel-card">
+            <h3>⌨️ أوامر السلاش من الداشبورد</h3>
+            <div class="section-note">
+                كل أوامر السلاش المسجّلة على السيرفر ظاهرة هنا. اللي يظهر عليه <b>✅ ينفذ من الداشبورد</b>
+                يتنفّذ فوراً على السيرفر بدون ما تدخل ديسكورد (مثل /ban، /embed، /giveaway start...).
+                اللي عنده <b>💬 من ديسكورد</b> يحتاج تفاعل حي داخل ديسكورد (زر/إيموجي/رسالة).
+                <br>🔐 الوصول لكل شيء هنا محصور برتبة <b>${escapeHtml(GUILD.staffRoleName || 'ستريتر')}</b>.
+            </div>
+            <div class="form-field" style="margin-top:10px">
+                <input id="cmd-search" class="cmd-input" placeholder="🔍 ابحث عن أمر..." value="${escapeHtml(COMMANDS.search)}">
+            </div>
+        </div>
+        <div class="cmd-page" id="cmd-list"></div>
+    `);
+
+    const searchEl = $('#cmd-search');
+    if (searchEl) {
+        searchEl.oninput = debounce(e => {
+            COMMANDS.search = e.target.value;
+            renderCommandsList();
+        }, 250);
+    }
+
+    renderCommandsList();
+}
+
+// إعادة رسم قائمة الأوامر فقط (بدون إعادة بناء البحث)
+function renderCommandsList() {
+    const listEl = $('#cmd-list');
+    if (!listEl) return;
+
+    const q = COMMANDS.search.trim().toLowerCase();
+    const filtered = COMMANDS.list.filter(c => {
+        if (!q) return true;
+        if (c.name.includes(q)) return true;
+        if (c.description && c.description.includes(q)) return true;
+        return c.subcommands.some(s => s.name.includes(q) || (s.group || '').includes(q));
+    });
+
+    // مرتبة: المدعومة أولاً
+    const sorted = [...filtered].sort((a, b) => (b.supported - a.supported) || a.name.localeCompare(b.name));
+
+    listEl.innerHTML = sorted.length === 0
+        ? '<div class="panel-card" style="color:var(--muted)">ما فيه نتائج.</div>'
+        : sorted.map(commandsCardHTML).join('');
+
+    // opt-inputs اللي تحتاج اقتراح أعضاء
+    const memberInput = listEl.querySelector('.cmd-input[data-opt-type="6"], .cmd-input[data-opt-type="9"]');
+    if (memberInput) {
+        memberInput.addEventListener('input', cmdsMemberSuggestDebounced);
+    }
+}
+
+// اقتراحات أعضاء (datalist) حسب ما يكتب
+function cmdsMemberSuggestDebounced(e) {
+    const q = e.target.value.trim();
+    const datalist = $('#cmds-members');
+    if (!datalist) return;
+    if (q.length < 2) { datalist.innerHTML = ''; return; }
+    debounce(async () => {
+        try {
+            const data = await api(`/api/server/${currentGuildId}/members?q=${encodeURIComponent(q)}&limit=25`);
+            datalist.innerHTML = (data.members || []).map(m =>
+                `<option value="${m.id}">${escapeHtml(m.username)}${m.tag ? ' — ' + escapeHtml(m.tag) : ''}</option>`
+            ).join('');
+        } catch {}
+    }, 250)();
+}
+
+// تنفيذ الأمر
+async function cmdExecute(command, sub, group) {
+    const card = $('#cmd-' + command);
+    if (!card) return;
+    const resultEl = card.querySelector('[data-cmd-result]');
+    const btn = card.querySelector('[data-action="cmd-execute"]');
+    const options = commandsCollect(card);
+    if (!btn) return;
+
+    btn.disabled = true;
+    btn.textContent = '⏳ جارٍ التنفيذ...';
+    if (resultEl) { resultEl.classList.add('show'); resultEl.innerHTML = '<span style="color:var(--muted)">⏳ جارٍ التنفيذ على السيرفر...</span>'; }
+
+    try {
+        const res = await api(`/api/server/${currentGuildId}/commands/execute`, {
+            method: 'POST',
+            body: JSON.stringify({ command, sub: sub || null, group: group || null, options })
+        });
+
+        if (res.data && res.data.type === 'report' && res.data.report) {
+            // التقرير الأمني
+            const rep = res.data.report;
+            resultEl.innerHTML = `
+                <b>${escapeHtml(rep.title || 'التقرير')}</b>
+                ${(rep.fields || []).map(f => `
+                    <div class="cmd-report-block">
+                        <b>${escapeHtml(f.name)}</b>
+                        <div>${escapeHtml(String(f.value || '')).replace(/\n/g, '<br>')}</div>
+                    </div>
+                `).join('')}
+            `;
+        } else {
+            resultEl.innerHTML = cmdTextResult(res.message || 'تم التنفيذ ✅');
+        }
+
+        // نحدّث الإعدادات بصمت عشان باقي التبويبات تلقط التغيير
+        api(`/api/server/${currentGuildId}`).then(d => { if (d && d.ok) GUILD = d; }).catch(() => {});
+    } catch (e) {
+        resultEl.innerHTML = `<span style="color:var(--red-bright)">${cmdTextResult(e.message || 'فشل التنفيذ.')}</span>`;
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '▶ تنفيذ';
+    }
+}
+
+// اختيار زوج فرعي
+function cmdSwitchSub(command, sub, group) {
+    COMMANDS.active[command] = { sub, group: group || '' };
+    renderCommandsList();
+}
+
 function dashboardAction(trigger) {
     const data = trigger.dataset;
 
@@ -2783,6 +3051,8 @@ function dashboardAction(trigger) {
         case 'save-auto-role': return () => saveAutoRole();
         case 'add-whitelist': return () => addWhitelist();
         case 'remove-whitelist': return () => removeWhitelist(data.userId);
+        case 'cmd-sub': return () => cmdSwitchSub(data.command, data.sub, data.group);
+        case 'cmd-execute': return () => cmdExecute(data.command, data.sub, data.group);
         default: return null;
     }
 }

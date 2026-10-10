@@ -1,5 +1,6 @@
 // الداشبورد مفتوح للكل، بس كل واحد يشوف سيرفراته هو فقط،
-// وإعدادات الحماية = راعي البوت (الي رتّب البوت) وحده.
+// والوصول لكل سيرفر محصور باللي عنده رتبة "ستريتر"،
+// والسيرفرات الخارجية (البوت مو داخلها) تظهر لراعي البوت فقط.
 // تشغيل: node tools/access.test.js
 
 const http = require('http');
@@ -96,9 +97,9 @@ const deps = {
     sendLog: async () => {},
     jailMember: async () => {},
     unjailMember: async () => {},
-    // كل عضو داخل السيرفر يقدر يديره (محاكاة Administrator)
+    // كل عضو بسيرفر الفيكسشر عنده رتبة الستريتر (محاكاة العضوية)
     isServerAdmin: () => true,
-    memberHasStaffRole: () => false,
+    memberHasStaffRole: () => true,
     hasStaffAccess: () => true,
     DashboardUser: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
     DashboardLog: { find: () => ({ sort: () => ({ limit: () => ({ lean: async () => [] }) }) }) },
@@ -178,15 +179,22 @@ function request(port, path, method, cookie, payload) {
     ok('ما في تداخل بين حسابين', JSON.stringify(ownerIds) === JSON.stringify(adminIds), JSON.stringify({ ownerIds, adminIds }));
 
     console.log('\n--- 4) القائمة الموحّدة: البوت داخل ولا لا ---');
+    const oauthList = [{ id: GUILD_A, name: 'مكرر', hasAdministrator: true }, { id: GUILD_OUT, name: 'مو داخل', approximate_member_count: 55 }];
     const merged = api.mergeUserServers(
         [guilds.get(GUILD_A)],
-        [{ id: GUILD_A, name: 'مكرر', hasAdministrator: true }, { id: GUILD_OUT, name: 'مو داخل', approximate_member_count: 55 }]
+        oauthList,
+        users.BOT_OWNER.id
     );
     ok('السيرفر اللي البوت داخله موجود مرة واحدة بس', merged.length === 2, JSON.stringify(merged.map(g => g.id)));
     ok('السيرفر اللي البوت داخله: botInside = true', merged[0].botInside === true && merged[0].notInBot === false);
     ok('السيرفر اللي البوت مو داخله: botInside = false', merged[1].botInside === false && merged[1].notInBot === true);
     ok('السيرفر الخارجي يجيب عدد أعضائه', merged[1].memberCount === 55, JSON.stringify(merged[1]));
     ok('botInside() يطّلع على الواقع', api.botInside(GUILD_A) === true && api.botInside(GUILD_OUT) === false);
+    // السيرفر الخارجي ما يظهر لغير راعي البوت
+    const mergedNonOwner = api.mergeUserServers([guilds.get(GUILD_A)], oauthList, users.ADMIN_B.id);
+    ok('السيرفر الخارجي مخفي لغير راعي البوت',
+        mergedNonOwner.length === 1 && mergedNonOwner[0].id === GUILD_A,
+        JSON.stringify(mergedNonOwner.map(g => g.id)));
 
     console.log('\n--- 5) إعدادات الحماية مفتوحة لكل إدمن على سيرفره ---');
     ok('isBotOwner يعرف المالك', api.isBotOwner(users.BOT_OWNER.id) === true);

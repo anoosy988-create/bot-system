@@ -91,9 +91,9 @@ const deps = {
     getSettings: async (guildId) => fakeSettings(guildId),
     ensureProtections: () => {},
     sendLog: async () => {}, jailMember: async () => {}, unjailMember: async () => {},
-    // صلاحية = بس صاحب السيرفر (محاكاة "إدمن")
+    // صلاحية = بس صاحب السيرفر (محاكاة رتبة "ستريتر" عند صاحب السيرفر)
     isServerAdmin: (member, guild) => Boolean(member && guild && member.id === guild.ownerId),
-    memberHasStaffRole: () => false,
+    memberHasStaffRole: (member, guild) => Boolean(member && guild && member.id === guild.ownerId),
     hasStaffAccess: () => true,
     // لازم findOne يرجّع chain متزامن: .select().lean()
     // (لو عملناه async بيرجع Promise و .select ما بيكون موجود)

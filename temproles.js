@@ -351,5 +351,8 @@ module.exports = {
     tick,
     TempRole,
     DURATIONS,
-    DURATION_LABELS
+    DURATION_LABELS,
+    removeTempRole,
+    log,
+    format
 };

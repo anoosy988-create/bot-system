@@ -433,7 +433,10 @@ module.exports = function setupDashboard(app, deps) {
         ButtonStyle,
         ChannelType,
         AttachmentBuilder,
-        PermissionsBitField
+        PermissionsBitField,
+        slashCommands,
+        executeDashboardCommand,
+        isDashboardCommandSupported
     } = deps;
 
     // يتحقق من عقوبة "shortcut:<name>": يرجّع الصيغة الموحّدة لو الاختصار
@@ -643,13 +646,14 @@ module.exports = function setupDashboard(app, deps) {
     }
 
     // هل المستخدم يقدر يشوف/يدير هذا السيرفر؟
+    // 🎯 الوصول للستريتر فقط: بدون Admin كدخول إضافي (وبس)
     async function canManage(userId, guild, allowFetch = true) {
         if (await isDashboardRevoked(userId)) return false;
 
         const member = await getUserGuildMember(guild, userId, allowFetch);
         if (!member) return false;
 
-        return isServerAdmin(member, guild) || memberHasStaffRole(member, guild);
+        return memberHasStaffRole(member, guild);
     }
 
     // 🔒 الوايت ليست: راعي البوت (OWNER_IDS) أو راعي السيرفر فقط
@@ -771,8 +775,17 @@ module.exports = function setupDashboard(app, deps) {
     // فلترة سريعة للكاش: نتأكد بس إن البوت لسا داخل السيرفر — بدون فحص صلاحيات
     // لكل سيرفر (كان يسوي members.fetch ويعطّل كل طلب). الفحص الكامل يصير عند
     // التحديث بالخلفية، وأي إجراء فعلي محمي بـ canManage داخل requireGuild.
+    // 🎯 لو العضو موجود بكاش الأعضاء نتحقق فوراً من رتبة الستريتر (بدون صفة Admin).
     async function filterCachedServers(userId, entries) {
-        return entries.filter(entry => client.guilds.cache.has(String(entry.id)));
+        const out = [];
+        for (const entry of entries) {
+            const guild = client.guilds.cache.get(String(entry.id));
+            if (!guild) continue;
+            const member = guild.members.cache.get(String(userId));
+            if (member && !memberHasStaffRole(member, guild)) continue;
+            out.push(entry);
+        }
+        return out;
     }
 
     // آيديات السيرفرات المرشّحة من الجلسة: القائمة الكاملة (guildIds) وإلا قائمة
@@ -784,8 +797,7 @@ module.exports = function setupDashboard(app, deps) {
     }
 
     // قائمة فورية من الذاكرة — بدون أي نداء لديسكورد إطلاقاً:
-    // 1) سيرفرات OAuth اللي فيها المستخدم Administrator أو مالك (نجيبتها وقت الدخول)
-    // 2) سيرفرات البوت اللي عضو المستخدم موجودة بكاش الأعضاء وعنده أدمن أو ستريتر
+    // 🎯 الستريتر فقط: كل السيرفرات اللي المستخدم عنده رتبة ستريتر فيها
     function instantAccessibleServers(userId, session) {
         const uid = String(userId || session?.userId || '');
         const out = [];
@@ -799,14 +811,17 @@ module.exports = function setupDashboard(app, deps) {
 
         for (const g of session?.guilds || []) {
             if (!(g.owner === true || g.hasAdministrator === true)) continue;
-            push(client.guilds.cache.get(String(g.id)));
+            const guild = client.guilds.cache.get(String(g.id));
+            if (!guild) continue;
+            const member = guild.members.cache.get(uid);
+            if (member && memberHasStaffRole(member, guild)) push(guild);
         }
 
         for (const guild of client.guilds.cache.values()) {
             if (seen.has(guild.id)) continue;
             const member = guild.members.cache.get(uid);
             if (!member) continue;
-            if (isServerAdmin(member, guild) || memberHasStaffRole(member, guild)) push(guild);
+            if (memberHasStaffRole(member, guild)) push(guild);
         }
 
         return out;
@@ -928,7 +943,7 @@ module.exports = function setupDashboard(app, deps) {
         };
     }
 
-    function mergeUserServers(liveGuilds = [], oauthGuilds = []) {
+    function mergeUserServers(liveGuilds = [], oauthGuilds = [], userId = '') {
         const seen = new Set();
         const merged = [];
 
@@ -939,11 +954,17 @@ module.exports = function setupDashboard(app, deps) {
             merged.push(liveGuildRow(guild));
         }
 
-        for (const guild of oauthGuilds) {
-            const id = String(guild?.id || '');
-            if (!id || seen.has(id)) continue;
-            seen.add(id);
-            merged.push(externalGuildRow(guild));
+        // 🎯 السيرفرات "الخارجية" (ما فيه البوت) ما نقدر نفحص فيها رتبة الستريتر —
+        // فما تظهر إلا لراعي البوت فقط (عشان يعرف وين يضيف البوت).
+        const showExternal = isBotOwner(userId);
+
+        if (showExternal) {
+            for (const guild of oauthGuilds) {
+                const id = String(guild?.id || '');
+                if (!id || seen.has(id)) continue;
+                seen.add(id);
+                merged.push(externalGuildRow(guild));
+            }
         }
 
         return merged;
@@ -1553,7 +1574,7 @@ module.exports = function setupDashboard(app, deps) {
         const oauthGuilds = await sessionOAuthGuilds(req, req.query.refresh === '1');
 
         // القائمة الموحّدة: داخلها البوت + اللي مو داخلها، مع علامة botInside
-        const guilds = mergeUserServers(live, oauthGuilds);
+        const guilds = mergeUserServers(live, oauthGuilds, s.userId);
         const adminIds = oauthGuilds.map(g => String(g.id));
 
         if (req?.session && data) {
@@ -1626,7 +1647,7 @@ module.exports = function setupDashboard(app, deps) {
         const force = req.query.refresh === '1';
         const live = await accessibleServers(me.userId, force, req.session?.user || me);
         const oauthGuilds = await sessionOAuthGuilds(req, force);
-        const guilds = mergeUserServers(live, oauthGuilds);
+        const guilds = mergeUserServers(live, oauthGuilds, me.userId);
 
         res.json({
             ok: true,
@@ -2410,6 +2431,150 @@ module.exports = function setupDashboard(app, deps) {
 
     // ======================================================
     // الصيغة الأخيرة: كل السيرفرات المسجلة في القاعدة (داخلي)
+    // ======================================================
+    // أوامر السلاش من الداشبورد — قائمة + تنفيذ
+    // (الوصول محمي بـ requireGuild = رتبة الستريتر فقط)
+    // ======================================================
+
+    // نبني فهرس الأوامر للواجهة: الأمر + أزواجه الفرعية (group/sub)
+    // وخيارات كل زوج، مع علامة هل ينفذ من الداشبورد.
+    function commandsCatalog() {
+        const list = Array.isArray(slashCommands) ? slashCommands : [];
+
+        const rawOption = o => {
+            const base = {
+                name: o.name,
+                description: o.description,
+                type: o.type,
+                required: !!o.required
+            };
+            if (Array.isArray(o.choices) && o.choices.length) {
+                base.choices = o.choices.slice(0, 25);
+            }
+            return base;
+        };
+
+        const mapSub = (name, description, group, options) => ({
+            name,
+            description: description || '',
+            group: group || null,
+            options: Array.isArray(options) ? options.map(rawOption) : [],
+            supported: isDashboardCommandSupported(name, name)
+        });
+
+        return list.map(raw => {
+            const cmd = typeof raw?.toJSON === 'function' ? raw.toJSON() : (raw || {});
+            const name = cmd.name;
+            const supported = isDashboardCommandSupported(name);
+
+            const subs = [];
+
+            for (const o of Array.isArray(cmd.options) ? cmd.options : []) {
+                // زوج فرعي (type 1)
+                if (o.type === 1) {
+                    subs.push({
+                        ...mapSub(o.name, o.description, null, o.options),
+                        supported: isDashboardCommandSupported(name, o.name)
+                    });
+                } else if (o.type === 2) {
+                    // مجموعة أزواج (type 2) — كل زوج داخلي يكون بصفة group.
+                    // علامة الدعم تُحسب على اسم المجموعة (مثل welcome image / ticket image).
+                    for (const g of Array.isArray(o.options) ? o.options : []) {
+                        if (g.type !== 1) continue;
+                        subs.push({
+                            ...mapSub(g.name, g.description, o.name, g.options),
+                            supported: isDashboardCommandSupported(name, o.name)
+                        });
+                    }
+                }
+            }
+
+            return {
+                name,
+                description: cmd.description || '',
+                supported,
+                unsupportedReason: supported ? null : 'ينفّذ من ديسكورد فقط (يحتاج تفاعل مثل زر/إيموجي/رسالة حية).',
+                hasSubcommands: subs.length > 0,
+                subcommands: subs,
+                options: subs.length
+                    ? []
+                    : (Array.isArray(cmd.options) ? cmd.options.map(rawOption) : [])
+            };
+        });
+    }
+
+    // قائمة أوامر السلاش الخاصة بالسيرفر
+    app.get('/api/server/:guildId/commands', async (req, res) => {
+        try {
+            const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+            if (!ctx) return;
+            const { guild } = ctx;
+
+            res.json({ ok: true, commands: commandsCatalog(), guildId: guild.id });
+        } catch (error) {
+            console.error('Dashboard commands load error:', error);
+            if (!res.headersSent) {
+                res.status(500).json({ ok: false, error: 'تعذر تحميل قائمة الأوامر.' });
+            }
+        }
+    });
+
+    // تنفيذ أمر سلاش من الداشبورد
+    app.post('/api/server/:guildId/commands/execute', express.json(), async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+        const actorId = ctx.s.userId;
+
+        const { command, sub = null, group = null, options = {} } = req.body || {};
+
+        if (!command || typeof command !== 'string') {
+            return res.status(400).json({ ok: false, error: 'حدد الأمر (command).' });
+        }
+
+        // التأكد أن الأمر موجود فعلاً بالسلاش المسجّل
+        const known = commandsCatalog().find(c => c.name === command);
+        if (!known) {
+            return res.status(400).json({ ok: false, error: `أمر \`/${command}\` غير موجود.` });
+        }
+
+        if (sub && known.subcommands.length && !known.subcommands.some(
+            s => s.name === sub && (group ? s.group === group : !s.group)
+        )) {
+            return res.status(400).json({ ok: false, error: `الزوج الفرعي \`/${command} ${group ? group + ' ' : ''}${sub}\` غير موجود.` });
+        }
+
+        try {
+            const result = await executeDashboardCommand({
+                guild,
+                actorId,
+                channelId: guild.systemChannelId || guild.channels.cache.find(c => c.isTextBased())?.id || null,
+                command,
+                sub: sub || null,
+                group: group || null,
+                options: (options && typeof options === 'object') ? options : {}
+            });
+
+            // سجل أي تنفيذ/محاولة
+            logDashboard(guild.id, actorId, 'تنفيذ أمر من الداشبورد', `/${command}${sub ? ' ' + sub : ''} — ${result.ok ? 'ناجح' : 'فشل'}`);
+
+            if (result.unsupported) {
+                return res.status(400).json({ ok: false, unsupported: true, error: result.error });
+            }
+
+            if (!result.ok) {
+                return res.status(400).json({ ok: false, error: result.error });
+            }
+
+            return res.json({ ok: true, message: result.message, data: result.data || null });
+        } catch (error) {
+            console.error('Dashboard command execute error:', error);
+            return res.status(500).json({ ok: false, error: error.message || 'فشل التنفيذ.' });
+        }
+    });
+
+    // ======================================================
+    // تسجيل الخروج
     // ======================================================
 
     app.get('/api/server/:guildId/logout', (req, res) => {

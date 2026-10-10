@@ -10572,6 +10572,1088 @@ ${dirListing}
 </div></body></html>`;
 }
 
+// ======================================================
+// منفّذ أوامر الداشبورد — ينفّذ أوامر السلاش من الداشبورد
+// مباشرة على السيرفر (بدون الحاجة لديسكورد).
+// يقرأ { guild, actorId, channelId, command, sub, group, options }
+// ويرجّع { ok, message, data?, unsupported? }.
+// الوصول محمي بالداشبورد (ستريتر فقط). الأوامر غير المدعومة
+// ترجع unsupported:true مع رسالة تحوّل المستخدم لديسكورد.
+// ======================================================
+
+// القائمة الرسمية لأوامر (وأزواجها الفرعية) اللي تقدر تنفذ من الداشبورد:
+// '*' يعني كل الأزواج الفرعية.
+const DASHBOARD_SUPPORTED = {
+    jail: '*', unjail: '*', ban: '*', unban: '*', kick: '*',
+    timeout: '*', untimeout: '*', 'role-add': '*', 'role-remove': '*',
+    purge: '*', lock: '*', unlock: '*', embed: '*',
+    autoresponse: ['add', 'list', 'remove', 'edit'],
+    shortcut: ['add', 'list', 'remove', 'edit'],
+    setlog: '*',
+    'level-settings': '*',
+    autorole: ['set', 'off', 'status'],
+    welcome: ['set', 'card', 'variables', 'off', 'image'],
+    whitelist: ['add', 'remove', 'list'],
+    protect: ['channels', 'roles', 'bans', 'bots', 'webhooks', 'invites', 'status'],
+    antispam: ['spam', 'scams'],
+    giveaway: ['setup', 'start', 'end', 'reroll', 'list'],
+    temprole: ['add', 'remove', 'list'],
+    puzzle: ['start', 'end', 'list'],
+    ticket: ['setup', 'send', 'option', 'disable', 'info', 'image'],
+    backup: '*', restore: '*', 'security-audit': '*', stats: '*'
+};
+
+// هل هذا الأمر يقدر ينفذ من الداشبورد؟
+function isDashboardCommandSupported(command, sub = null) {
+    const entry = DASHBOARD_SUPPORTED[command];
+    if (!entry) return false;
+    if (!sub) return true;
+    if (entry === '*') return true;
+    if (Array.isArray(entry)) return entry.includes(sub);
+    return false;
+}
+
+// المقابلة الجاهزة لأوامر يحتاجون ديسكورد حقيقي
+// (زر/رسالة/إيموجي تفاعلي) — نستخدمها في واجهة الأوامر.
+function dashboardUnsupportedReason(command) {
+    if (isDashboardCommandSupported(command)) return null;
+
+    return 'ينفّذ من ديسكورد فقط (يحتاج تفاعل مثل زر/إيموجي/رسالة حية).';
+}
+
+async function executeDashboardCommand(ctx) {
+    const {
+        guild,
+        actorId,
+        channelId,
+        command,
+        sub = null,
+        group = null,
+        options = {}
+    } = ctx || {};
+
+    if (!guild || !actorId) return { ok: false, error: 'بيانات ناقصة (سيرفر أو منفّذ).' };
+
+    const opt = key => (
+        options && options[key] !== undefined && options[key] !== null
+            ? options[key]
+            : undefined
+    );
+
+    const idOf = value => {
+        if (value == null) return '';
+        return String(value).replace(/<@!?&?#?(\d{15,21})>/g, '$1').trim();
+    };
+
+    const resolveMember = async value => getMember(guild, idOf(value));
+    const resolveRole = value => guild.roles.cache.get(idOf(value)) || null;
+    const resolveChannel = value => guild.channels.cache.get(idOf(value)) || null;
+
+    // روم نصي افتراضي للرسائل (لو ما حدد المستخدم روم)
+    function defaultTextChannel() {
+        return guild.channels.cache
+            .filter(c => c.isTextBased())
+            .sort((a, b) => a.position - b.position)
+            .first() || null;
+    }
+
+    function pickChannel(value) {
+        const ch = resolveChannel(value) || resolveChannel(channelId);
+        if (ch) return ch;
+        return defaultTextChannel();
+    }
+
+    const settings = await getSettings(guild.id);
+    ensureProtections(settings);
+
+    const fail = (error = 'فشل التنفيذ.') => ({ ok: false, error: String(error) });
+    const done = message => ({ ok: true, message: String(message) });
+
+    try {
+        // ================= JAIL / UNJAIL =================
+        if (command === 'jail') {
+            const member = await resolveMember(opt('user'));
+            if (!member) return fail('العضو غير موجود بالسيرفر.');
+            if (String(member.id) === String(OWNER_ID)) return fail('لا يمكن سجن مالك البوت.');
+            await jailMember(member);
+            await sendLog(guild, 'moderation', '🔒 Jail', `${member} تم سجنه من الداشبورد بواسطة <@${actorId}>.`, 0xFFAA00);
+            return done(`🔒 تم سجن ${member} من الداشبورد.`);
+        }
+
+        if (command === 'unjail') {
+            const member = await resolveMember(opt('user'));
+            if (!member) return fail('العضو غير موجود بالسيرفر.');
+            const ok = await unjailMember(member);
+            if (!ok) return fail('هذا العضو ليس مسجوناً.');
+            await sendLog(guild, 'moderation', '🔓 Unjail', `${member} تم فك سجنه من الداشبورد بواسطة <@${actorId}>.`, 0x57F287);
+            return done(`🔓 تم فك سجن ${member} من الداشبورد.`);
+        }
+
+        // ================= BAN / UNBAN =================
+        if (command === 'ban') {
+            const reason = opt('reason') || 'بدون سبب';
+            const uid = idOf(opt('user'));
+            if (!uid) return fail('حدد العضو.');
+            if (uid === String(OWNER_ID)) return fail('لا يمكن حظر مالك البوت.');
+            const member = await getMember(guild, uid);
+            const target = member || await client.users.fetch(uid).catch(() => null);
+            if (!target) return fail('ما لقيت العضو.');
+            await guild.members.ban(target.id, { reason: `من الداشبورد — ${reason}` });
+            await sendLog(guild, 'moderation', '🔨 Ban', `${target} تم حظره من الداشبورد بواسطة <@${actorId}>.`, 0xED4245);
+            return done(`🔨 تم حظر ${target} من الداشبورد.`);
+        }
+
+        if (command === 'unban') {
+            const reason = opt('reason') || 'بدون سبب';
+            const uid = idOf(opt('user_id') || opt('user'));
+            if (!uid) return fail('حدد آيدي العضو.');
+            const bans = await guild.bans.fetch().catch(() => null);
+            const banned = bans ? bans.get(uid) : null;
+            if (!banned) return fail('هذا المستخدم مو محظور أصلاً.');
+            await guild.members.unban(uid, `من الداشبورد — ${reason}`);
+            await sendLog(guild, 'moderation', '🔨 Unban', `<@${uid}> تم رفع حظره من الداشبورد بواسطة <@${actorId}>.`, 0x57F287);
+            return done(`🔨 تم رفع حظر <@${uid}>.`);
+        }
+
+        // ================= KICK / TIMEOUT / UNTIMEOUT =================
+        if (command === 'kick') {
+            const member = await resolveMember(opt('user'));
+            if (!member) return fail('العضو غير موجود بالسيرفر.');
+            const reason = opt('reason') || 'بدون سبب';
+            await member.kick(`من الداشبورد — ${reason}`);
+            await sendLog(guild, 'moderation', '👢 Kick', `${member} تم طرده من الداشبورد بواسطة <@${actorId}>.`, 0xF1C40F);
+            return done(`👢 تم طرد ${member} من الداشبورد.`);
+        }
+
+        if (command === 'timeout') {
+            const member = await resolveMember(opt('user'));
+            if (!member) return fail('العضو غير موجود بالسيرفر.');
+            const duration = String(opt('duration') || '').trim();
+            const dm = duration.match(/^(\d+)(s|m|h|d)$/i);
+            if (!dm) return fail('صيغة المدة غلط — اكتب مثل 10m أو 1h أو 1d.');
+            const ms = Number(dm[1]) * ({ s: 1000, m: 60000, h: 3600000, d: 86400000 })[dm[2].toLowerCase()];
+            if (!ms || ms > 28 * 86400000) return fail('أقصى مدة تايم أوت 28 يوم.');
+            const reason = opt('reason') || 'بدون سبب';
+            await member.timeout(ms, `من الداشبورد — ${reason}`);
+            await sendLog(guild, 'moderation', '⏳ Timeout', `${member} كتم ${duration} من الداشبورد بواسطة <@${actorId}>.`, 0xF1C40F);
+            return done(`⏳ تم كتم ${member} لمدة **${duration}**.`);
+        }
+
+        if (command === 'untimeout') {
+            const member = await resolveMember(opt('user'));
+            if (!member) return fail('العضو غير موجود بالسيرفر.');
+            const reason = opt('reason') || 'بدون سبب';
+            await member.timeout(null, `من الداشبورد — ${reason}`);
+            return done(`✅ تم فك الكتم عن ${member}.`);
+        }
+
+        // ================= ROLE ADD / REMOVE =================
+        if (command === 'role-add') {
+            const member = await resolveMember(opt('user'));
+            const role = resolveRole(opt('role'));
+            if (!member || !role) return fail('حدد العضو والرتبة.');
+            if (!role.editable || role.managed) return fail('ما أقدر أعطي رتبة بوت أو رتبة فوق رتبتي.');
+            const reason = opt('reason') || 'من الداشبورد';
+            await member.roles.add(role, reason);
+            await sendLog(guild, 'moderation', '🎭 Role Add', `${member} أخذ ${role} من الداشبورد بواسطة <@${actorId}>.`, 0x57F287);
+            return done(`🎭 تم إعطاء ${role} للعضو ${member}.`);
+        }
+
+        if (command === 'role-remove') {
+            const member = await resolveMember(opt('user'));
+            const role = resolveRole(opt('role'));
+            if (!member || !role) return fail('حدد العضو والرتبة.');
+            if (!role.editable) return fail('ما أقدر أسحب رتبة بوت أو رتبة فوق رتبتي.');
+            const reason = opt('reason') || 'من الداشبورد';
+            await member.roles.remove(role, reason);
+            await sendLog(guild, 'moderation', '🎭 Role Remove', `${member} سُحبت منه ${role} من الداشبورد بواسطة <@${actorId}>.`, 0xF1C40F);
+            return done(`🎭 تم سحب ${role} من ${member}.`);
+        }
+
+        // ================= PURGE =================
+        if (command === 'purge') {
+            const ch = pickChannel(opt('channel'));
+            if (!ch || !ch.isTextBased()) return fail('حدد روم نصي.');
+            const amount = Math.min(100, Math.max(1, Number(opt('amount')) || 10));
+            const deleted = await ch.bulkDelete(amount, true).catch(() => null);
+            if (deleted === null) return fail('ما قدرت أحذف الرسائل (تأكد من صلاحياتي).');
+            await sendLog(guild, 'moderation', '🧹 Purge', `حُذفت **${deleted.size}** رسالة من ${ch} من الداشبورد بواسطة <@${actorId}>.`, 0x9B59B6);
+            return done(`🧹 حذفت **${deleted.size}** رسالة من ${ch}.`);
+        }
+
+        // ================= LOCK / UNLOCK =================
+        if (command === 'lock') {
+            const ch = pickChannel(opt('channel'));
+            if (!ch || !ch.isTextBased()) return fail('حدد روم.');
+            await ch.permissionOverwrites.edit(guild.id, { SendMessages: false }, { reason: 'من الداشبورد' });
+            await sendLog(guild, 'moderation', '🔒 Lock', `قفل روم ${ch} من الداشبورد بواسطة <@${actorId}>.`, 0xED4245);
+            return done(`🔒 تم قفل الروم ${ch}.`);
+        }
+
+        if (command === 'unlock') {
+            const ch = pickChannel(opt('channel'));
+            if (!ch || !ch.isTextBased()) return fail('حدد روم.');
+            await ch.permissionOverwrites.edit(guild.id, { SendMessages: null }, { reason: 'من الداشبورد' });
+            await sendLog(guild, 'moderation', '🔓 Unlock', `فتح روم ${ch} من الداشبورد بواسطة <@${actorId}>.`, 0x57F287);
+            return done(`🔓 تم فتح الروم ${ch}.`);
+        }
+
+        // ================= EMBED =================
+        if (command === 'embed') {
+            const ch = pickChannel(opt('channel'));
+            if (!ch || !ch.isTextBased()) return fail('حدد روم نصي.');
+            const description = String(opt('description') || '').trim();
+            if (!description) return fail('نص الإيمبد مطلوب.');
+
+            const eb = new EmbedBuilder().setDescription(description);
+            if (opt('title')) eb.setTitle(String(opt('title')));
+            if (opt('color')) eb.setColor(/^#?[0-9a-fA-F]{6}$/.test(String(opt('color'))) ? parseInt(String(opt('color')).replace('#', ''), 16) : 0x5865F2);
+            if (opt('footer')) eb.setFooter({ text: String(opt('footer')) });
+            if (opt('image')) eb.setImage(String(opt('image')));
+            if (opt('thumbnail')) eb.setThumbnail(String(opt('thumbnail')));
+            if (opt('url')) eb.setURL(String(opt('url')));
+
+            await ch.send({ embeds: [eb] });
+            await sendLog(guild, 'moderation', '📄 Embed', `أُرسل إيمبد في ${ch} من الداشبورد بواسطة <@${actorId}>.`, 0x5865F2);
+            return done(`✅ تم إرسال الإيمبد في ${ch}.`);
+        }
+
+        // ================= WELCOME =================
+        if (command === 'welcome') {
+            if (sub === 'set') {
+                const ch = resolveChannel(opt('channel'));
+                const message = String(opt('message') || '').trim();
+                if (!ch) return fail('حدد روم نصي للترحيب.');
+                if (!message) return fail('رسالة الترحيب مطلوبة.');
+                settings.welcome.enabled = true;
+                settings.welcome.channelId = ch.id;
+                settings.welcome.message = message;
+                await settings.save();
+                await sendLog(guild, 'moderation', '👋 Welcome', `<@${actorId}> فعّل الترحيب في ${ch} من الداشبورد.`, 0x57F287);
+                return done(`✅ تم تفعيل الترحيب في ${ch}.`);
+            }
+
+            if (sub === 'card') {
+                const enabled = opt('enabled');
+                if (typeof enabled !== 'boolean') return fail('اختر تفعيل/إيقاف.');
+                settings.welcome.cardEnabled = enabled;
+                await settings.save();
+                return done(`🖼️ صورة الترحيب (Canvas) ${enabled ? 'مفعّلة ✅' : 'متوقفة ❌'}.`);
+            }
+
+            if (sub === 'variables') {
+                return done(
+                    'متغيرات رسالة الترحيب:\n' +
+                    '· `{user}` — المنشن\n· `{username}` — الاسم\n· `{server}` — اسم السيرفر\n' +
+                    '· `{members}` — عدد الأعضاء\n· `{joinedAt}` — تاريخ الدخول\n· `{inviter}` — الداعي'
+                    + '\n· `{invites}` — عدد دعوات الداعي\n· `{userCount}` — ترتيب العضو'
+                );
+            }
+
+            if (sub === 'off') {
+                settings.welcome.enabled = false;
+                await settings.save();
+                await sendLog(guild, 'moderation', '👋 Welcome Off', `<@${actorId}> أوقف الترحيب من الداشبورد.`, 0xED4245);
+                return done(`⛔ تم إيقاف الترحيب.`);
+            }
+
+            if (sub === 'image') {
+                if (group === 'set') {
+                    const url = String(opt('url') || '').trim();
+                    if (!/^https?:\/\/.+/i.test(url)) return fail('أرسل رابط صورة مباشر (https://...).');
+                    settings.welcome.image = url;
+                    settings.welcome.cardEnabled = false;
+                    await settings.save();
+                    return done(`🖼️ تم تعيين صورة الترحيب من الداشبورد.`);
+                }
+                if (group === 'remove') {
+                    settings.welcome.image = null;
+                    settings.welcome.cardEnabled = true;
+                    await settings.save();
+                    return done(`🖼️ حذفنا صورة الترحيب — رجعنا للبطاقة (Canvas).`);
+                }
+            }
+
+            return fail('أمر welcome فرعي غير معروف.');
+        }
+
+        // ================= AUTORESPONSE =================
+        if (command === 'autoresponse') {
+            if (sub === 'add') {
+                const trigger = String(opt('trigger') || '').trim();
+                const response = String(opt('response') || '').trim();
+                if (!normalizeText(trigger)) return fail('الكلمة المطلوبة للرد التلقائي لا يمكن أن تكون فارغة.');
+                if (settings.autoResponses.some(x => normalizeText(x.trigger) === normalizeText(trigger))) {
+                    return fail('هذا الرد التلقائي موجود مسبقاً.');
+                }
+                settings.autoResponses.push({ trigger, response, staffOnly: !!opt('staff_only') });
+                await settings.save();
+                await sendLog(guild, 'moderation', '🤖 Autoresponse', `<@${actorId}> أضاف رد تلقائي "**${trigger}**" من الداشبورد.`, 0x57F287);
+                return done(`✅ أضفت الرد التلقائي **"${trigger}"** (العدد: ${settings.autoResponses.length}).`);
+            }
+
+            if (sub === 'list') {
+                if (!settings.autoResponses.length) return done('ℹ️ ما فيه ردود تلقائية حاليًا.');
+                const lines = settings.autoResponses.map((x, i) =>
+                    `**${i + 1}.** \`${x.trigger}\` → ${String(x.response).slice(0, 60)}${x.staffOnly ? ' 🔒' : ''}`
+                );
+                return done(lines.join('\n'));
+            }
+
+            if (sub === 'remove') {
+                const target = String(opt('target') || '').trim();
+                if (!target) return fail('حدد الرد من القائمة.');
+                const idx = settings.autoResponses.findIndex(x => normalizeText(x.trigger) === normalizeText(target));
+                if (idx === -1) return fail('هذا الرد مو موجود.');
+                settings.autoResponses.splice(idx, 1);
+                await settings.save();
+                return done(`🗑️ حذفت الرد **"${target}"**.`);
+            }
+
+            if (sub === 'edit') {
+                const target = String(opt('target') || '').trim();
+                const response = String(opt('response') || '').trim();
+                const idx = settings.autoResponses.findIndex(x => normalizeText(x.trigger) === normalizeText(target));
+                if (idx === -1) return fail('هذا الرد مو موجود.');
+                if (response) settings.autoResponses[idx].response = response;
+                if (opt('staff_only') !== undefined) settings.autoResponses[idx].staffOnly = !!opt('staff_only');
+                await settings.save();
+                return done(`✏️ عدّلت الرد **"${target}"**.`);
+            }
+
+            return fail('أمر autoreponse فرعي غير معروف.');
+        }
+
+        // ================= SHORTCUT =================
+        if (command === 'shortcut') {
+            if (sub === 'add') {
+                const name = String(opt('name') || '').trim();
+                const cmd = String(opt('command') || '').trim();
+                if (!normalizeText(name)) return fail('اسم الاختصار لا يمكن أن يكون فارغاً.');
+                if (settings.shortcuts.some(x => normalizeText(x.name) === normalizeText(name))) {
+                    return fail('هذا الاختصار موجود مسبقاً.');
+                }
+                settings.shortcuts.push({ name, command: cmd });
+                await settings.save();
+                await sendLog(guild, 'moderation', '⚡ Shortcut', `<@${actorId}> أضاف اختصار "**${name}**" → \`${cmd}\` من الداشبورد.`, 0x00B0F4);
+                return done(`⚡ أضفت الاختصار **"${name}"** → \`${cmd}\`.`);
+            }
+
+            if (sub === 'list') {
+                if (!settings.shortcuts.length) return done('ℹ️ ما فيه اختصارات حاليًا.');
+                const lines = settings.shortcuts.map((x, i) => `**${i + 1}.** \`${x.name}\` → \`${x.command}\``);
+                return done(lines.join('\n'));
+            }
+
+            if (sub === 'remove') {
+                const target = String(opt('target') || '').trim();
+                const idx = settings.shortcuts.findIndex(x => normalizeText(x.name) === normalizeText(target));
+                if (idx === -1) return fail('هذا الاختصار مو موجود.');
+                settings.shortcuts.splice(idx, 1);
+                await settings.save();
+                return done(`🗑️ حذفت الاختصار **"${target}"**.`);
+            }
+
+            if (sub === 'edit') {
+                const target = String(opt('target') || '').trim();
+                const idx = settings.shortcuts.findIndex(x => normalizeText(x.name) === normalizeText(target));
+                if (idx === -1) return fail('هذا الاختصار مو موجود.');
+                if (opt('name')) settings.shortcuts[idx].name = String(opt('name'));
+                if (opt('command')) settings.shortcuts[idx].command = String(opt('command'));
+                await settings.save();
+                return done(`✏️ عدّلت الاختصار **"${target}"**.`);
+            }
+
+            return fail('أمر shortcut فرعي غير معروف.');
+        }
+
+        // ================= SETLOG =================
+        if (command === 'setlog') {
+            const ch = resolveChannel(opt('channel'));
+            if (!ch) return fail('حدد روم.');
+            settings.logs.moderation = ch.id;
+            await settings.save();
+            await sendLog(guild, 'moderation', '📑 SetLog', `${ch} أصبح روم سجلات الإدارة من الداشبورد بواسطة <@${actorId}>.`, 0x5865F2);
+            return done(`✅ ${ch} أصبح روم سجلات الإدارة.`);
+        }
+
+        // ================= LEVEL SETTINGS =================
+        if (command === 'level-settings') {
+            const messages = Number(opt('messages'));
+            const level = Number(opt('level'));
+            const role = opt('role') ? resolveRole(opt('role')) : null;
+
+            if (messages > 0) {
+                const next = Math.max(1, Math.min(100000, Math.round(messages)));
+                settings.levelSettings.messagesPerLevel = next;
+            }
+
+            if (level > 0 && role) {
+                settings.levelSettings.rewards.set(String(Math.round(level)), role.id);
+                settings.markModified('levelSettings.rewards');
+            }
+
+            if (!(messages > 0) && !(level > 0 && role)) {
+                return fail('أرسل عدد الرسائل لكل مستوى، أو مستوى + رتبة كمكافأة.');
+            }
+
+            await settings.save();
+            await sendLog(guild, 'moderation', '📊 Level Settings', `<@${actorId}> حدّث إعدادات المستويات من الداشبورد.`, 0x57F287);
+            return done(`✅ تم تحديث إعدادات المستويات.\n💬 الرسائل لكل مستوى: **${settings.levelSettings.messagesPerLevel}**`);
+        }
+
+        // ================= AUTO ROLE =================
+        if (command === 'autorole') {
+            if (sub === 'set') {
+                const role = resolveRole(opt('role'));
+                if (!role) return fail('حدد رتبة.');
+                const botHighest = guild.members.me?.roles?.highest;
+                if (botHighest && role.position >= botHighest.position) {
+                    return fail('الرتبة لازم تكون **تحت** رتبة البوت.');
+                }
+                settings.autoRole.enabled = true;
+                settings.autoRole.roleId = role.id;
+                await settings.save();
+                await sendLog(guild, 'moderation', '🛡️ AutoRole', `<@${actorId}> فعّل الرتبة التلقائية ${role} من الداشبورد.`, 0x57F287);
+                return done(`✅ الرتبة التلقائية مفعّلة — أي عضو جديد بيحصل على ${role}.`);
+            }
+
+            if (sub === 'off') {
+                settings.autoRole.enabled = false;
+                settings.autoRole.roleId = null;
+                await settings.save();
+                return done(`⛔ تم إيقاف الرتبة التلقائية.`);
+            }
+
+            if (sub === 'status') {
+                const role = settings.autoRole.roleId ? guild.roles.cache.get(settings.autoRole.roleId) : null;
+                return done(
+                    `🛡️ الرتبة التلقائية: **${settings.autoRole.enabled ? 'مفعّلة ✅' : 'متوقفة ❌'}**\n` +
+                    `🎭 الرتبة: ${role ? role.toString() : 'غير محددة'}`
+                );
+            }
+
+            return fail('أمر autorole فرعي غير معروف.');
+        }
+
+        // ================= WHITELIST =================
+        if (command === 'whitelist') {
+            const isOwnerHere = String(guild.ownerId) === String(actorId) || isBotOwner(actorId);
+            if (!isOwnerHere) {
+                return fail('🔒 الوايت ليست للمالك فقط — راعي السيرفر أو راعي البوت.');
+            }
+
+            const list = () => {
+                if (!settings.whitelist?.length) return 'ℹ️ الوايت ليست فاضية.';
+                return settings.whitelist.map((id, i) => `**${i + 1}.** <@${id}>`).join('\n');
+            };
+
+            if (sub === 'add') {
+                const uid = idOf(opt('user'));
+                if (!uid) return fail('حدد العضو.');
+                if (settings.whitelist.includes(uid)) return fail('هذا العضو موجود مسبقاً بالوايت ليست.');
+                settings.whitelist.push(uid);
+                await settings.save();
+                ensureProtections(settings);
+                return done(`✅ أضفت <@${uid}> إلى الوايت ليست — الحماية ما تتدخل معه.`);
+            }
+
+            if (sub === 'remove') {
+                const uid = idOf(opt('user'));
+                if (!uid) return fail('حدد العضو.');
+                if (!settings.whitelist.includes(uid)) return fail('هذا العضو ليس بالوايت ليست.');
+                settings.whitelist = settings.whitelist.filter(id => id !== uid);
+                await settings.save();
+                ensureProtections(settings);
+                return done(`🗑️ أزلت <@${uid}> من الوايت ليست.`);
+            }
+
+            if (sub === 'list') return done(list());
+
+            return fail('أمر whitelist فرعي غير معروف.');
+        }
+
+        // ================= PROTECT =================
+        if (command === 'protect') {
+            const names = {
+                channels: 'الرومات', roles: 'الرتب', bans: 'الباند',
+                spam: 'السبام', webhooks: 'الويب هوك'
+            };
+
+            const applies = ['channels', 'roles', 'bans', 'webhooks'];
+
+            if (applies.includes(sub)) {
+                const prot = settings.protections[sub];
+                const enabled = opt('enabled');
+                const limit = Number(opt('limit'));
+                const timeframe = Number(opt('duration'));
+                const action = opt('action');
+
+                if (typeof enabled !== 'boolean') return fail(`اختر تفعيل/إيقاف لحماية ${names[sub]}.`);
+                prot.enabled = enabled;
+                if (limit > 0 && Number.isInteger(limit) && limit <= 50) prot.limit = limit;
+                if (timeframe > 0) prot.timeframe = timeframe * 1000;
+                if (action && PROTECTION_ACTIONS.includes(action)) prot.action = action;
+
+                await settings.save();
+                return done(
+                    `🛡️ حماية ${names[sub]}\n` +
+                    `الحالة: **${enabled ? 'مفعلة ✅' : 'متوقفة ❌'}**\n` +
+                    `الحد: **${prot.limit}**\n` +
+                    `العقوبة عند التجاوز: **${prot.action}**`
+                );
+            }
+
+            if (sub === 'bots') {
+                const enabled = opt('enabled');
+                if (typeof enabled !== 'boolean') return fail('اختر تفعيل/إيقاف.');
+                settings.protections.bots.enabled = enabled;
+                await settings.save();
+                return done(`🤖 حماية البوتات **${enabled ? 'مفعّلة ✅' : 'متوقفة ❌'}** (المرجع: رتبة البوت).`);
+            }
+
+            if (sub === 'invites') {
+                const prot = settings.protections.invites;
+                const enabled = opt('enabled');
+                const code = String(opt('code') || '').trim().replace(/[^a-zA-Z0-9-]/g, '');
+                const action = opt('action');
+                const ch = resolveChannel(opt('channel'));
+
+                if (typeof enabled !== 'boolean') return fail('اختر تفعيل/إيقاف.');
+
+                if (enabled && !code) {
+                    const invites = await guild.invites.fetch().catch(() => null);
+                    const best = invites
+                        ? Array.from(invites.values())
+                            .filter(i => i.channel)
+                            .sort((a, b) => (b.uses || 0) - (a.uses || 0))[0]
+                        : null;
+                    if (best) {
+                        prot.code = best.code;
+                        prot.channelId = best.channel.id;
+                    } else {
+                        return fail('ما فيه اختصار بالسيرفر — فعّل الحماية بعد ما ينشئ أحد اختصار.');
+                    }
+                } else if (enabled && code) {
+                    prot.code = code;
+                    if (ch) prot.channelId = ch.id;
+                }
+
+                prot.enabled = enabled;
+                if (action && PROTECTION_ACTIONS.includes(action)) prot.action = action;
+                await settings.save();
+                return done(`🔗 حماية اختصار السيرفر **${enabled ? 'مفعّلة ✅' : 'متوقفة ❌'}**\nاختصار محمي: \`${prot.code || '—'}\``);
+            }
+
+            if (sub === 'status') {
+                const p = settings.protections;
+                const on = v => (v ? '✅' : '❌');
+                const lines = [
+                    `الرومات: ${on(p.channels?.enabled)}`,
+                    `الرتب: ${on(p.roles?.enabled)}`,
+                    `الباند: ${on(p.bans?.enabled) || on(p.ban?.enabled)}`,
+                    `البوتات: ${on(p.bots?.enabled)}`,
+                    `السبام: ${on(p.spam?.enabled)}`,
+                    `الويب هوك: ${on(p.webhooks?.enabled)}`,
+                    `الاختصار: ${on(p.invites?.enabled)}`
+                ];
+                return done(`🛡️ **حالة الحمايات**\n${lines.join('\n')}`);
+            }
+
+            return fail('أمر protect فرعي غير معروف.');
+        }
+
+        // ================= ANTISPAM =================
+        if (command === 'antispam') {
+            if (sub === 'spam') {
+                const prot = settings.protections.spam;
+                const enabled = opt('enabled');
+                const limit = Number(opt('limit'));
+                const timeframe = Number(opt('duration'));
+                const action = opt('action');
+                const maxLength = Number(opt('maxlength'));
+                const repeated = Number(opt('repeated'));
+
+                if (typeof enabled !== 'boolean') return fail('اختر تفعيل/إيقاف.');
+                prot.enabled = enabled;
+                if (limit > 0) prot.limit = limit;
+                if (timeframe > 0) prot.timeframe = timeframe * 1000;
+                if (action && PROTECTION_ACTIONS.includes(action)) prot.action = action;
+                if (maxLength > 0) prot.maxLength = maxLength;
+                if (repeated > 0) prot.repeatedChar = repeated;
+
+                prot.metrics = prot.metrics || {};
+                if (limit > 0) prot.metrics.messages = limit;
+                if (maxLength > 0) prot.metrics.length = maxLength;
+                if (repeated > 0) prot.metrics.repeat = repeated;
+                for (const key of ['mentions', 'spaces', 'bigtext', 'files']) {
+                    const v = Number(opt(key));
+                    if (v >= 0) prot.metrics[key] = v;
+                }
+
+                const links = opt('links');
+                const invitesOpt = opt('invites');
+                if (typeof links === 'boolean') prot.onLinks = links;
+                if (typeof invitesOpt === 'boolean') prot.onInvites = invitesOpt;
+
+                await settings.save();
+                return done(
+                    `🛡️ حماية السبام\n` +
+                    `الحالة: **${enabled ? 'مفعّلة ✅' : 'متوقفة ❌'}**\n` +
+                    `الحد: **${prot.limit}** رسالة | الفترة: **${Math.round((prot.timeframe || 5000) / 1000)} ثانية**\n` +
+                    `أقصى طول رسالة: **${prot.maxLength}** | تكرار الحرف: **${prot.repeatedChar}**\n` +
+                    `روابط خارجية: **${prot.onLinks !== false ? 'محظورة 🚫' : 'مسموحة ✅'}** | دعوات: **${prot.onInvites !== false ? 'محظورة 🚫' : 'مسموحة ✅'}**`
+                );
+            }
+
+            if (sub === 'scams') {
+                const prot = settings.protections.scams;
+                const enabled = opt('enabled');
+                const channel = resolveChannel(opt('channel'));
+                const clear = opt('clear');
+                const talk = opt('talk');
+                const image = opt('image');
+                const link = opt('link');
+                const action = opt('action');
+
+                if (typeof enabled !== 'boolean') return fail('اختر تفعيل/إيقاف.');
+
+                if (channel) prot.channelIds = [channel.id];
+                if (clear === true) prot.channelIds = [];
+                if (typeof talk === 'boolean') prot.onTalk = talk;
+                if (typeof image === 'boolean') prot.onImage = image;
+                if (typeof link === 'boolean') prot.onLink = link;
+                if (action && PROTECTION_ACTIONS.includes(action)) prot.action = action;
+
+                prot.enabled = enabled;
+
+                const hasChannels = (prot.channelIds || []).length > 0;
+                const hasRules = prot.onTalk || prot.onImage || prot.onLink;
+                if (enabled && (!hasChannels || !hasRules)) {
+                    return fail('حدد روم محمي واحد + قاعدة واحدة على الأقل قبل التفعيل.');
+                }
+
+                await settings.save();
+                return done(`🛡️ حماية النصب **${enabled ? 'مفعّلة ✅' : 'متوقفة ❌'}**\nرومات محمية: ${(prot.channelIds || []).length} | قواعد: ${['كلام', 'صورة', 'رابط'].filter((_, i) => [prot.onTalk, prot.onImage, prot.onLink][i]).join('، ') || '—'}`);
+            }
+
+            return fail('أمر antispam فرعي غير معروف.');
+        }
+
+        // ================= GIVEAWAY =================
+        if (command === 'giveaway') {
+            if (sub === 'setup') {
+                const ch = resolveChannel(opt('channel'));
+                if (!ch) return fail('حدد روم نصي.');
+                settings.giveawayChannelId = ch.id;
+                await settings.save();
+                return done(`✅ تم تحديد روم السحوبات: ${ch}`);
+            }
+
+            if (sub === 'start') {
+                const prize = String(opt('prize') || '').trim();
+                const minutes = Number(opt('duration'));
+                const winners = Math.max(1, Number(opt('winners')) || 1);
+                const role = opt('role') ? resolveRole(opt('role')) : null;
+                const requireAvatar = opt('require_avatar') !== false;
+                const requireTag = opt('require_tag') !== false;
+
+                if (!prize) return fail('الجائزة مطلوبة.');
+                if (!(minutes > 0)) return fail('حدد مدة السحب بالدقائق.');
+
+                let ch = resolveChannel(opt('channel'));
+                if (!ch) ch = settings.giveawayChannelId ? guild.channels.cache.get(settings.giveawayChannelId) : null;
+                if (!ch || !ch.isTextBased()) return fail('حدد روم نصي أو اضبطه أولاً عبر /giveaway setup.');
+
+                const endsAt = new Date(Date.now() + minutes * 60 * 1000);
+                const gw = await giveaways.Giveaway.create({
+                    guildId: guild.id,
+                    channelId: ch.id,
+                    hostId: actorId,
+                    prize,
+                    winnersCount: winners,
+                    endsAt,
+                    requirements: { roleId: role ? role.id : null, requireAvatar, requireTag },
+                    entries: []
+                });
+
+                const msg = await ch.send({
+                    embeds: [giveaways.buildEmbed(gw.toObject(), guild, false)],
+                    components: [giveaways.actionRow(gw._id.toString())]
+                });
+                gw.messageId = msg.id;
+                await gw.save();
+
+                giveaways.log(guild, '🎁 Giveaway Started', `تم إنشاء سحب **${prize}** في ${ch} من الداشبورد بواسطة <@${actorId}>.`);
+                return done(`🎁 تم إنشاء السحب في ${ch} — ينتهي بعد **${minutes}** دقيقة.`);
+            }
+
+            if (sub === 'end') {
+                const messageId = String(opt('message_id') || '').trim();
+                const gw = await giveaways.Giveaway.findOne({ guildId: guild.id, messageId, ended: false }).lean();
+                if (!gw) return fail('ما لقيت سحب نشط بهذا الـ ID.');
+                const doc = await giveaways.Giveaway.findById(gw._id).catch(() => null);
+                if (!doc) return fail('ما لقيت السحب.');
+                await giveaways.endGiveaway(doc);
+                return done(`✅ تم إنهاء السحب **${gw.prize}**.`);
+            }
+
+            if (sub === 'reroll') {
+                const messageId = String(opt('message_id') || '').trim();
+                const gw = await giveaways.Giveaway.findOne({ guildId: guild.id, messageId }).lean();
+                if (!gw || !gw.ended) return fail('ما لقيت سحب منتهي بهذا الـ ID.');
+                const doc = await giveaways.Giveaway.findById(gw._id).catch(() => null);
+                const picked = await giveaways.pickWinners(guild, doc);
+                return done(picked && picked.length
+                    ? `🎉 أُعيد سحب الفائزين: ${picked.map(id => `<@${id}>`).join('، ')}`
+                    : '😔 ما فيه مشارك ينطبق عليه الشرط.');
+            }
+
+            if (sub === 'list') {
+                const list = await giveaways.Giveaway.find({ guildId: guild.id })
+                    .sort({ createdAt: -1 })
+                    .limit(20)
+                    .lean();
+                if (!list.length) return done('ℹ️ ما فيه سحوبات بعد.');
+                return done(list.map(gw =>
+                    `**${gw.prize}** — ${gw.ended ? '⛔ منتهي' : `⏳ <t:${Math.floor(new Date(gw.endsAt).getTime() / 1000)}:R>`} · مشاركون ${(gw.entries || []).length} · \`id:${gw.messageId || '—'}\``
+                ).join('\n'));
+            }
+
+            return fail('أمر giveaway فرعي غير معروف.');
+        }
+
+        // ================= TEMPROLE =================
+        if (command === 'temprole') {
+            if (sub === 'add') {
+                const member = await resolveMember(opt('member'));
+                const role = resolveRole(opt('role'));
+                const key = String(opt('duration') || 'week');
+
+                if (!member || !role) return fail('حدد العضو والرتبة.');
+                const me = guild.members.me;
+                if (!role.editable || role.managed || (me && role.position >= me.roles.highest.position)) {
+                    return fail('ما أقدر أعطي رتبة فوق رتبتي أو رتبة بوت/مدارة.');
+                }
+
+                const durationMs = temproles.DURATIONS[key];
+                if (durationMs === undefined) {
+                    return fail(`المدة غير معروفة. المتاح: ${Object.keys(temproles.DURATIONS).join('، ')}`);
+                }
+
+                const expiresAt = durationMs === null ? null : new Date(Date.now() + durationMs);
+
+                await member.roles.add(role, `[TempRole] ${temproles.DURATION_LABELS[key]} بواسطة <@${actorId}> (داشبورد)`);
+
+                await temproles.TempRole.findOneAndUpdate(
+                    { guildId: guild.id, userId: member.id, roleId: role.id },
+                    { $set: { assignedBy: actorId, assignedAt: new Date(), expiresAt, notified: false } },
+                    { upsert: true }
+                );
+
+                temproles.log(guild, '⏳ Temp Role Added', `أعطى <@${actorId}> رتبة **${role.name}** للعضو ${member} من الداشبورد (${temproles.DURATION_LABELS[key]}).`);
+                return done(`⏳ تم إعطاء ${member} الرتبة ${role} لمدة **${temproles.DURATION_LABELS[key]}**.`);
+            }
+
+            if (sub === 'remove') {
+                const member = await resolveMember(opt('member'));
+                const role = resolveRole(opt('role'));
+                if (!member || !role) return fail('حدد العضو والرتبة.');
+                const doc = await temproles.TempRole.findOne({
+                    guildId: guild.id, userId: member.id, roleId: role.id
+                }).lean();
+                if (!doc) return fail('ما فيه رتبة مؤقتة مسجلة بهذي البيانات.');
+                await temproles.removeTempRole(doc, 'manual');
+                temproles.log(guild, '⏳ Temp Role Removed', `أزال <@${actorId}> الرتبة المؤقتة **${role.name}** من ${member} من الداشبورد.`);
+                return done(`✅ تمت إزالة الرتبة **${role.name}** من ${member}.`);
+            }
+
+            if (sub === 'list') {
+                const list = await temproles.TempRole.find({ guildId: guild.id })
+                    .sort({ expiresAt: 1 })
+                    .limit(20)
+                    .lean();
+                if (!list.length) return done('ℹ️ ما فيه رتب مؤقتة مسجلة في هذا السيرفر.');
+                return done(list.map((doc, i) => {
+                    const r = guild.roles.cache.get(doc.roleId);
+                    const expired = doc.expiresAt && new Date(doc.expiresAt).getTime() <= Date.now();
+                    return `**${i + 1}.** <@${doc.userId}> — **${r ? r.name : doc.roleId}**\n└ ${doc.expiresAt ? (expired ? '⛔ منتهية' : `⏳ ${temproles.format(doc.expiresAt)}`) : '🔒 دائم'}`;
+                }).join('\n'));
+            }
+
+            return fail('أمر temprole فرعي غير معروف.');
+        }
+
+        // ================= PUZZLE =================
+        if (command === 'puzzle') {
+            if (sub === 'start') {
+                const code = String(opt('code') || '').trim();
+                const prize = String(opt('prize') || '').trim();
+                const hint = String(opt('hint') || '').trim();
+                const role = opt('role') ? resolveRole(opt('role')) : null;
+                const ch = resolveChannel(opt('channel'));
+
+                if (!/^\d{4}$/.test(code)) return fail('الرمز لازم يكون **4 أرقام** بالضبط.');
+                if (!prize) return fail('الجائزة مطلوبة.');
+                if (!ch || !ch.isTextBased()) return fail('حدد روم نصي.');
+
+                const pz = await puzzle.Puzzle.create({
+                    guildId: guild.id,
+                    channelId: ch.id,
+                    code,
+                    prize,
+                    prizeRoleId: role ? role.id : null,
+                    hint: hint || null,
+                    createdBy: actorId
+                });
+
+                try {
+                    const msg = await ch.send({
+                        embeds: [puzzle.buildEmbed(pz.toObject())],
+                        components: [puzzle.actionRow(pz._id.toString())]
+                    });
+                    pz.messageId = msg.id;
+                    await pz.save();
+                } catch (error) {
+                    await pz.deleteOne().catch(() => {});
+                    return fail(`فشل إرسال رسالة القفل: ${error.message}`);
+                }
+
+                puzzle.log(guild, '🔒 Puzzle Started', `قفل جديد من الداشبورد بواسطة <@${actorId}> في ${ch} — الجائزة: **${prize}**.`);
+                return done(`🔒 تم إنشاء القفل في ${ch}.\n🔐 الرمز: \`${code}\` (خاص — ما يعرض لأحد).`);
+            }
+
+            if (sub === 'end') {
+                const messageId = String(opt('message_id') || '').trim();
+                const pz = await puzzle.Puzzle.findOne({ guildId: guild.id, messageId, solved: false }).lean();
+                if (!pz) return fail('ما لقيت قفل نشط بهذا الـ ID.');
+
+                await puzzle.Puzzle.updateOne({ _id: pz._id }, { $set: { solved: true } });
+
+                const ch = guild.channels.cache.get(pz.channelId);
+                if (ch && pz.messageId) {
+                    const msg = await ch.messages.fetch(pz.messageId).catch(() => null);
+                    if (msg) {
+                        await msg.edit({
+                            embeds: [new EmbedBuilder()
+                                .setTitle('🔒 قفل ومفتاح')
+                                .setColor(0xED4245)
+                                .setDescription('⛔ تم إلغاء هذا القفل.')],
+                            components: [puzzle.actionRow(pz._id.toString(), true)]
+                        }).catch(() => {});
+                    }
+                }
+
+                return done('✅ تم إلغاء القفل.');
+            }
+
+            if (sub === 'list') {
+                const list = await puzzle.Puzzle.find({ guildId: guild.id, solved: false })
+                    .sort({ createdAt: -1 })
+                    .limit(20)
+                    .lean();
+                if (!list.length) return done('ℹ️ ما فيه أقفال نشطة.');
+                return done(list.map(pz =>
+                    `**${pz.prize}** — ${pz.hint ? `تلميح: ${pz.hint}` : 'بلا تلميح'} · \`id:${pz.messageId || '—'}\``
+                ).join('\n'));
+            }
+
+            return fail('أمر puzzle فرعي غير معروف.');
+        }
+
+        // ================= TICKET =================
+        if (command === 'ticket') {
+            if (sub === 'setup') {
+                const ch = resolveChannel(opt('channel'));
+                const category = resolveChannel(opt('category'));
+                const role = opt('role') ? resolveRole(opt('role')) : null;
+                const logCh = resolveChannel(opt('log_channel'));
+                const message = String(opt('message') || '').trim();
+
+                if (!ch) return fail('حدد روم لوحة التكتات.');
+
+                const data = {
+                    enabled: true,
+                    panelChannelId: ch.id,
+                    categoryId: category ? category.id : undefined,
+                    supportRoleId: role ? role.id : undefined,
+                    logChannelId: logCh ? logCh.id : undefined,
+                    welcomeMessage: message || undefined,
+                    sendPanel: false
+                };
+
+                await tickets.configureFromDashboard(settings, data, guild);
+                const sent = await tickets.sendPanelMessage(settings, guild, ch);
+                return done(`🎫 تم تفعيل نظام التكتات — لوحة التكتات في ${ch}${sent ? ' 🛎️ نُشرت اللوحة.' : ' (فشل نشر اللوحة — راجع رتبة الوصول).'}`);
+            }
+
+            if (sub === 'send') {
+                const ch = resolveChannel(opt('channel')) || (settings.tickets?.panelChannelId ? guild.channels.cache.get(settings.tickets.panelChannelId) : null);
+                if (!ch) return fail('حدد روم النشر (أو عيّن روم اللوحة أولاً).');
+                const sent = await tickets.sendPanelMessage(settings, guild, ch);
+                return sent ? done(`🛎️ نُشرت لوحة التكتات في ${ch}.`) : fail('فشل النشر — النظام معطّل أو الروم ما ينفع.');
+            }
+
+            if (sub === 'option') {
+                const mode = String(opt('mode') || '');
+                const label = String(opt('label') || '').trim();
+                const key = String(opt('key') || '').trim();
+                const description = String(opt('description') || '').trim();
+                const emoji = String(opt('emoji') || '').trim();
+                const state = String(opt('state') || 'active');
+
+                const cur = settings.tickets || { enabled: false, options: [] };
+
+                if (mode === 'add') {
+                    if (!label) return fail('اسم الخيار (label) مطلوب للإضافة.');
+                    const cleanOpts = tickets.cleanOptions(cur.options || []);
+                    if (cleanOpts.length >= tickets.MAX_OPTIONS) {
+                        return fail(`ما تقدر تضيف أكثر من **${tickets.MAX_OPTIONS}** خيار.`);
+                    }
+                    const newKey = key || `opt-${Date.now()}`;
+                    cleanOpts.push({
+                        key: newKey, label, description: description || null,
+                        emoji: emoji || null, suspended: state === 'suspended'
+                    });
+                    await tickets.configureFromDashboard(settings, { options: cleanOpts }, guild);
+                    return done(`➕ أضفت خيار **"${label}"** للتكتات.`);
+                }
+
+                if (mode === 'state') {
+                    if (!key) return fail('عيّن مفتاح الخيار key.');
+                    const cleanOpts = tickets.cleanOptions(cur.options || []);
+                    const found = cleanOpts.find(o => o.key === key);
+                    if (!found) return fail('ما لقيت خيار بهذا المفتاح.');
+                    found.suspended = state === 'suspended';
+                    await tickets.configureFromDashboard(settings, { options: cleanOpts }, guild);
+                    return done(`⏸️ الخيار **"${found.label}"** أصبح ${state === 'suspended' ? 'معلّقاً' : 'مفعّلاً'}.`);
+                }
+
+                if (mode === 'remove') {
+                    if (!key) return fail('عيّن مفتاح الخيار key.');
+                    const cleanOpts = tickets.cleanOptions(cur.options || []).filter(o => o.key !== key);
+                    await tickets.configureFromDashboard(settings, { options: cleanOpts }, guild);
+                    return done(`➖ حذفت الخيار بمفتاح **"${key}"**.`);
+                }
+
+                return fail('اختر mode: add / state / remove.');
+            }
+
+            if (sub === 'disable') {
+                await tickets.configureFromDashboard(settings, { enabled: false }, guild);
+                return done('⛔ تم إيقاف نظام التكتات بالكامل.');
+            }
+
+            if (sub === 'info') {
+                const t = settings.tickets || {};
+                const options = tickets.ticketOptions(settings);
+                const lines = [
+                    `🎫 نظام التكتات: **${t.enabled ? 'مفعّل ✅' : 'متوقف ❌'}**`,
+                    `🖥️ روم اللوحة: ${t.panelChannelId ? `<#${t.panelChannelId}>` : '—'}`,
+                    `🗂️ الكاتقري: ${t.categoryId ? `<#${t.categoryId}>` : '—'}`,
+                    `🛎️ رتبة الدعم: ${t.supportRoleId ? `<@&${t.supportRoleId}>` : '—'}`,
+                    `📑 سجل التكتات: ${t.logChannelId ? `<#${t.logChannelId}>` : '—'}`,
+                    `🗂️ الخيارات: **${options.length}**`
+                ];
+                if (options.length) {
+                    lines.push(options.map(o => `· ${o.emoji || '🎯'} **${o.label}**${o.suspended ? ' ⏸️' : ''} — \`${o.key}\``).join('\n'));
+                }
+                return done(lines.join('\n'));
+            }
+
+            if (sub === 'image') {
+                if (group === 'set') {
+                    const url = String(opt('url') || '').trim();
+                    if (!/^https?:\/\/.+/i.test(url)) return fail('أرسل رابط صورة مباشر.');
+                    const cur = settings.tickets || {};
+                    const data = { welcomeImage: url, panelImage: cur.panelImage || null };
+                    await tickets.configureFromDashboard(settings, data, guild);
+                    return done('🖼️ تم تعيين صورة الإيمبد داخل التكت.');
+                }
+                if (group === 'panel') {
+                    const url = String(opt('url') || '').trim();
+                    if (!/^https?:\/\/.+/i.test(url)) return fail('أرسل رابط صورة مباشر.');
+                    const cur = settings.tickets || {};
+                    const data = { panelImage: url, welcomeImage: cur.welcomeImage || null };
+                    await tickets.configureFromDashboard(settings, data, guild);
+                    return done('🖼️ تم تعيين صورة لوحة التكتات.');
+                }
+                if (group === 'remove') {
+                    await tickets.configureFromDashboard(settings, { panelImage: null, welcomeImage: null }, guild);
+                    return done('🖼️ حذفت كل صور التكتات.');
+                }
+            }
+
+            return fail('أمر ticket فرعي غير معروف.');
+        }
+
+        // ================= BACKUP / RESTORE =================
+        if (command === 'backup') {
+            const res = await captureGuildBackup(guild, 'manual');
+            if (!res.saved) return fail(res.error || 'ما نجحت النسخة.');
+            await sendLog(guild, 'moderation', '📦 Backup', `<@${actorId}> أنشأ نسخة احتياطية من الداشبورد.`, 0x5865F2);
+            return done(
+                `📦 تم حفظ نسخة احتياطية كاملة.\n` +
+                `الرومات: **${res.channels}** | الرتب: **${res.roles}** | الإيموجي: **${res.emojis}** | ستيكرات: **${res.stickers}**\n` +
+                (res.protections ? `🛡️ إعدادات الحماية مضمّنة أيضاً.` : '')
+            );
+        }
+
+        if (command === 'restore') {
+            const res = await restoreGuildFromBackup(guild, null);
+            if (res.error) {
+                const map = { 'no-backup': 'ما فيه نسخة احتياطية لهذا السيرفر.', 'empty-backup': 'النسخة فاضية.' };
+                return fail(map[res.error] || res.error);
+            }
+            await sendLog(guild, 'moderation', '♻️ Restore', `<@${actorId}> استرجع نسخة احتياطية من الداشبورد.`, 0x57F287);
+            return done(
+                `♻️ اكتمل الاسترجاع من النسخة الاحتياطية.\n` +
+                `رومات أنشئت: **${res.restoredChannels.length}** | رتب أنشئت: **${res.restoredRoles.length}**\n` +
+                `رومات حُذفت: **${res.deletedChannels}** | رتب حُذفت: **${res.deletedRoles}**\n` +
+                (res.protectionsApplied ? '🛡️ إعدادات الحماية استرجعت أيضاً.' : '')
+            );
+        }
+
+        // ================= SECURITY AUDIT =================
+        if (command === 'security-audit') {
+            const isOwnerHere = String(guild.ownerId) === String(actorId) || isBotOwner(actorId);
+            if (!isOwnerHere) return fail('❌ هذا التقرير للمالك فقط.');
+            const embed = await securityAudit.buildReport(guild);
+            return {
+                ok: true,
+                message: '🛡️ تقرير أمني شامل — محضّر:',
+                data: { type: 'report', report: embed.toJSON() }
+            };
+        }
+
+        // ================= STATS =================
+        if (command === 'stats') {
+            const guilds = client.guilds.cache;
+            const top = guilds
+                .map(g => `${g.name} (${g.memberCount} عضو)`)
+                .sort((a, b) => b.length - a.length)
+                .slice(0, 10)
+                .join('\n');
+            return done(
+                `📊 **إحصائيات البوت**\n\n` +
+                `🖥️ السيرفرات: **${guilds.size}**\n` +
+                `👥 إجمالي الأعضاء: **${guilds.reduce((s, g) => s + g.memberCount, 0)}**\n\n` +
+                (guilds.size ? `**أكبر ${10} سيرفرات:**\n${top}` : 'البوت غير مفعل في أي سيرفر بعد.')
+            );
+        }
+    } catch (error) {
+        console.error('[DASHBOARD-EXEC]', error);
+        return { ok: false, error: error?.message || 'خطأ غير متوقع.' };
+    }
+
+    // الأمر مو ضمن المدعومين
+    return {
+        ok: false,
+        unsupported: true,
+        error: `أمر \`/${command}\` ما يقدر ينفذ من الداشبورد.${dashboardUnsupportedReason(command) ? ` ${dashboardUnsupportedReason(command)}` : ''}`
+    };
+}
+
 function mountDashboard(targetApp, deps) {
     try {
         if (!DASHBOARD_PATHS) {
@@ -10687,7 +11769,10 @@ mountDashboard(app, {
     ChannelType,
     AttachmentBuilder,
     PermissionsBitField,
-    setRuntimeDashboardUrl
+    setRuntimeDashboardUrl,
+    slashCommands,
+    executeDashboardCommand,
+    isDashboardCommandSupported
 });
 
 // ======================================================

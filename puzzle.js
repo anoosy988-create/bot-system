@@ -343,5 +343,8 @@ module.exports = {
     handleSlash,
     handleButton,
     handleModal,
-    Puzzle
+    Puzzle,
+    buildEmbed,
+    actionRow,
+    log
 };

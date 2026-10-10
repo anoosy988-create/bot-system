@@ -519,5 +519,10 @@ module.exports = {
     handleButton,
     tick,
     Giveaway,
-    endGiveaway
+    endGiveaway,
+    buildEmbed,
+    actionRow,
+    pickWinners,
+    meetsRequirements,
+    log
 };
