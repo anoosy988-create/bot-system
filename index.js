@@ -115,10 +115,29 @@ const OWNER_IDS = String(process.env.OWNER_IDS || OWNER_ID)
 // لو ما حددته، يكتشفه البوت تلقائياً من أول طلب يجيه (يشتغل على أي استضافة)
 let RUNTIME_DASHBOARD_URL = '';
 
+// نحفظ الدومين اللي انكشف مرة — عشان يبقى بعد إعادة تشغيل الاستضافة
+const DASHBOARD_URL_FILE = path.join(__dirname, '.dashboard-url');
+
+try {
+    const cached = String(fs.readFileSync(DASHBOARD_URL_FILE, 'utf8') || '').trim();
+    if (/^https?:\/\//i.test(cached) && !/localhost|127\.0\.0\.1/i.test(cached)) {
+        RUNTIME_DASHBOARD_URL = cached.replace(/\/+$/, '');
+    }
+} catch {}
+
 const DASHBOARD_URL = String(process.env.DASHBOARD_URL || '').replace(/\/+$/, '');
 
 function setRuntimeDashboardUrl(url) {
-    RUNTIME_DASHBOARD_URL = String(url || '').replace(/\/+$/, '');
+    const clean = String(url || '').replace(/\/+$/, '');
+
+    if (!clean || /localhost|127\.0\.0\.1/i.test(clean)) return;
+    if (clean === RUNTIME_DASHBOARD_URL) return;
+
+    RUNTIME_DASHBOARD_URL = clean;
+
+    try {
+        fs.writeFileSync(DASHBOARD_URL_FILE, clean, 'utf8');
+    } catch {}
 }
 
 // ======================================================
@@ -225,12 +244,12 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Web server running on port ${PORT} (bound 0.0.0.0)`);
     console.log(`   ↳ مصدر البورت: ${portFromEnv ? `env (${portFromEnv})` : 'افتراضي 10000 — لو استضافتك تعطيك بورت ثاني، اضبط PORT أو SERVER_PORT'}`);
 
-    const announceUrl = (RUNTIME_DASHBOARD_URL || DASHBOARD_URL || '').replace(/\/+$/, '');
+    const announceUrl = dashboardBaseUrl();
     if (announceUrl) {
         console.log(`🔗 [داشبورد] افتح: ${announceUrl}`);
         console.log(`🔗 [داشبورد] رابط OAuth callback (ضيفه لدى Discord إن لم يكن موجوداً): ${announceUrl}/api/auth/callback`);
     } else {
-        console.log('🔗 [داشبورد] ما انضبط DASHBOARD_URL — ضيفه في .env (مثلاً DASHBOARD_URL=https://دومينك) ليظهر رابطه في السجلات.');
+        console.log('🔗 [داشبورد] الرابط حيتكشف تلقائياً — افتح دومين الاستضافة مرة وحدة وبيتكمل لوحده (وينحفظ).');
     }
 });
 
