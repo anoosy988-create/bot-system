@@ -449,6 +449,7 @@ module.exports = function setupDashboard(app, deps) {
         isServerAdmin,
         memberHasStaffRole,
         hasStaffAccess,
+        hasDashboardAccess,
         DashboardUser,
         DashboardLog,
         STAFF_ROLE_NAME,
@@ -463,7 +464,15 @@ module.exports = function setupDashboard(app, deps) {
         PermissionsBitField,
         slashCommands,
         executeDashboardCommand,
-        isDashboardCommandSupported
+        isDashboardCommandSupported,
+        Giveaway,
+        Feedback,
+        giveawayBuildEmbed,
+        giveawayActionRow,
+        giveawayEnd,
+        giveawayPickWinners,
+        feedbackBuildEmbed,
+        feedbackComponentsFor
     } = deps;
 
     // يتحقق من عقوبة "shortcut:<name>": يرجّع الصيغة الموحّدة لو الاختصار
@@ -680,7 +689,7 @@ module.exports = function setupDashboard(app, deps) {
         const member = await getUserGuildMember(guild, userId, allowFetch);
         if (!member) return false;
 
-        return hasStaffAccess(member, guild);
+        return hasDashboardAccess(member, guild);
     }
 
     // 🔒 الوايت ليست: راعي البوت (OWNER_IDS) أو راعي السيرفر فقط
@@ -827,7 +836,7 @@ module.exports = function setupDashboard(app, deps) {
             const guild = client.guilds.cache.get(String(entry.id));
             if (!guild) continue;
             const member = guild.members.cache.get(String(userId));
-            if (member && !hasStaffAccess(member, guild)) continue;
+            if (member && !hasDashboardAccess(member, guild)) continue;
             out.push(entry);
         }
         return out;
@@ -859,14 +868,14 @@ module.exports = function setupDashboard(app, deps) {
             const guild = client.guilds.cache.get(String(g.id));
             if (!guild) continue;
             const member = guild.members.cache.get(uid);
-            if (member && hasStaffAccess(member, guild)) push(guild);
+            if (member && hasDashboardAccess(member, guild)) push(guild);
         }
 
         for (const guild of client.guilds.cache.values()) {
             if (seen.has(guild.id)) continue;
             const member = guild.members.cache.get(uid);
             if (!member) continue;
-            if (hasStaffAccess(member, guild)) push(guild);
+            if (hasDashboardAccess(member, guild)) push(guild);
         }
 
         return out;
@@ -2621,6 +2630,314 @@ module.exports = function setupDashboard(app, deps) {
             console.error('Dashboard command execute error:', error);
             return res.status(500).json({ ok: false, error: error.message || 'فشل التنفيذ.' });
         }
+    });
+
+    // ======================================================
+    // 🎁 السحوبات (Giveaway) — من الداشبورد
+    // ======================================================
+
+    app.get('/api/server/:guildId/giveaways', async (req, res) => {
+        try {
+            const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+            if (!ctx) return;
+            const { guild } = ctx;
+
+            const settings = await getSettings(guild.id);
+            const list = await Giveaway.find({ guildId: guild.id })
+                .sort({ endsAt: -1 })
+                .limit(50)
+                .lean();
+
+            res.json({
+                ok: true,
+                channelId: settings.giveawayChannelId || null,
+                giveaways: list.map(gw => ({
+                    id: String(gw._id),
+                    prize: gw.prize,
+                    channelId: gw.channelId,
+                    channelName: guild.channels.cache.get(gw.channelId)?.name || null,
+                    winnersCount: gw.winnersCount,
+                    endsAt: new Date(gw.endsAt).getTime(),
+                    ended: !!gw.ended,
+                    entries: (gw.entries || []).length,
+                    winnerIds: gw.winnerIds || [],
+                    requirements: {
+                        roleId: gw.requirements?.roleId || null,
+                        requireAvatar: !!gw.requirements?.requireAvatar,
+                        requireTag: !!gw.requirements?.requireTag
+                    }
+                }))
+            });
+        } catch (error) {
+            console.error('Giveaways load error:', error);
+            if (!res.headersSent) res.status(500).json({ ok: false, error: 'تعذر تحميل السحوبات.' });
+        }
+    });
+
+    app.post('/api/server/:guildId/giveaways/setup', express.json(), async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+
+        const channelId = String(req.body?.channelId || '').trim();
+        if (!/^\d{15,21}$/.test(channelId) || !guild.channels.cache.has(channelId)) {
+            return res.status(400).json({ ok: false, error: 'اختر روم السحوبات أولاً.' });
+        }
+
+        const settings = await getSettings(guild.id);
+        settings.giveawayChannelId = channelId;
+        await settings.save();
+        logDashboard(guild.id, ctx.s.userId, 'تعديل إعدادات', 'giveaways');
+
+        res.json({ ok: true, channelId });
+    });
+
+    app.post('/api/server/:guildId/giveaways', express.json(), async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+        const actorId = ctx.s.userId;
+
+        const { prize, minutes, winners, channelId, roleId, requireAvatar, requireTag } = req.body || {};
+
+        const cleanPrize = String(prize || '').trim();
+        if (!cleanPrize) return res.status(400).json({ ok: false, error: 'اكتب اسم الجائزة.' });
+
+        const mins = Math.max(1, Math.min(10080, Math.round(Number(minutes) || 60)));
+        const count = Math.max(1, Math.min(25, Math.round(Number(winners) || 1)));
+
+        let channel = channelId ? guild.channels.cache.get(String(channelId)) : null;
+        if (!channel) {
+            const settings = await getSettings(guild.id);
+            channel = settings.giveawayChannelId ? guild.channels.cache.get(settings.giveawayChannelId) : null;
+        }
+        if (!channel) {
+            return res.status(400).json({ ok: false, error: 'اختر روم السحوبات (أو اضبطه أولاً).' });
+        }
+
+        const role = roleId ? (guild.roles.cache.get(String(roleId)) || null) : null;
+        const endsAt = new Date(Date.now() + mins * 60 * 1000);
+
+        const gw = await Giveaway.create({
+            guildId: guild.id,
+            channelId: channel.id,
+            hostId: actorId,
+            prize: cleanPrize,
+            winnersCount: count,
+            endsAt,
+            requirements: {
+                roleId: role ? role.id : null,
+                requireAvatar: !!requireAvatar,
+                requireTag: !!requireTag
+            },
+            entries: []
+        });
+
+        try {
+            const msg = await channel.send({
+                embeds: [giveawayBuildEmbed(gw.toObject(), guild, false)],
+                components: [giveawayActionRow(gw._id.toString())]
+            });
+            gw.messageId = msg.id;
+            await gw.save();
+        } catch (error) {
+            await Giveaway.deleteOne({ _id: gw._id }).catch(() => {});
+            return res.status(500).json({
+                ok: false,
+                error: 'أنشأت السحب بس ما قدرت أرسل الرسالة للروم: ' + (error.message || '—')
+            });
+        }
+
+        logDashboard(guild.id, actorId, 'إنشاء سحب', cleanPrize);
+        res.json({ ok: true, message: `تم إنشاء السحب في ${channel.name} 🎉` });
+    });
+
+    app.post('/api/server/:guildId/giveaways/:id/end', async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+
+        const gw = await Giveaway.findOne({ _id: req.params.id, guildId: guild.id }).lean();
+        if (!gw) return res.status(404).json({ ok: false, error: 'السحب غير موجود.' });
+        if (gw.ended) return res.status(400).json({ ok: false, error: 'السحب منتهي بالفعل.' });
+
+        const winners = await giveawayEnd(gw);
+        logDashboard(guild.id, ctx.s.userId, 'إنهاء سحب', gw.prize);
+
+        res.json({
+            ok: true,
+            message: winners && winners.length
+                ? 'تم إنهاء السحب — الفائزون معلنون في الروم.'
+                : 'تم إنهاء السحب — لا فائزين.',
+            winners: winners || []
+        });
+    });
+
+    app.post('/api/server/:guildId/giveaways/:id/reroll', async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+
+        const gw = await Giveaway.findOne({ _id: req.params.id, guildId: guild.id }).lean();
+        if (!gw) return res.status(404).json({ ok: false, error: 'السحب غير موجود.' });
+        if (!gw.ended) return res.status(400).json({ ok: false, error: 'السحب لسا شغال — خلّه ينتهي أول.' });
+
+        const winners = await giveawayPickWinners(guild, gw);
+        if (!winners.length) {
+            return res.json({ ok: true, message: 'لا فائزين (ما انطبق الشرط على أحد).', winners: [] });
+        }
+
+        await Giveaway.updateOne({ _id: gw._id }, { $set: { winnerIds: winners } });
+
+        const channel = guild.channels.cache.get(gw.channelId)
+            || await guild.channels.fetch(gw.channelId).catch(() => null);
+
+        if (channel) {
+            await channel.send({
+                content:
+                    `🎲 إعادة سحب **${gw.prize}** — الفائزون الجدد: ` +
+                    winners.map(id => `<@${id}>`).join(', ')
+            }).catch(() => {});
+        }
+
+        logDashboard(guild.id, ctx.s.userId, 'إعادة سحب', gw.prize);
+        res.json({ ok: true, message: 'تمت إعادة السحب — الفائزون الجدد معلنون.', winners });
+    });
+
+    // ======================================================
+    // 💬 الفيدباك (Feedback) — من الداشبورد
+    // ======================================================
+
+    app.get('/api/server/:guildId/feedback', async (req, res) => {
+        try {
+            const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+            if (!ctx) return;
+            const { guild } = ctx;
+
+            const settings = await getSettings(guild.id);
+            const list = await Feedback.find({ guildId: guild.id })
+                .sort({ createdAt: -1 })
+                .limit(50)
+                .lean();
+
+            res.json({
+                ok: true,
+                channelId: settings.feedbackChannelId || null,
+                feedback: list.map(fb => {
+                    const author = guild.members.cache.get(fb.userId) || client.users.cache.get(fb.userId);
+                    return {
+                        id: String(fb._id),
+                        name: author?.displayName || author?.username || null,
+                        avatar: author?.displayAvatarURL?.({ size: 128 }) || null,
+                        userId: fb.userId,
+                        subject: fb.subject || null,
+                        body: fb.body || '',
+                        rating: Number(fb.rating) || 0,
+                        status: fb.status === 'answered' ? 'answered' : 'open',
+                        replies: (fb.replies || []).map(r => ({
+                            by: r.by,
+                            text: r.text,
+                            at: new Date(r.at).getTime()
+                        })),
+                        channelId: fb.channelId,
+                        createdAt: new Date(fb.createdAt).getTime()
+                    };
+                })
+            });
+        } catch (error) {
+            console.error('Feedback load error:', error);
+            if (!res.headersSent) res.status(500).json({ ok: false, error: 'تعذر تحميل الفيدباك.' });
+        }
+    });
+
+    app.post('/api/server/:guildId/feedback/setup', express.json(), async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+
+        const channelId = String(req.body?.channelId || '').trim();
+        if (!/^\d{15,21}$/.test(channelId) || !guild.channels.cache.has(channelId)) {
+            return res.status(400).json({ ok: false, error: 'اختر روم الفيدباك أولاً.' });
+        }
+
+        const settings = await getSettings(guild.id);
+        settings.feedbackChannelId = channelId;
+        await settings.save();
+        logDashboard(guild.id, ctx.s.userId, 'تعديل إعدادات', 'feedback');
+
+        res.json({ ok: true, channelId });
+    });
+
+    app.post('/api/server/:guildId/feedback/:id/reply', express.json(), async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+        const actorId = ctx.s.userId;
+
+        const text = String(req.body?.text || '').trim();
+        if (!text) return res.status(400).json({ ok: false, error: 'اكتب الرد أولاً.' });
+
+        const fb = await Feedback.findOne({ _id: req.params.id, guildId: guild.id });
+        if (!fb) return res.status(404).json({ ok: false, error: 'الفيدباك غير موجود.' });
+
+        fb.replies.push({ by: actorId, text });
+        fb.status = 'answered';
+        await fb.save();
+
+        const channel = guild.channels.cache.get(fb.channelId)
+            || await guild.channels.fetch(fb.channelId).catch(() => null);
+
+        if (channel) {
+            const content = `💬 رد على <@${fb.userId}>: ${text}`;
+            const target = fb.messageId
+                ? await channel.messages.fetch(fb.messageId).catch(() => null)
+                : null;
+
+            if (target) {
+                await target.reply({ content }).catch(() => {});
+                await target.edit({
+                    embeds: [feedbackBuildEmbed(fb.toObject())],
+                    components: feedbackComponentsFor(fb.toObject())
+                }).catch(() => {});
+            } else {
+                await channel.send({ content }).catch(() => {});
+            }
+        }
+
+        logDashboard(guild.id, actorId, 'رد فيدباك', String(fb.subject || 'بدون عنوان'));
+        res.json({ ok: true, message: 'تم إرسال الرد علناً.' });
+    });
+
+    app.post('/api/server/:guildId/feedback/:id/rate', express.json(), async (req, res) => {
+        const ctx = await requireGuild(req, res, hasSession(req)?.userId);
+        if (!ctx) return;
+        const { guild } = ctx;
+        const actorId = ctx.s.userId;
+
+        const stars = Math.max(0, Math.min(5, Math.round(Number(req.body?.stars) || 0)));
+
+        const fb = await Feedback.findOne({ _id: req.params.id, guildId: guild.id });
+        if (!fb) return res.status(404).json({ ok: false, error: 'الفيدباك غير موجود.' });
+
+        fb.rating = stars;
+        fb.ratedBy = actorId;
+        await fb.save();
+
+        const channel = guild.channels.cache.get(fb.channelId)
+            || await guild.channels.fetch(fb.channelId).catch(() => null);
+
+        if (channel && fb.messageId) {
+            const target = await channel.messages.fetch(fb.messageId).catch(() => null);
+            if (target) {
+                await target.edit({
+                    embeds: [feedbackBuildEmbed(fb.toObject())],
+                    components: feedbackComponentsFor(fb.toObject())
+                }).catch(() => {});
+            }
+        }
+
+        logDashboard(guild.id, actorId, 'تقييم فيدباك', `${stars}/5`);
+        res.json({ ok: true, rating: stars });
     });
 
     // ======================================================

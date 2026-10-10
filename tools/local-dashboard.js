@@ -75,6 +75,7 @@ const deps = {
     isServerAdmin: () => true,
     memberHasStaffRole: () => true,
     hasStaffAccess: () => true,
+    hasDashboardAccess: () => true,
     DashboardUser: { findOne: async () => null },
     DashboardLog: {
         find: () => ({ sort: () => ({ limit: () => ({ lean: async () => [] }) }) })

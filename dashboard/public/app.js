@@ -722,6 +722,8 @@ const TABS = [
     { id: 'shortcuts', label: 'الاختصارات', icon: '⚡' },
     { id: 'levels', label: 'المستويات', icon: '🏆' },
     { id: 'autorole', label: 'الرتبة التلقائية', icon: '🎭' },
+    { id: 'giveaways', label: 'السحوبات', icon: '🎁' },
+    { id: 'feedback', label: 'الفيدباك', icon: '💬' },
     { id: 'whitelist', label: 'الوايت ليست', icon: '🟢' }
 ];
 
@@ -902,6 +904,8 @@ function renderTab(tab) {
         case 'shortcuts': return renderShortcuts();
         case 'levels': return renderLevels();
         case 'autorole': return renderAutoRole();
+        case 'giveaways': return renderGiveaways();
+        case 'feedback': return renderFeedback();
         case 'whitelist': return renderWhitelist();
     }
 
@@ -2691,6 +2695,324 @@ async function removeReward(lv) {
     } catch (e) { toast(e.message, 'err'); }
 }
 
+/* ---------- GIVEAWAYS (السحوبات) ---------- */
+
+const GW_STATE = { loaded: false, busy: false, list: [], channelId: null };
+
+function gwTimeLeft(ts) {
+    const left = (Number(ts) || 0) - Date.now();
+    if (left <= 0) return 'انتهى';
+    return fmt(left);
+}
+
+function gwRoleName(id) {
+    const role = GUILD.roles.find(r => String(r.id) === String(id));
+    return role ? role.name : 'رتبة محذوفة';
+}
+
+function renderGiveaways() {
+    panelHTML(`
+        <div class="panel-card">
+            <h3>🎁 السحوبات</h3>
+            <div style="color:var(--muted)">جاري التحميل...</div>
+        </div>
+    `);
+    loadGiveaways(true).then(ok => { if (ok) paintGiveaways(); }).catch(e => toast(e.message, 'err'));
+}
+
+async function loadGiveaways(force = false) {
+    if (GW_STATE.busy) return false;
+    if (GW_STATE.loaded && !force) return true;
+    GW_STATE.busy = true;
+    try {
+        const d = await api(`/api/server/${currentGuildId}/giveaways`);
+        GW_STATE.list = d.giveaways || [];
+        GW_STATE.channelId = d.channelId || null;
+        GW_STATE.loaded = true;
+        return true;
+    } finally {
+        GW_STATE.busy = false;
+    }
+}
+
+async function reloadGiveaways() {
+    GW_STATE.loaded = false;
+    const ok = await loadGiveaways(true);
+    if (ok) paintGiveaways();
+}
+
+function paintGiveaways() {
+    const list = GW_STATE.list || [];
+
+    panelHTML(`
+        <div class="panel-card">
+            <h3>🎁 إنشاء سحب جديد</h3>
+            <div class="section-note">أنشئ سحباً من هنا — يرسل البوت بطاقة السحب للروم مباشرة، ويختار الفائزين تلقائياً عند الانتهاء.</div>
+            <div class="form-grid">
+                <div class="form-field"><label>الجائزة</label><input id="gw-prize" placeholder="مثال: Nitro شهر"></div>
+                <div class="form-field"><label>المدة (دقائق)</label><input type="number" id="gw-minutes" min="1" max="10080" value="60"></div>
+            </div>
+            <div class="form-grid">
+                <div class="form-field"><label>عدد الفائزين</label><input type="number" id="gw-winners" min="1" max="25" value="1"></div>
+                <div class="form-field">
+                    <label>روم السحوبات</label>
+                    <select id="gw-channel">
+                        <option value="">— اختر الروم —</option>
+                        ${GUILD.channels.filter(c => c.type === 0).map(c =>
+                            `<option value="${c.id}" ${String(c.id) === String(GW_STATE.channelId || '') ? 'selected' : ''}>${channelName(0, c.name)}</option>`
+                        ).join('')}
+                    </select>
+                </div>
+            </div>
+            <div class="form-field" style="margin-top:10px">
+                <label>رتبة مطلوبة للاشتراك (اختياري)</label>
+                <select id="gw-role">
+                    <option value="">— بدون شروط —</option>
+                    ${GUILD.roles.map(r => `<option value="${r.id}">${escapeHtml(r.name)}</option>`).join('')}
+                </select>
+            </div>
+            <div style="display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap">
+                <label class="switch-row" style="border:none;padding:4px 0"><input type="checkbox" id="gw-avatar" style="width:auto"> صورة بروفايل مطلوبة</label>
+                <label class="switch-row" style="border:none;padding:4px 0"><input type="checkbox" id="gw-tag" style="width:auto"> تاق السيرفر مطلوب</label>
+            </div>
+            <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <button type="button" class="btn btn-primary btn-sm" data-action="create-giveaway">🎉 بدء السحب</button>
+                <button type="button" class="btn btn-ghost btn-sm" data-action="save-giveaway-channel">💾 حفظ الروم الافتراضي</button>
+            </div>
+            <div id="gw-result"></div>
+        </div>
+
+        <div class="panel-card">
+            <h3>📋 السحوبات (${list.length})</h3>
+            ${list.length === 0
+                ? '<div style="color:var(--muted)">لا توجد سحوبات بعد.</div>'
+                : `
+                    <div class="item-list">
+                        ${list.map(gw => `
+                            <div class="item">
+                                <div class="grow">
+                                    <b>🎁 ${escapeHtml(gw.prize)}</b>
+                                    <div class="small">
+                                        ${gw.ended ? '⛔ منتهي' : `⏳ ينتهي ${gwTimeLeft(gw.endsAt)}`}
+                                        · 👥 ${gw.entries} مشارك${gw.entries === 1 ? '' : 'ين'}
+                                        ${gw.channelName ? ` · ${channelName(0, gw.channelName)}` : ''}
+                                        ${gw.requirements.roleId ? ` · 🔑 ${escapeHtml(gwRoleName(gw.requirements.roleId))}` : ''}
+                                        ${gw.requirements.requireAvatar ? ' · 🖼️ صورة' : ''}
+                                        ${gw.requirements.requireTag ? ' · 🏷️ تاق' : ''}
+                                    </div>
+                                    ${gw.winnerIds.length ? `<div class="small">🏆 الفائزون: ${gw.winnerIds.length} (${gw.winnersCount})</div>` : ''}
+                                </div>
+                                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                                    ${gw.ended
+                                        ? `<button type="button" class="btn btn-ghost btn-sm" data-action="reroll-giveaway" data-id="${gw.id}">🎲 إعادة سحب</button>`
+                                        : `<button type="button" class="btn btn-primary btn-sm" data-action="end-giveaway" data-id="${gw.id}">⏹️ إنهاء</button>`}
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `}
+        </div>
+    `);
+}
+
+async function createGiveaway() {
+    const prize = $('#gw-prize').value.trim();
+    if (!prize) return toast('اكتب اسم الجائزة أولاً', 'err');
+    try {
+        const res = await api(`/api/server/${currentGuildId}/giveaways`, {
+            method: 'POST',
+            body: JSON.stringify({
+                prize,
+                minutes: $('#gw-minutes').value,
+                winners: $('#gw-winners').value,
+                channelId: $('#gw-channel').value,
+                roleId: $('#gw-role').value || null,
+                requireAvatar: $('#gw-avatar').checked,
+                requireTag: $('#gw-tag').checked
+            })
+        });
+        $('#gw-result').innerHTML = `<div class="result-box ok">${escapeHtml(res.message)}</div>`;
+        await reloadGiveaways();
+        toast('🎉 تم إنشاء السحب');
+    } catch (e) {
+        $('#gw-result').innerHTML = `<div class="result-box err">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function saveGiveawayChannel() {
+    const channelId = $('#gw-channel').value;
+    if (!channelId) return toast('اختر الروم أولاً', 'err');
+    try {
+        const res = await api(`/api/server/${currentGuildId}/giveaways/setup`, {
+            method: 'POST',
+            body: JSON.stringify({ channelId })
+        });
+        GW_STATE.channelId = res.channelId;
+        toast('✅ تم حفظ روم السحوبات الافتراضي');
+    } catch (e) { toast(e.message, 'err'); }
+}
+
+async function endGiveawayFromDash(id) {
+    try {
+        const res = await api(`/api/server/${currentGuildId}/giveaways/${id}/end`, { method: 'POST' });
+        toast(res.message || '✅ تم إنهاء السحب');
+        await reloadGiveaways();
+    } catch (e) { toast(e.message, 'err'); }
+}
+
+async function rerollGiveawayFromDash(id) {
+    try {
+        const res = await api(`/api/server/${currentGuildId}/giveaways/${id}/reroll`, { method: 'POST' });
+        toast(res.message || '🎲 تمت إعادة السحب');
+        await reloadGiveaways();
+    } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ---------- FEEDBACK (الفيدباك) ---------- */
+
+const FB_STATE = { loaded: false, busy: false, list: [], channelId: null };
+
+function fbRating(stars) {
+    const r = Math.max(0, Math.min(5, Number(stars) || 0));
+    return '⭐'.repeat(r) + '☆'.repeat(5 - r);
+}
+
+function fbDate(ts) {
+    try {
+        return new Date(ts).toLocaleString('ar-EG', {
+            day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit'
+        });
+    } catch {
+        return '';
+    }
+}
+
+function renderFeedback() {
+    panelHTML(`
+        <div class="panel-card">
+            <h3>💬 الفيدباك</h3>
+            <div style="color:var(--muted)">جاري التحميل...</div>
+        </div>
+    `);
+    loadFeedback(true).then(ok => { if (ok) paintFeedback(); }).catch(e => toast(e.message, 'err'));
+}
+
+async function loadFeedback(force = false) {
+    if (FB_STATE.busy) return false;
+    if (FB_STATE.loaded && !force) return true;
+    FB_STATE.busy = true;
+    try {
+        const d = await api(`/api/server/${currentGuildId}/feedback`);
+        FB_STATE.list = d.feedback || [];
+        FB_STATE.channelId = d.channelId || null;
+        FB_STATE.loaded = true;
+        return true;
+    } finally {
+        FB_STATE.busy = false;
+    }
+}
+
+async function reloadFeedback() {
+    FB_STATE.loaded = false;
+    const ok = await loadFeedback(true);
+    if (ok) paintFeedback();
+}
+
+function paintFeedback() {
+    const list = FB_STATE.list || [];
+
+    panelHTML(`
+        <div class="panel-card">
+            <h3>💬 روم الفيدباك</h3>
+            <div class="section-note">الأعضاء يرسلون ملاحظاتهم للروم، والبوت يحولها لبطاقات هنا — ترد عليها أو تقيمها.</div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <select id="fb-channel" style="min-width:240px">
+                    <option value="">— اختر روم الفيدباك —</option>
+                    ${GUILD.channels.filter(c => c.type === 0).map(c =>
+                        `<option value="${c.id}" ${String(c.id) === String(FB_STATE.channelId || '') ? 'selected' : ''}>${channelName(0, c.name)}</option>`
+                    ).join('')}
+                </select>
+                <button type="button" class="btn btn-primary btn-sm" data-action="save-feedback-channel">💾 حفظ</button>
+            </div>
+        </div>
+
+        <div class="panel-card">
+            <h3>📋 الفيدباك (${list.length})</h3>
+            ${list.length === 0
+                ? '<div style="color:var(--muted)">لا يوجد فيدباك بعد.</div>'
+                : `
+                    <div class="item-list">
+                        ${list.map(fb => `
+                            <div class="item fb-item">
+                                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                                    ${fb.avatar ? `<img src="${escapeHtml(fb.avatar)}" class="fb-avatar" alt="">` : ''}
+                                    <div class="grow">
+                                        <b>${escapeHtml(fb.subject || 'بدون عنوان')}</b>
+                                        <div class="small">
+                                            ${escapeHtml(fb.name || 'عضو')} · ${fbRating(fb.rating)}
+                                            · ${fb.status === 'answered' ? '✅ تم الرد' : '⏳ بانتظار الرد'}
+                                            · ${fbDate(fb.createdAt)}
+                                        </div>
+                                    </div>
+                                </div>
+                                <p style="margin:8px 0;white-space:pre-wrap;color:var(--text)">${escapeHtml(fb.body)}</p>
+                                ${fb.replies.map(r =>
+                                    `<div class="fb-reply small">💬 <b>الإدارة:</b> ${escapeHtml(r.text)}</div>`
+                                ).join('')}
+                                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                                    <input id="fb-reply-${fb.id}" class="grow" placeholder="اكتب رد الإدارة...">
+                                    <button type="button" class="btn btn-primary btn-sm" data-action="reply-feedback" data-id="${fb.id}">رد</button>
+                                    <div class="fb-rates">
+                                        ${['1', '2', '3', '4', '5'].map(n =>
+                                            `<button type="button" class="btn btn-ghost btn-sm" data-action="rate-feedback" data-id="${fb.id}" data-stars="${n}">${'⭐'.repeat(Number(n))}</button>`
+                                        ).join('')}
+                                    </div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `}
+        </div>
+    `);
+}
+
+async function saveFeedbackChannel() {
+    const channelId = $('#fb-channel').value;
+    if (!channelId) return toast('اختر الروم أولاً', 'err');
+    try {
+        const res = await api(`/api/server/${currentGuildId}/feedback/setup`, {
+            method: 'POST',
+            body: JSON.stringify({ channelId })
+        });
+        FB_STATE.channelId = res.channelId;
+        toast('✅ تم حفظ روم الفيدباك');
+    } catch (e) { toast(e.message, 'err'); }
+}
+
+async function replyFeedback(id) {
+    const text = $('#fb-reply-' + id).value.trim();
+    if (!text) return toast('اكتب الرد أولاً', 'err');
+    try {
+        const res = await api(`/api/server/${currentGuildId}/feedback/${id}/reply`, {
+            method: 'POST',
+            body: JSON.stringify({ text })
+        });
+        toast(res.message || '✅ تم إرسال الرد علناً');
+        await reloadFeedback();
+    } catch (e) { toast(e.message, 'err'); }
+}
+
+async function rateFeedback(id, stars) {
+    try {
+        await api(`/api/server/${currentGuildId}/feedback/${id}/rate`, {
+            method: 'POST',
+            body: JSON.stringify({ stars })
+        });
+        toast(`⭐ تم تسجيل التقييم (${stars}/5)`);
+        await reloadFeedback();
+    } catch (e) { toast(e.message, 'err'); }
+}
+
 /* ---------- AUTO ROLE ---------- */
 
 function renderAutoRole() {
@@ -3171,6 +3493,13 @@ function dashboardAction(trigger) {
         case 'remove-reward': return () => removeReward(data.level);
         case 'save-levels': return () => saveLevels();
         case 'save-auto-role': return () => saveAutoRole();
+        case 'create-giveaway': return () => createGiveaway();
+        case 'save-giveaway-channel': return () => saveGiveawayChannel();
+        case 'end-giveaway': return () => endGiveawayFromDash(data.id);
+        case 'reroll-giveaway': return () => rerollGiveawayFromDash(data.id);
+        case 'save-feedback-channel': return () => saveFeedbackChannel();
+        case 'reply-feedback': return () => replyFeedback(data.id);
+        case 'rate-feedback': return () => rateFeedback(data.id, Number(data.stars));
         case 'add-whitelist': return () => addWhitelist();
         case 'remove-whitelist': return () => removeWhitelist(data.userId);
         case 'cmd-sub': return () => cmdSwitchSub(data.command, data.sub, data.group);

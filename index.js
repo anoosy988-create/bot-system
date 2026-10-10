@@ -378,6 +378,16 @@ function hasStaffAccess(member, guild) {
     return memberHasStaffRole(member, guild) || isServerAdmin(member, guild);
 }
 
+// 🎯 وصول الداشبورد (ظهور السيرفر في القائمة): آدمن حقيقي أو ستريتر فقط.
+// نستثني عمداً شرط "رتبته فوق رتبة البوت" — لأنه كان يطلع للمستخدم سيرفرات
+// هو مجرد عضو فيها (بس رتبته أعلى من رتبة البوت).
+function hasDashboardAccess(member, guild) {
+    if (!member || !guild) return false;
+    if (member.id === guild.ownerId) return true;
+    if (member.permissions?.has(PermissionsBitField.Flags.Administrator)) return true;
+    return memberHasStaffRole(member, guild);
+}
+
 // هل العضو يملك رتبة الصلاحيات؟
 function memberHasStaffRole(member, guild) {
     if (!member || !guild) return false;
@@ -11836,6 +11846,7 @@ mountDashboard(app, {
     isServerAdmin,
     memberHasStaffRole,
     hasStaffAccess,
+    hasDashboardAccess,
     DashboardUser,
     DashboardLog,
     STAFF_ROLE_NAME,
@@ -11851,7 +11862,15 @@ mountDashboard(app, {
     setRuntimeDashboardUrl,
     slashCommands,
     executeDashboardCommand,
-    isDashboardCommandSupported
+    isDashboardCommandSupported,
+    Giveaway: giveaways.Giveaway,
+    Feedback: feedback.Feedback,
+    giveawayBuildEmbed: giveaways.buildEmbed,
+    giveawayActionRow: giveaways.actionRow,
+    giveawayEnd: giveaways.endGiveaway,
+    giveawayPickWinners: giveaways.pickWinners,
+    feedbackBuildEmbed: feedback.buildEmbed,
+    feedbackComponentsFor: feedback.componentsFor
 });
 
 // ======================================================

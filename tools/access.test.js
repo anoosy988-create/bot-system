@@ -101,7 +101,7 @@ const deps = {
     isServerAdmin: () => true,
     memberHasStaffRole: () => true,
     hasStaffAccess: () => true,
-    hasStaffAccess: () => true,
+    hasDashboardAccess: () => true,
     DashboardUser: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
     DashboardLog: { find: () => ({ sort: () => ({ limit: () => ({ lean: async () => [] }) }) }) },
     STAFF_ROLE_NAME: 'ستريتر',

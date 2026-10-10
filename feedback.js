@@ -498,5 +498,8 @@ module.exports = {
     handleButton,
     handleModal,
     handleMessage,
-    Feedback
+    Feedback,
+    buildEmbed,
+    componentsFor,
+    ratingText
 };

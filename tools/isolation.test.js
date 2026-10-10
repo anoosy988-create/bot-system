@@ -95,6 +95,7 @@ const deps = {
     isServerAdmin: (member, guild) => Boolean(member && guild && member.id === guild.ownerId),
     memberHasStaffRole: (member, guild) => Boolean(member && guild && member.id === guild.ownerId),
     hasStaffAccess: (member, guild) => Boolean(member && guild && member.id === guild.ownerId),
+    hasDashboardAccess: (member, guild) => Boolean(member && guild && member.id === guild.ownerId),
     // لازم findOne يرجّع chain متزامن: .select().lean()
     // (لو عملناه async بيرجع Promise و .select ما بيكون موجود)
     DashboardUser: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
